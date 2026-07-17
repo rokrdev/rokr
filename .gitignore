@@ -1,0 +1,8 @@
+/target/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

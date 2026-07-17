@@ -1,0 +1,13 @@
+[package]
+name = "rokr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rokr-tui = { path = "../rokr-tui" }
+rokr-core = { path = "../rokr-core" }
+rokr-provider = { path = "../rokr-provider" }
+rokr-tools = { path = "../rokr-tools" }
+rokr-config = { path = "../rokr-config" }
+rokr-session = { path = "../rokr-session" }

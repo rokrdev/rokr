@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rokr",
+    "crates/rokr-tui",
+    "crates/rokr-core",
+    "crates/rokr-provider",
+    "crates/rokr-tools",
+    "crates/rokr-config",
+    "crates/rokr-session",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
