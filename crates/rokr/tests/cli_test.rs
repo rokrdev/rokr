@@ -23,7 +23,10 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rokr-cli-test-{label}-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "rokr-cli-test-{label}-{}-{nanos}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -67,10 +70,9 @@ fn first_run_scaffolds_agent_prompt_files() {
     let plan_contents = std::fs::read_to_string(agents_dir.join("plan.md")).unwrap_or_else(|e| {
         panic!("expected plan.md at {agents_dir:?}: {e}");
     });
-    let build_contents =
-        std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(|e| {
-            panic!("expected build.md at {agents_dir:?}: {e}");
-        });
+    let build_contents = std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(|e| {
+        panic!("expected build.md at {agents_dir:?}: {e}");
+    });
 
     assert!(
         !plan_contents.trim().is_empty(),
