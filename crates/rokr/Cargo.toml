@@ -11,3 +11,6 @@ rokr-provider = { path = "../rokr-provider" }
 rokr-tools = { path = "../rokr-tools" }
 rokr-config = { path = "../rokr-config" }
 rokr-session = { path = "../rokr-session" }
+
+[dev-dependencies]
+assert_cmd = "2"
