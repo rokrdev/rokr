@@ -63,7 +63,7 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let system_prompt = match rokr_config::read_agent_prompt(
+            let mut system_prompt = match rokr_config::read_agent_prompt(
                 &rokr_config::default_config_dir(),
                 agent.prompt_name(),
             ) {
@@ -73,6 +73,20 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            // One-time, unconditional, side-effect-free read of project-level
+            // context (AGENTS.md, falling back to CLAUDE.md) from the
+            // current working directory, folded into the system prompt
+            // alongside the active agent tier's prompt. Not a tool, not
+            // permission-gated — this is how the system prompt is built, not
+            // a model-invoked action. A cwd that can't be resolved is
+            // treated the same as no project context being present.
+            if let Ok(cwd) = std::env::current_dir() {
+                if let Some(project_context) = rokr_config::load_project_context(&cwd) {
+                    system_prompt.push_str("\n\n");
+                    system_prompt.push_str(&project_context);
+                }
+            }
 
             // Constructed once at startup (so a missing/invalid env var
             // doesn't crash the TUI — it's reported the first time the

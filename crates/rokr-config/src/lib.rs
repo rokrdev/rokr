@@ -86,6 +86,18 @@ pub fn read_agent_prompt(config_dir: &Path, agent: &str) -> Result<String, Confi
     Ok(contents)
 }
 
+/// Reads project-level context from `cwd`, if any is present. Looks for
+/// `AGENTS.md` first; if it isn't there, falls back to `CLAUDE.md`. Never
+/// reads both. Neither present is not an error — just no project context.
+/// This is a one-time, unconditional, side-effect-free read intended to be
+/// folded into the system prompt at startup — not a tool, not permission-
+/// gated.
+pub fn load_project_context(cwd: &Path) -> Option<String> {
+    std::fs::read_to_string(cwd.join("AGENTS.md"))
+        .or_else(|_| std::fs::read_to_string(cwd.join("CLAUDE.md")))
+        .ok()
+}
+
 /// Load config from `config_dir/rokr.json`, creating it with `"version": 1`
 /// if it does not already exist. Never overwrites an existing file; an
 /// existing file is parsed and returned as-is.
@@ -300,5 +312,27 @@ mod tests {
         }
 
         assert_eq!(dir, PathBuf::from("/tmp/rokr-test-home/.config/rokr"));
+    }
+
+    #[test]
+    fn load_project_context_reads_agents_md_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents_content = "# Project AGENTS.md\nUse tabs, not spaces, in this repo.";
+        std::fs::write(temp.path().join("AGENTS.md"), agents_content).unwrap();
+
+        let context = load_project_context(temp.path());
+
+        assert_eq!(context.as_deref(), Some(agents_content));
+    }
+
+    #[test]
+    fn load_project_context_falls_back_to_claude_md_when_agents_md_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_content = "# Project CLAUDE.md\nRun tests before committing.";
+        std::fs::write(temp.path().join("CLAUDE.md"), claude_content).unwrap();
+
+        let context = load_project_context(temp.path());
+
+        assert_eq!(context.as_deref(), Some(claude_content));
     }
 }
