@@ -8,3 +8,4 @@
 *.swo
 
 .workflow/
+.claude/worktrees/
