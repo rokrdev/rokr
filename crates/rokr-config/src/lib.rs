@@ -253,22 +253,18 @@ mod tests {
         let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let original_home = std::env::var_os("HOME");
 
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "");
-            std::env::set_var("HOME", "/tmp/rokr-test-home");
-        }
+        std::env::set_var("XDG_CONFIG_HOME", "");
+        std::env::set_var("HOME", "/tmp/rokr-test-home");
 
         let dir = default_config_dir();
 
-        unsafe {
-            match original_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match original_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
+        match original_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
         }
 
         assert_eq!(dir, PathBuf::from("/tmp/rokr-test-home/.config/rokr"));
