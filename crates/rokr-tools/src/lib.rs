@@ -54,10 +54,22 @@ pub trait Tool {
 
 /// A [`Tool`] whose side effects must be gated behind user permission
 /// (`docs/adr/0005-permission-model.md`). Implemented by `write`, `edit`,
-/// and `bash`. `preview` computes a human-readable description of what
-/// `execute` would do, with zero filesystem or process side effects, so a
-/// permission prompt can show it before the user grants access.
+/// and `bash`. `preview` computes a [`Preview`] of what `execute` would do,
+/// with zero filesystem or process side effects, so a permission prompt can
+/// show it before the user grants access.
 pub trait PreviewableTool: Tool {
     /// Describe what `execute(input)` would do, without doing it.
-    fn preview(&self, input: serde_json::Value) -> Result<String, ToolError>;
+    fn preview(&self, input: serde_json::Value) -> Result<Preview, ToolError>;
+}
+
+/// A side-effect-free description of what a gated tool's `execute` would do,
+/// returned by [`PreviewableTool::preview`]. `Command` covers `bash`: the
+/// literal shell command that would run. `Diff` covers `write` and `edit`:
+/// the before/after text a permission prompt can render as a diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preview {
+    /// The literal shell command that `execute` would run.
+    Command(String),
+    /// The before (`old`) and after (`new`) text `execute` would produce.
+    Diff { old: String, new: String },
 }

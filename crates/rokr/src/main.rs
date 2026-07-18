@@ -103,8 +103,8 @@ async fn main() -> ExitCode {
             // each new prompt is sent with the full prior conversation
             // history rather than in isolation. Seeded with the agent
             // tier's system prompt before any user turn is added.
-            let mut transcript: Vec<rokr_core::Message> = Vec::new();
-            transcript.push(rokr_core::Message::system_text(system_prompt));
+            let transcript: Vec<rokr_core::Message> =
+                vec![rokr_core::Message::system_text(system_prompt)];
             let transcript: Arc<tokio::sync::Mutex<Vec<rokr_core::Message>>> =
                 Arc::new(tokio::sync::Mutex::new(transcript));
 

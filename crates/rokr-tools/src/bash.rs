@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::{PreviewableTool, Tool, ToolError};
+use crate::{Preview, PreviewableTool, Tool, ToolError};
 
 #[derive(Debug, Deserialize)]
 struct BashInput {
@@ -58,17 +58,17 @@ impl Tool for BashTool {
 }
 
 impl PreviewableTool for BashTool {
-    fn preview(&self, input: serde_json::Value) -> Result<String, ToolError> {
+    fn preview(&self, input: serde_json::Value) -> Result<Preview, ToolError> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        Ok(input.command)
+        Ok(Preview::Command(input.command))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::BashTool;
-    use crate::{PreviewableTool, Tool};
+    use crate::{Preview, PreviewableTool, Tool};
     use serde_json::json;
 
     #[test]
@@ -84,10 +84,11 @@ mod tests {
 
         assert!(
             !marker_path.exists(),
-            "preview must not execute the command: {preview}"
+            "preview must not execute the command: {preview:?}"
         );
         assert_eq!(
-            preview, command,
+            preview,
+            Preview::Command(command),
             "preview should describe the literal command"
         );
     }

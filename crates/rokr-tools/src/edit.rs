@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::{PreviewableTool, Tool, ToolError};
+use crate::{Preview, PreviewableTool, Tool, ToolError};
 
 #[derive(Debug, Deserialize)]
 struct EditInput {
@@ -82,22 +82,18 @@ impl Tool for EditTool {
 }
 
 impl PreviewableTool for EditTool {
-    fn preview(&self, input: serde_json::Value) -> Result<String, ToolError> {
+    fn preview(&self, input: serde_json::Value) -> Result<Preview, ToolError> {
         let input: EditInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let contents = std::fs::read_to_string(&input.path)?;
-        Self::apply(&contents, &input.old_str, &input.new_str, &input.path)?;
-        Ok(format!(
-            "in {}, replace:\n- {}\n+ {}",
-            input.path, input.old_str, input.new_str
-        ))
+        let (old, new) = Self::diff_snippet(&input.path, &input.old_str, &input.new_str)?;
+        Ok(Preview::Diff { old, new })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::EditTool;
-    use crate::{PreviewableTool, Tool};
+    use crate::{Preview, PreviewableTool, Tool};
     use serde_json::json;
 
     #[test]
@@ -118,9 +114,15 @@ mod tests {
         let contents = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(
             contents, "hello world",
-            "preview must not modify the file on disk: preview was {preview}"
+            "preview must not modify the file on disk: preview was {preview:?}"
         );
-        assert!(preview.contains("world") && preview.contains("rokr"));
+        assert_eq!(
+            preview,
+            Preview::Diff {
+                old: "world".to_string(),
+                new: "rokr".to_string()
+            }
+        );
     }
 
     #[test]

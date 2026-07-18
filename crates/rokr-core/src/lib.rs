@@ -118,10 +118,12 @@ impl_executable_tool!(rokr_tools::ls::LsTool);
 
 /// Like [`impl_executable_tool`], but for a `rokr_tools::PreviewableTool`:
 /// also implements [`ExecutableTool::preview`] by delegating to
-/// `PreviewableTool::preview` and wrapping its output in `$wrap`, the
-/// [`PermissionPayload`] variant constructor for this tool's preview shape.
+/// `PreviewableTool::preview` and mapping its `rokr_tools::Preview` result to
+/// the matching [`PermissionPayload`] variant, one-for-one — both enums have
+/// the identical shape (`Command(String)` and `Diff { old, new }`), so this
+/// mapping is generic across every gated tool, not per-type.
 macro_rules! impl_executable_tool_gated {
-    ($ty:ty, $wrap:path) => {
+    ($ty:ty) => {
         impl ExecutableTool for $ty {
             fn name(&self) -> &'static str {
                 rokr_tools::Tool::name(self)
@@ -147,133 +149,24 @@ macro_rules! impl_executable_tool_gated {
                 &self,
                 input: serde_json::Value,
             ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
-                Some(rokr_tools::PreviewableTool::preview(self, input).map($wrap))
+                Some(rokr_tools::PreviewableTool::preview(self, input).map(
+                    |preview| match preview {
+                        rokr_tools::Preview::Command(command) => {
+                            PermissionPayload::Command(command)
+                        }
+                        rokr_tools::Preview::Diff { old, new } => {
+                            PermissionPayload::Diff { old, new }
+                        }
+                    },
+                ))
             }
         }
     };
 }
 
-impl_executable_tool_gated!(rokr_tools::bash::BashTool, PermissionPayload::Command);
-
-/// `write` can't use [`impl_executable_tool_gated!`]: that macro maps a
-/// `PreviewableTool::preview`'s single `String` through a tuple-variant
-/// constructor, but [`PermissionPayload::Diff`] is a struct variant needing
-/// two strings (old file content + new content), not one derived from the
-/// tool's own `PreviewableTool::preview`. So this reads `path`/`content`
-/// directly off the tool-call JSON and the file's current on-disk content,
-/// rather than going through `PreviewableTool`.
-impl ExecutableTool for rokr_tools::write::WriteTool {
-    fn name(&self) -> &'static str {
-        rokr_tools::Tool::name(self)
-    }
-
-    fn to_tool_spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: rokr_tools::Tool::name(self).to_string(),
-            description: rokr_tools::Tool::description(self).to_string(),
-            input_schema: rokr_tools::Tool::input_schema(self),
-        }
-    }
-
-    fn execute_boxed<'a>(
-        &'a self,
-        input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>> {
-        Box::pin(async move {
-            <rokr_tools::write::WriteTool as rokr_tools::Tool>::execute(self, input).await
-        })
-    }
-
-    fn preview(
-        &self,
-        input: serde_json::Value,
-    ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
-        let path = match input.get("path").and_then(|v| v.as_str()) {
-            Some(path) => path,
-            None => {
-                return Some(Err(rokr_tools::ToolError::InvalidInput(
-                    "missing \"path\"".to_string(),
-                )))
-            }
-        };
-        let new = match input.get("content").and_then(|v| v.as_str()) {
-            Some(content) => content.to_string(),
-            None => {
-                return Some(Err(rokr_tools::ToolError::InvalidInput(
-                    "missing \"content\"".to_string(),
-                )))
-            }
-        };
-        let old = std::fs::read_to_string(path).unwrap_or_default();
-        Some(Ok(PermissionPayload::Diff { old, new }))
-    }
-}
-
-/// `edit` can't use [`impl_executable_tool_gated!`] for the same structural
-/// reason as `write` (see that impl's doc comment): [`PermissionPayload::Diff`]
-/// needs two strings, not the single `String` `PreviewableTool::preview`
-/// produces. Unlike `write`, though, `edit`'s diff-review must render only
-/// the targeted changed region rather than the whole file (ticket
-/// `diff-review-edit`: "not a whole-file overwrite framing"), so this reads
-/// `path`/`old_str`/`new_str` off the tool-call JSON and delegates to
-/// `EditTool::diff_snippet` for the (old, new) pair, rather than diffing the
-/// file's full before/after content the way `write`'s preview does.
-impl ExecutableTool for rokr_tools::edit::EditTool {
-    fn name(&self) -> &'static str {
-        rokr_tools::Tool::name(self)
-    }
-
-    fn to_tool_spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: rokr_tools::Tool::name(self).to_string(),
-            description: rokr_tools::Tool::description(self).to_string(),
-            input_schema: rokr_tools::Tool::input_schema(self),
-        }
-    }
-
-    fn execute_boxed<'a>(
-        &'a self,
-        input: serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>> {
-        Box::pin(async move {
-            <rokr_tools::edit::EditTool as rokr_tools::Tool>::execute(self, input).await
-        })
-    }
-
-    fn preview(
-        &self,
-        input: serde_json::Value,
-    ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
-        let path = match input.get("path").and_then(|v| v.as_str()) {
-            Some(path) => path,
-            None => {
-                return Some(Err(rokr_tools::ToolError::InvalidInput(
-                    "missing \"path\"".to_string(),
-                )))
-            }
-        };
-        let old_str = match input.get("old_str").and_then(|v| v.as_str()) {
-            Some(old_str) => old_str,
-            None => {
-                return Some(Err(rokr_tools::ToolError::InvalidInput(
-                    "missing \"old_str\"".to_string(),
-                )))
-            }
-        };
-        let new_str = match input.get("new_str").and_then(|v| v.as_str()) {
-            Some(new_str) => new_str,
-            None => {
-                return Some(Err(rokr_tools::ToolError::InvalidInput(
-                    "missing \"new_str\"".to_string(),
-                )))
-            }
-        };
-        Some(
-            rokr_tools::edit::EditTool::diff_snippet(path, old_str, new_str)
-                .map(|(old, new)| PermissionPayload::Diff { old, new }),
-        )
-    }
-}
+impl_executable_tool_gated!(rokr_tools::bash::BashTool);
+impl_executable_tool_gated!(rokr_tools::write::WriteTool);
+impl_executable_tool_gated!(rokr_tools::edit::EditTool);
 
 /// Runs the agent tool loop (ADR 0004) against the running conversation
 /// `transcript`, and for as long as the reply contains `ToolUse` blocks,
@@ -595,12 +488,15 @@ mod tests {
     }
 
     impl rokr_tools::PreviewableTool for FakeGatedTool {
-        fn preview(&self, _input: serde_json::Value) -> Result<String, rokr_tools::ToolError> {
-            Ok("fake command".to_string())
+        fn preview(
+            &self,
+            _input: serde_json::Value,
+        ) -> Result<rokr_tools::Preview, rokr_tools::ToolError> {
+            Ok(rokr_tools::Preview::Command("fake command".to_string()))
         }
     }
 
-    impl_executable_tool_gated!(FakeGatedTool, PermissionPayload::Command);
+    impl_executable_tool_gated!(FakeGatedTool);
 
     #[tokio::test]
     async fn loop_skips_execution_when_permission_rejected() {
@@ -708,6 +604,81 @@ mod tests {
             old_content,
             "preview must not have written to the file"
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// F-007: a rejected `write` call must never reach `execute` and must
+    /// leave the target file untouched, exercised against the real
+    /// `rokr_tools::write::WriteTool` (not `FakeGatedTool`) so this catches a
+    /// regression where the permission gate is bypassed for the actual tool.
+    #[tokio::test]
+    async fn write_tool_reject_leaves_file_untouched() {
+        let temp_dir = unique_temp_dir("write-reject");
+        let target_file = temp_dir.join("target.txt");
+        let original_content = "original content";
+        std::fs::write(&target_file, original_content).unwrap();
+        let target_path = target_file.to_string_lossy().into_owned();
+
+        let tool_call_reply = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "write".to_string(),
+                input: serde_json::json!({
+                    "path": target_path,
+                    "content": "clobbered content"
+                }),
+            }],
+        };
+        let final_reply = Message::assistant_text("final answer after rejection");
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_reply.clone(),
+                final_reply.clone(),
+            ])),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let write_tool = rokr_tools::write::WriteTool;
+        let tools: [&dyn ExecutableTool; 1] = [&write_tool];
+
+        let mut transcript = vec![Message::user_text("overwrite the file")];
+
+        let result = run_tool_loop(&provider, &mut transcript, &tools, |_request| async {
+            false
+        })
+        .await
+        .expect("loop should succeed even when permission is rejected");
+
+        assert_eq!(result.text(), "final answer after rejection");
+        assert_eq!(
+            std::fs::read_to_string(&target_file).unwrap(),
+            original_content,
+            "a rejected write must never reach execute and must leave the file untouched"
+        );
+
+        let calls = provider.calls.lock().unwrap();
+        match &calls[1][2].content[..] {
+            [ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            }] => {
+                assert_eq!(tool_use_id, "call_1");
+                assert!(
+                    *is_error,
+                    "a rejected tool call should be reflected as an error result"
+                );
+                assert!(
+                    content.to_lowercase().contains("denied")
+                        || content.to_lowercase().contains("reject"),
+                    "result content should reflect the rejection, got: {content}"
+                );
+            }
+            other => panic!("expected a single ToolResult block, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
