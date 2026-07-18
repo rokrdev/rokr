@@ -84,3 +84,16 @@ fn first_run_scaffolds_agent_prompt_files() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+#[test]
+fn unknown_flag_exits_nonzero_with_usage_message() {
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd.arg("--bogus").assert().failure();
+
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Usage:"),
+        "expected stderr to contain 'Usage:', got: {stderr:?}"
+    );
+}
