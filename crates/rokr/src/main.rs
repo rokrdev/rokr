@@ -7,6 +7,10 @@ fn main() -> ExitCode {
 
     match args.as_slice() {
         [] => {
+            if let Err(err) = rokr_config::load_or_init_default() {
+                eprintln!("failed to initialize config: {err}");
+                return ExitCode::FAILURE;
+            }
             println!("rokr — pre-alpha");
             ExitCode::SUCCESS
         }
