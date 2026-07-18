@@ -1,4 +1,5 @@
 use std::process::ExitCode;
+use std::sync::Arc;
 
 const USAGE: &str = "Usage: rokr [--version]";
 
@@ -13,7 +14,28 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            match rokr_tui::run().await {
+            // Constructed once at startup (so a missing/invalid env var
+            // doesn't crash the TUI — it's reported the first time the
+            // user submits a prompt instead) and wired through
+            // `rokr_core::single_turn`. `rokr-tui` stays decoupled from
+            // `rokr-core`/`rokr-provider`, so this closure is where the
+            // message model and provider abstraction meet the TUI.
+            let provider = rokr_provider::OpenAiProvider::from_env()
+                .map(Arc::new)
+                .map_err(|err| err.to_string());
+
+            let submit = move |input: String| {
+                let provider = provider.clone();
+                async move {
+                    let provider = provider?;
+                    rokr_core::single_turn(provider.as_ref(), input)
+                        .await
+                        .map(|message| message.text())
+                        .map_err(|err| err.to_string())
+                }
+            };
+
+            match rokr_tui::run(submit).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) if err.is_not_a_tty() => {
                     // Not an error in a scripting/piping context: config is

@@ -2,15 +2,13 @@
 
 pub mod openai;
 
-use rokr_core::Message;
-
-/// A backend capable of turning a conversation (ordered `Message`s) into the
-/// next assistant `Message`. One module per concrete implementation (ADR
-/// 0003); each implementation owns its own wire format and converts to/from
-/// `rokr_core::Message` at the edge (ADR 0006).
-pub trait Provider {
-    async fn send(&self, messages: &[Message]) -> Result<Message, ProviderError>;
-}
+/// The `Provider` trait now lives in `rokr-core` (see its doc comment there
+/// for why: `single_turn` needs to be generic over it without rokr-core
+/// depending on rokr-provider, which would cycle). Re-exported here so
+/// existing call sites (`rokr_provider::Provider`) keep working unchanged.
+/// Concrete implementations still live in this crate, one module per
+/// provider (ADR 0003).
+pub use rokr_core::Provider;
 
 /// Typed provider failures. Never panics: HTTP and deserialization failures
 /// surface here instead.

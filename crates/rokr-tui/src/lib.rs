@@ -1,6 +1,8 @@
 //! ratatui frontend: render loop, layout, input handling.
 
+use std::future::Future;
 use std::io::{self, IsTerminal, Stdout};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -22,13 +24,15 @@ const HEADER_HEIGHT: u16 = 3;
 const PROMPT_HEIGHT: u16 = 3;
 
 /// State rendered into the TUI's View section. Owns the scrollback lines
-/// shown in the View pane and the current prompt input buffer. Future
-/// tickets (e.g. `single-turn-prompt`) push content into `view_lines` and
-/// drive `prompt_input` from keystrokes.
+/// shown in the View pane and the current prompt input buffer.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     pub view_lines: Vec<String>,
     pub prompt_input: String,
+    /// True while a submitted prompt is awaiting a response. Drives the
+    /// pending indicator in [`draw`] and blocks new input/submission until
+    /// the in-flight call resolves.
+    pub pending: bool,
 }
 
 /// Errors returned by [`run`].
@@ -66,7 +70,11 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     let header = Block::default().borders(Borders::ALL).title(HEADER_TITLE);
     frame.render_widget(header, chunks[0]);
 
-    let view = Paragraph::new(state.view_lines.join("\n"))
+    let mut view_lines = state.view_lines.clone();
+    if state.pending {
+        view_lines.push("...".to_string());
+    }
+    let view = Paragraph::new(view_lines.join("\n"))
         .block(Block::default().borders(Borders::ALL).title(VIEW_TITLE));
     frame.render_widget(view, chunks[1]);
 
@@ -112,20 +120,38 @@ fn install_panic_hook() {
 }
 
 /// Runs the TUI event loop: draws `Header`/`View`/`Prompt`, and exits on
-/// `q` or Ctrl+C, restoring the terminal on every exit path. Fails fast
-/// with [`TuiError::NotATty`] if stdout isn't a terminal, rather than
-/// corrupting non-interactive output.
-pub async fn run() -> Result<(), TuiError> {
+/// `q` (when the prompt is empty) or Ctrl+C (always), restoring the
+/// terminal on every exit path. Fails fast with [`TuiError::NotATty`] if
+/// stdout isn't a terminal, rather than corrupting non-interactive output.
+///
+/// `submit` is called with the prompt text whenever the user presses Enter
+/// on a non-empty prompt; it is deliberately generic (rather than depending
+/// on `rokr-core`/`rokr-provider` types) so this crate stays decoupled from
+/// the message model and provider abstraction — the caller (typically
+/// `rokr`'s `main.rs`) wires those in. The call runs on a spawned tokio
+/// task so the blocking crossterm event loop never stalls waiting on it;
+/// [`AppState::pending`] reflects the in-flight state in the meantime.
+pub async fn run<F, Fut>(submit: F) -> Result<(), TuiError>
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
     if !io::stdout().is_terminal() {
         return Err(TuiError::NotATty);
     }
 
-    tokio::task::spawn_blocking(run_blocking)
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || run_blocking(handle, submit))
         .await
         .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
-fn run_blocking() -> Result<(), TuiError> {
+fn run_blocking<F, Fut>(handle: tokio::runtime::Handle, submit: F) -> Result<(), TuiError>
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
 
@@ -133,28 +159,78 @@ fn run_blocking() -> Result<(), TuiError> {
     let mut terminal = Terminal::new(backend)?;
     let mut state = AppState::default();
 
-    event_loop(&mut terminal, &mut state)
+    event_loop(&mut terminal, &mut state, &handle, &submit)
 }
 
-fn event_loop(
+fn event_loop<F, Fut>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
-) -> Result<(), TuiError> {
+    handle: &tokio::runtime::Handle,
+    submit: &F,
+) -> Result<(), TuiError>
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
+    // Carries the outcome of a spawned `submit` call back into the blocking
+    // event loop without blocking it: each iteration does a non-blocking
+    // `try_recv` alongside the existing crossterm poll.
+    let (tx, rx) = mpsc::channel::<Result<String, String>>();
+
     loop {
         terminal.draw(|frame| draw(frame, state))?;
 
+        if let Ok(outcome) = rx.try_recv() {
+            state.pending = false;
+            match outcome {
+                Ok(response) => state.view_lines.push(response),
+                Err(error) => state.view_lines.push(format!("Error: {error}")),
+            }
+        }
+
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && should_quit(key.code, key.modifiers) {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if should_quit(key.code, key.modifiers, state.prompt_input.is_empty()) {
                     return Ok(());
+                }
+
+                if state.pending {
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Enter if !state.prompt_input.is_empty() => {
+                        let input = std::mem::take(&mut state.prompt_input);
+                        state.view_lines.push(format!("> {input}"));
+                        state.pending = true;
+
+                        let submit_fut = submit(input);
+                        let tx = tx.clone();
+                        handle.spawn(async move {
+                            let outcome = submit_fut.await;
+                            let _ = tx.send(outcome);
+                        });
+                    }
+                    KeyCode::Char(c) => state.prompt_input.push(c),
+                    KeyCode::Backspace => {
+                        state.prompt_input.pop();
+                    }
+                    _ => {}
                 }
             }
         }
     }
 }
 
-fn should_quit(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    matches!(code, KeyCode::Char('q'))
+/// `q` quits only when the prompt is empty, so it doesn't clash with typing
+/// a prompt that uses the letter; Ctrl+C always quits as a hard escape
+/// hatch regardless of prompt content.
+fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool) -> bool {
+    (matches!(code, KeyCode::Char('q')) && prompt_is_empty)
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
 }
 

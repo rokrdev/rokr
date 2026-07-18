@@ -116,6 +116,8 @@ impl OpenAiProvider {
 }
 
 impl Provider for OpenAiProvider {
+    type Error = ProviderError;
+
     async fn send(&self, messages: &[Message]) -> Result<Message, ProviderError> {
         let request_body = ChatCompletionRequest {
             model: self.model.clone(),
