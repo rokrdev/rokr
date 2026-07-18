@@ -200,43 +200,47 @@ where
         }
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                if should_quit(key.code, key.modifiers, state.prompt_input.is_empty()) {
-                    return Ok(());
-                }
-
-                if state.pending {
-                    continue;
-                }
-
-                match key.code {
-                    KeyCode::Enter if !state.prompt_input.is_empty() => {
-                        let input = std::mem::take(&mut state.prompt_input);
-                        state.view_lines.push(format!("> {input}"));
-                        state.pending = true;
-                        dirty = true;
-
-                        let submit_fut = submit(input);
-                        let tx = tx.clone();
-                        handle.spawn(async move {
-                            let outcome = submit_fut.await;
-                            let _ = tx.send(outcome);
-                        });
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyCode::Char(c) => {
-                        state.prompt_input.push(c);
-                        dirty = true;
+
+                    if should_quit(key.code, key.modifiers, state.prompt_input.is_empty()) {
+                        return Ok(());
                     }
-                    KeyCode::Backspace => {
-                        state.prompt_input.pop();
-                        dirty = true;
+
+                    if state.pending {
+                        continue;
                     }
-                    _ => {}
+
+                    match key.code {
+                        KeyCode::Enter if !state.prompt_input.is_empty() => {
+                            let input = std::mem::take(&mut state.prompt_input);
+                            state.view_lines.push(format!("> {input}"));
+                            state.pending = true;
+                            dirty = true;
+
+                            let submit_fut = submit(input);
+                            let tx = tx.clone();
+                            handle.spawn(async move {
+                                let outcome = submit_fut.await;
+                                let _ = tx.send(outcome);
+                            });
+                        }
+                        KeyCode::Char(c) => {
+                            state.prompt_input.push(c);
+                            dirty = true;
+                        }
+                        KeyCode::Backspace => {
+                            state.prompt_input.pop();
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
                 }
+                Event::Resize(_, _) => dirty = true,
+                _ => {}
             }
         }
     }
