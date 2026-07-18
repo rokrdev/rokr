@@ -107,6 +107,17 @@ fn tool_spec_to_wire(spec: &ToolSpec) -> WireTool {
 /// Usually one-to-one, but a [`ContentBlock::ToolResult`] always becomes its
 /// own `role: "tool"` message (OpenAI has no concept of a mixed-role
 /// message), so this returns a `Vec`.
+///
+/// Invariant: if a single source `Message` ever mixed `Text`/`ToolUse`
+/// blocks with `ToolResult` blocks, any resulting `role: "tool"` wire
+/// messages are always ordered ahead of the combined text/tool_calls wire
+/// message. OpenAI rejects a `role: "tool"` message that doesn't immediately
+/// follow the assistant message carrying the `tool_calls` it answers, so
+/// tool-result messages must never be pushed after a same-source
+/// text/tool_calls message. Nothing in rokr currently constructs such a
+/// mixed message (the tool loop always keeps `ToolResult`s in their own
+/// dedicated message), but this ordering keeps the function correct if that
+/// ever changes.
 fn message_to_wire(message: &Message) -> Vec<WireMessage> {
     let mut wire_messages = Vec::new();
     let mut text = String::new();
@@ -143,19 +154,20 @@ fn message_to_wire(message: &Message) -> Vec<WireMessage> {
     }
 
     if !text.is_empty() || !tool_calls.is_empty() {
-        wire_messages.insert(
-            0,
-            WireMessage {
-                role: role_to_wire(message.role).to_string(),
-                content: if text.is_empty() { None } else { Some(text) },
-                tool_calls: if tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(tool_calls)
-                },
-                tool_call_id: None,
+        // Pushed after any `role: "tool"` messages collected above (rather
+        // than inserted at index 0) so tool-result messages always precede
+        // the combined text/tool_calls message — see the invariant
+        // documented on this function.
+        wire_messages.push(WireMessage {
+            role: role_to_wire(message.role).to_string(),
+            content: if text.is_empty() { None } else { Some(text) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
             },
-        );
+            tool_call_id: None,
+        });
     }
 
     wire_messages
@@ -175,8 +187,16 @@ fn wire_to_message(wire: WireMessage) -> Message {
 
     if let Some(tool_calls) = wire.tool_calls {
         for tool_call in tool_calls {
-            let input = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or(serde_json::Value::Null);
+            // If the model returns malformed JSON in `arguments`, don't
+            // silently collapse it to `Value::Null` — that hides the actual
+            // problem behind a generic "invalid input" failure downstream.
+            // Instead, preserve the raw string as a `Value::String` so a
+            // downstream `serde_json::from_value::<T>` failure names the
+            // malformed content (e.g. "invalid type: string ... expected
+            // struct WriteInput") rather than an opaque null.
+            let input = serde_json::from_str(&tool_call.function.arguments).unwrap_or_else(|_| {
+                serde_json::Value::String(tool_call.function.arguments.clone())
+            });
             content.push(ContentBlock::ToolUse {
                 id: tool_call.id,
                 name: tool_call.function.name,
