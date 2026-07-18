@@ -1260,6 +1260,7 @@ dependencies = [
 name = "rokr-core"
 version = "0.1.0"
 dependencies = [
+ "rokr-tools",
  "serde",
  "serde_json",
  "tokio",

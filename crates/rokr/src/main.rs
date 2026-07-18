@@ -17,7 +17,7 @@ async fn main() -> ExitCode {
             // Constructed once at startup (so a missing/invalid env var
             // doesn't crash the TUI — it's reported the first time the
             // user submits a prompt instead) and wired through
-            // `rokr_core::single_turn`. `rokr-tui` stays decoupled from
+            // `rokr_core::run_tool_loop`. `rokr-tui` stays decoupled from
             // `rokr-core`/`rokr-provider`, so this closure is where the
             // message model and provider abstraction meet the TUI.
             let provider = rokr_provider::OpenAiProvider::from_env()
@@ -28,7 +28,19 @@ async fn main() -> ExitCode {
                 let provider = provider.clone();
                 async move {
                     let provider = provider?;
-                    rokr_core::single_turn(provider.as_ref(), input)
+
+                    // Fixed read-only tool set (ADR 0005: no
+                    // preview/permission gate needed since none of these
+                    // are `PreviewableTool`s). Agent-tier selection lands
+                    // in a later ticket; for now every prompt gets the same
+                    // four tools.
+                    let read = rokr_tools::read::ReadTool;
+                    let glob = rokr_tools::glob::GlobTool;
+                    let grep = rokr_tools::grep::GrepTool;
+                    let ls = rokr_tools::ls::LsTool;
+                    let tools: [&dyn rokr_core::ExecutableTool; 4] = [&read, &glob, &grep, &ls];
+
+                    rokr_core::run_tool_loop(provider.as_ref(), input, &tools)
                         .await
                         .map(|message| message.text())
                         .map_err(|err| err.to_string())
