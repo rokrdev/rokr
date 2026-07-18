@@ -21,9 +21,63 @@ pub enum ConfigError {
     },
 }
 
+/// Default system prompt for the Plan agent, scaffolded to `agents/plan.md`
+/// on first run.
+const DEFAULT_PLAN_PROMPT: &str = "\
+# Plan Agent
+
+You are the Plan agent. Given a user request, analyze the relevant code and \
+produce a clear, step-by-step implementation plan.
+
+- Read enough of the codebase to understand the current behavior and \
+  conventions before proposing changes.
+- Break the work into small, ordered steps that a Build agent can follow \
+  without further clarification.
+- Call out risks, open questions, and files you expect to touch.
+- Do not edit any files or write code yourself — your output is the plan.
+";
+
+/// Default system prompt for the Build agent, scaffolded to `agents/build.md`
+/// on first run.
+const DEFAULT_BUILD_PROMPT: &str = "\
+# Build Agent
+
+You are the Build agent. Given an implementation plan, carry it out.
+
+- Follow the plan's steps in order, adapting only when the plan conflicts \
+  with what you find in the code.
+- Write tests alongside (or before) the code they cover, and keep the \
+  change scoped to what the plan describes.
+- Prefer small, reviewable edits over large rewrites.
+- Run the relevant tests before considering a step complete.
+";
+
+/// Scaffold `agents/plan.md` and `agents/build.md` under `config_dir` with
+/// default prompt content, if they do not already exist. Existing files are
+/// left untouched.
+fn scaffold_agent_prompts(config_dir: &Path) -> Result<(), ConfigError> {
+    let agents_dir = config_dir.join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+
+    for (name, default_content) in [
+        ("plan.md", DEFAULT_PLAN_PROMPT),
+        ("build.md", DEFAULT_BUILD_PROMPT),
+    ] {
+        let path = agents_dir.join(name);
+        if !path.exists() {
+            std::fs::write(&path, default_content)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Load config from `config_dir/rokr.json`, creating it with `"version": 1`
 /// if it does not already exist. Never overwrites an existing file; an
 /// existing file is parsed and returned as-is.
+///
+/// Also scaffolds `agents/plan.md` and `agents/build.md` under `config_dir`
+/// with default prompt content, if they do not already exist.
 pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
     std::fs::create_dir_all(config_dir)?;
     let file_path = config_dir.join("rokr.json");
@@ -35,12 +89,14 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
                 path: file_path.clone(),
                 source,
             })?;
+        scaffold_agent_prompts(config_dir)?;
         return Ok(config);
     }
 
     let config = Config { version: 1 };
     let json = serde_json::to_string_pretty(&config).expect("Config serialization is infallible");
     std::fs::write(&file_path, json)?;
+    scaffold_agent_prompts(config_dir)?;
     Ok(config)
 }
 
@@ -93,6 +149,61 @@ mod tests {
         assert_eq!(
             contents, existing,
             "existing config file must not be modified by load_or_init"
+        );
+    }
+
+    #[test]
+    fn scaffold_writes_plan_and_build_prompts() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let _ = load_or_init(temp.path()).unwrap();
+
+        let plan_path = temp.path().join("agents").join("plan.md");
+        let build_path = temp.path().join("agents").join("build.md");
+
+        let plan_contents = std::fs::read_to_string(&plan_path).unwrap_or_else(|e| {
+            panic!("expected plan prompt at {plan_path:?} to exist: {e}");
+        });
+        let build_contents = std::fs::read_to_string(&build_path).unwrap_or_else(|e| {
+            panic!("expected build prompt at {build_path:?} to exist: {e}");
+        });
+
+        assert!(
+            !plan_contents.trim().is_empty(),
+            "expected plan.md to have non-empty content"
+        );
+        assert!(
+            !build_contents.trim().is_empty(),
+            "expected build.md to have non-empty content"
+        );
+    }
+
+    #[test]
+    fn scaffold_skips_existing_prompt_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents_dir = temp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let plan_path = agents_dir.join("plan.md");
+        let user_content = "# my custom plan prompt\ndo not touch this";
+        std::fs::write(&plan_path, user_content).unwrap();
+
+        let _ = load_or_init(temp.path()).unwrap();
+
+        // Scaffolding still runs for the untouched file, proving this test
+        // actually exercises the scaffold path rather than trivially passing
+        // because nothing writes to agents/ at all.
+        let build_contents = std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(
+            |e| panic!("expected build.md to be scaffolded alongside untouched plan.md: {e}"),
+        );
+        assert!(
+            !build_contents.trim().is_empty(),
+            "expected build.md to have non-empty content"
+        );
+
+        let contents = std::fs::read_to_string(&plan_path).unwrap();
+        assert_eq!(
+            contents, user_content,
+            "existing plan.md must not be overwritten by scaffolding"
         );
     }
 }

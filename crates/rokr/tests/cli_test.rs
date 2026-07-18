@@ -51,3 +51,36 @@ fn first_run_creates_config_file_with_version_one() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+#[test]
+fn first_run_scaffolds_agent_prompt_files() {
+    let home = unique_temp_dir("home");
+    let xdg_config_home = unique_temp_dir("xdg-config-home");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    cmd.env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .assert()
+        .success();
+
+    let agents_dir = xdg_config_home.join("rokr").join("agents");
+    let plan_contents = std::fs::read_to_string(agents_dir.join("plan.md")).unwrap_or_else(|e| {
+        panic!("expected plan.md at {agents_dir:?}: {e}");
+    });
+    let build_contents =
+        std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(|e| {
+            panic!("expected build.md at {agents_dir:?}: {e}");
+        });
+
+    assert!(
+        !plan_contents.trim().is_empty(),
+        "expected plan.md to have non-empty content"
+    );
+    assert!(
+        !build_contents.trim().is_empty(),
+        "expected build.md to have non-empty content"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
