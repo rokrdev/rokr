@@ -8,10 +8,10 @@ pub use message::{CacheControl, CacheControlKind, ContentBlock, Message, Role};
 /// next assistant `Message`. Defined here rather than in `rokr-provider` so
 /// that `rokr-core`'s own orchestration (e.g. [`single_turn`]) can be generic
 /// over it without `rokr-core` depending on `rokr-provider` — which already
-/// depends on `rokr-core` per ADR 0003, so the reverse edge would be a cycle.
-/// `rokr-provider` re-exports this trait so existing call sites are
-/// unaffected; concrete implementations still live there, one module per
-/// provider (ADR 0003).
+/// depends on `rokr-core` per ADR 0003 as refined by 0009, so the reverse
+/// edge would be a cycle. `rokr-provider` re-exports this trait so existing
+/// call sites are unaffected; concrete implementations still live there,
+/// one module per provider (ADR 0003 as refined by 0009).
 ///
 /// The associated `Error` type keeps this trait free of any
 /// provider-specific error shape (e.g. reqwest/serde_json failure variants),

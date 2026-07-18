@@ -11,7 +11,9 @@ product you want to change, you know which crate to open. See the root
 - **Tools** — implement the `Tool` trait in `rokr-tools`. Each tool is a
   single file (e.g. `read.rs`, `bash.rs`, `grep.rs`).
 - **Providers** — implement the `Provider` trait in `rokr-provider`. Each
-  provider is its own module (e.g. `openai.rs`, `anthropic.rs`).
+  provider is its own module (e.g. `openai.rs`, `anthropic.rs`) (declared in
+  `rokr-core`, re-exported here — you still `impl` it in a `rokr-provider`
+  module).
 - **Agents** — agents are defined as markdown prompts, not Rust code. Drop a
   new prompt file into the agents directory to define an agent's behavior.
 
