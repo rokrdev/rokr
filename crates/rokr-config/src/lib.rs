@@ -89,13 +89,21 @@ pub fn read_agent_prompt(config_dir: &Path, agent: &str) -> Result<String, Confi
 /// Reads project-level context from `cwd`, if any is present. Looks for
 /// `AGENTS.md` first; if it isn't there, falls back to `CLAUDE.md`. Never
 /// reads both. Neither present is not an error — just no project context.
+/// The fallback only triggers when `AGENTS.md` is absent (`NotFound`); a
+/// read error for any other reason (e.g. a permissions error, or the path
+/// existing but not being a readable file) is treated as no context,
+/// without falling back to `CLAUDE.md`.
 /// This is a one-time, unconditional, side-effect-free read intended to be
 /// folded into the system prompt at startup — not a tool, not permission-
 /// gated.
 pub fn load_project_context(cwd: &Path) -> Option<String> {
-    std::fs::read_to_string(cwd.join("AGENTS.md"))
-        .or_else(|_| std::fs::read_to_string(cwd.join("CLAUDE.md")))
-        .ok()
+    match std::fs::read_to_string(cwd.join("AGENTS.md")) {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::read_to_string(cwd.join("CLAUDE.md")).ok()
+        }
+        Err(_) => None,
+    }
 }
 
 /// Load config from `config_dir/rokr.json`, creating it with `"version": 1`
@@ -334,5 +342,43 @@ mod tests {
         let context = load_project_context(temp.path());
 
         assert_eq!(context.as_deref(), Some(claude_content));
+    }
+
+    // Unix-only: relies on chmod semantics to make AGENTS.md unreadable,
+    // which have no portable Windows equivalent.
+    //
+    // Note: if this test is ever run as root (e.g. some CI/sandbox setups),
+    // permission bits on files owned by root don't block root's own reads,
+    // so the read may unexpectedly succeed and this test would need a
+    // root-detection guard. No such guard exists elsewhere in this
+    // workspace to mirror, so it's intentionally omitted here.
+    #[cfg(unix)]
+    #[test]
+    fn load_project_context_does_not_fall_back_when_agents_md_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let agents_path = temp.path().join("AGENTS.md");
+        let claude_content = "# Project CLAUDE.md\nThis must not be loaded.";
+        std::fs::write(&agents_path, "# Project AGENTS.md\nUnreadable.").unwrap();
+        std::fs::write(temp.path().join("CLAUDE.md"), claude_content).unwrap();
+
+        std::fs::set_permissions(&agents_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let context = load_project_context(temp.path());
+
+        // Restore permissions before the tempdir drops, so cleanup can
+        // delete the file.
+        std::fs::set_permissions(&agents_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_ne!(
+            context.as_deref(),
+            Some(claude_content),
+            "must not silently fall back to CLAUDE.md when AGENTS.md exists but is unreadable"
+        );
+        assert_eq!(
+            context, None,
+            "a non-NotFound read error on AGENTS.md must yield no project context"
+        );
     }
 }
