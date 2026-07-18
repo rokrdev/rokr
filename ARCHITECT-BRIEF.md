@@ -16,9 +16,10 @@ provider → render) works before any agentic behavior is layered on.
 - **Config**: JSON at `~/.config/rokr/rokr.json`, created on first run with an
   explicit `"version": 1` field (ADR 0002). Config is a public contract for
   OSS users — schema is versioned from day one, migrations required on bumps.
-- **Provider abstraction**: a `Provider` trait in `rokr-provider`, one module
-  per implementation (ADR 0003). Phase 1 ships only the OpenAI-compatible
-  implementation (url/model/api_key via env vars); Anthropic lands in Phase 4.
+- **Provider abstraction**: trait declared in `rokr-core` (port); impls +
+  one-module-per-provider in `rokr-provider` (ADR 0003 as refined by 0009).
+  Phase 1 ships only the OpenAI-compatible implementation (url/model/api_key
+  via env vars); Anthropic lands in Phase 4.
 - **Message/content-block model**: `rokr-core` models Anthropic-style
   structured content blocks with `cache_control` breakpoints from day one
   (ADR 0006), even though Phase 1 only exercises a single-turn, non-cached

@@ -2,7 +2,7 @@
 
 ## Status
 
-accepted
+superseded by [0009](0009-provider-trait-location.md)
 
 ## Context
 
