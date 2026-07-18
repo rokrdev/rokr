@@ -9,13 +9,13 @@
    model call rendered in the TUI.
 
 2. **Phase 2** — Agent tool loop (model → tool call → execute → result →
-   iterate) + core tools (read, write, edit, bash, glob, grep, ls, webfetch,
-   websearch — the agent needs docs access) + permission prompts. Plan agent
-   = read-only tool set; Build agent = full tool set. Permissions ship WITH
-   tools, same phase. Write/edit tool calls render as a diff review UI with
-   accept/reject, pairing naturally with the permission prompts above.
-   Project context files (AGENTS.md, plus a rokr-specific override file) are
-   auto-loaded from the project root into the system prompt.
+   iterate) + core tools (read, write, edit, bash, glob, grep, ls) +
+   permission prompts. Plan agent = read-only tool set; Build agent = full
+   tool set. Permissions ship WITH tools, same phase. Write/edit tool calls
+   render as a diff review UI with accept/reject, pairing naturally with the
+   permission prompts above. Project context files (AGENTS.md, plus a
+   rokr-specific override file) are auto-loaded from the project root into
+   the system prompt.
 
 3. **Phase 3** — Cache optimization (cache_control breakpoints, ≥1h prompt
    caching, following Claude/Crush best practices) + auto-compaction at a
@@ -26,10 +26,11 @@
 
 4. **Phase 4** — Anthropic provider + subagents (user-defined, own prompts,
    navigable) + session-scoped model search/switch (does not persist to
-   config). Provider resilience (retries with exponential backoff,
-   rate-limit handling, provider failover) is designed into the `Provider`
-   trait and implemented in this phase. OAuth login for subscription plans
-   (Claude Pro/Max-style) supplements API-key auth.
+   config) + webfetch/websearch tools (deferred from Phase 2). Provider
+   resilience (retries with exponential backoff, rate-limit handling,
+   provider failover) is designed into the `Provider` trait and implemented
+   in this phase. OAuth login for subscription plans (Claude Pro/Max-style)
+   supplements API-key auth.
 
 5. **Phase 5** — Session management: resume, search older sessions, jump
    between sessions with a swap warning; mouse support; status line (session
