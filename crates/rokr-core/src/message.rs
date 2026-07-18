@@ -1,0 +1,125 @@
+//! Provider-agnostic message model (ADR 0006).
+//!
+//! Every message — system, user, or assistant — is a role plus an ordered
+//! list of content blocks. `ContentBlock` is the designated extension point
+//! for new modalities and turn types (tool calls, images, thinking); it is
+//! intentionally *not* `#[non_exhaustive]` so that adding a variant forces a
+//! compile error in every provider adapter's `match`, guaranteeing no
+//! provider silently drops a block type it doesn't handle.
+//!
+//! `rokr-core` types derive `serde::{Serialize, Deserialize}` only for
+//! rokr's own persistence (sessions, checkpoints) in a rokr-native shape.
+//! Providers own their own wire DTOs and convert `Message` <-> DTO at the
+//! edge (ADR 0003) — no provider-specific serde attributes belong here.
+
+use serde::{Deserialize, Serialize};
+
+/// Who authored a message. Kept minimal and provider-neutral: providers map
+/// these onto their own conventions at the edge (e.g. Anthropic lifts
+/// `System` to the top-level `system` param; OpenAI tool results map onto
+/// the `tool` role, not a rokr role).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+/// Caching hint kind. Phase 1 only defines `Ephemeral`; more kinds may be
+/// added later without touching `ContentBlock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheControlKind {
+    Ephemeral,
+}
+
+/// Caching hint attached to a content block. Always `None` until Phase 3;
+/// present now so caching is additive rather than a struct change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheControl {
+    pub kind: CacheControlKind,
+}
+
+/// A single unit of content within a message. This enum is the designated
+/// extension point for the message model: new modalities and turn types
+/// (tool calls, images, thinking) are added as variants, never by changing
+/// `Message` or `Role`.
+///
+/// Deliberately NOT `#[non_exhaustive]`: adding a variant must break every
+/// provider adapter's `match` at compile time.
+// Phase 2:  ToolUse { id, name, input }
+//           ToolResult { tool_use_id, content, is_error }
+// Phase 8:  Image { source, cache_control }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentBlock {
+    Text {
+        text: String,
+        cache_control: Option<CacheControl>,
+    },
+}
+
+/// A message is always role + an ordered list of blocks, uniformly. The
+/// Anthropic-style "content may be a bare string" shortcut is a wire-format
+/// concern owned by the provider adapter, not the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    pub role: Role,
+    pub content: Vec<ContentBlock>,
+}
+
+impl Message {
+    fn text_message(role: Role, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    pub fn system_text(text: impl Into<String>) -> Self {
+        Self::text_message(Role::System, text)
+    }
+
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self::text_message(Role::User, text)
+    }
+
+    pub fn assistant_text(text: impl Into<String>) -> Self {
+        Self::text_message(Role::Assistant, text)
+    }
+
+    /// Concatenates all `Text` blocks in order. Convenience accessor for the
+    /// render layer; other block kinds contribute nothing until they exist.
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text, .. } => text.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_roundtrips_role_and_content() {
+        let original = Message::user_text("hello world");
+
+        let json = serde_json::to_string(&original).expect("serialize message");
+        let restored: Message = serde_json::from_str(&json).expect("deserialize message");
+
+        assert_eq!(restored.role, Role::User);
+        assert_eq!(restored.content.len(), 1);
+        match &restored.content[0] {
+            ContentBlock::Text { text, cache_control } => {
+                assert_eq!(text, "hello world");
+                assert!(cache_control.is_none());
+            }
+        }
+    }
+}
