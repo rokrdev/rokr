@@ -32,6 +32,22 @@ impl EditTool {
         }
         Ok(contents.replacen(old_str, new_str, 1))
     }
+
+    /// Validates that `old_str` occurs in the file at `path` (without
+    /// touching the filesystem), then returns the raw `(old_str, new_str)`
+    /// pair for a permission preview to render as a partial diff. Unlike
+    /// `write`'s preview (whole file before/after), `edit`'s diff-review must
+    /// show only the targeted changed region, so this deliberately returns
+    /// the snippet itself rather than the file's full before/after content.
+    pub fn diff_snippet(
+        path: &str,
+        old_str: &str,
+        new_str: &str,
+    ) -> Result<(String, String), ToolError> {
+        let contents = std::fs::read_to_string(path)?;
+        Self::apply(&contents, old_str, new_str, path)?;
+        Ok((old_str.to_string(), new_str.to_string()))
+    }
 }
 
 impl Tool for EditTool {
@@ -105,6 +121,28 @@ mod tests {
             "preview must not modify the file on disk: preview was {preview}"
         );
         assert!(preview.contains("world") && preview.contains("rokr"));
+    }
+
+    #[test]
+    fn edit_preview_shows_targeted_replacement_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("multi.txt");
+        std::fs::write(&file_path, "line1\nline2\nline3\n").unwrap();
+
+        let (old, new) =
+            EditTool::diff_snippet(&file_path.to_string_lossy(), "line2", "replaced_line2")
+                .expect("diff_snippet should succeed when old_str is present in the file");
+
+        assert_eq!(old, "line2");
+        assert_eq!(new, "replaced_line2");
+        assert!(
+            !old.contains("line1") && !old.contains("line3"),
+            "diff snippet must contain only the targeted region, not unrelated file lines, got old: {old:?}"
+        );
+        assert!(
+            !new.contains("line1") && !new.contains("line3"),
+            "diff snippet must contain only the targeted region, not unrelated file lines, got new: {new:?}"
+        );
     }
 
     #[tokio::test]

@@ -209,6 +209,72 @@ impl ExecutableTool for rokr_tools::write::WriteTool {
     }
 }
 
+/// `edit` can't use [`impl_executable_tool_gated!`] for the same structural
+/// reason as `write` (see that impl's doc comment): [`PermissionPayload::Diff`]
+/// needs two strings, not the single `String` `PreviewableTool::preview`
+/// produces. Unlike `write`, though, `edit`'s diff-review must render only
+/// the targeted changed region rather than the whole file (ticket
+/// `diff-review-edit`: "not a whole-file overwrite framing"), so this reads
+/// `path`/`old_str`/`new_str` off the tool-call JSON and delegates to
+/// `EditTool::diff_snippet` for the (old, new) pair, rather than diffing the
+/// file's full before/after content the way `write`'s preview does.
+impl ExecutableTool for rokr_tools::edit::EditTool {
+    fn name(&self) -> &'static str {
+        rokr_tools::Tool::name(self)
+    }
+
+    fn to_tool_spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: rokr_tools::Tool::name(self).to_string(),
+            description: rokr_tools::Tool::description(self).to_string(),
+            input_schema: rokr_tools::Tool::input_schema(self),
+        }
+    }
+
+    fn execute_boxed<'a>(
+        &'a self,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            <rokr_tools::edit::EditTool as rokr_tools::Tool>::execute(self, input).await
+        })
+    }
+
+    fn preview(
+        &self,
+        input: serde_json::Value,
+    ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
+        let path = match input.get("path").and_then(|v| v.as_str()) {
+            Some(path) => path,
+            None => {
+                return Some(Err(rokr_tools::ToolError::InvalidInput(
+                    "missing \"path\"".to_string(),
+                )))
+            }
+        };
+        let old_str = match input.get("old_str").and_then(|v| v.as_str()) {
+            Some(old_str) => old_str,
+            None => {
+                return Some(Err(rokr_tools::ToolError::InvalidInput(
+                    "missing \"old_str\"".to_string(),
+                )))
+            }
+        };
+        let new_str = match input.get("new_str").and_then(|v| v.as_str()) {
+            Some(new_str) => new_str,
+            None => {
+                return Some(Err(rokr_tools::ToolError::InvalidInput(
+                    "missing \"new_str\"".to_string(),
+                )))
+            }
+        };
+        Some(
+            rokr_tools::edit::EditTool::diff_snippet(path, old_str, new_str)
+                .map(|(old, new)| PermissionPayload::Diff { old, new }),
+        )
+    }
+}
+
 /// Runs the agent tool loop (ADR 0004) against the running conversation
 /// `transcript`, and for as long as the reply contains `ToolUse` blocks,
 /// executes each named tool from `tools` directly (no preview/permission
