@@ -455,6 +455,233 @@ async fn typed_prompt_triggers_read_tool_call_and_renders_final_reply() {
 }
 
 #[tokio::test]
+async fn second_prompt_includes_prior_turn_in_request_body() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Single tokens (no spaces) for the same reason as the other tests:
+    // ratatui only redraws changed cells, so a literal substring match on
+    // raw pty bytes needs to avoid spaces that might not get rewritten.
+    let first_reply_text = "FirstReplyTokenForTesting";
+    let second_reply_text = "SecondReplyTokenForTesting";
+
+    // First call gets a distinct reply so we can tell it apart on screen
+    // from the second call's reply. `up_to_n_times(1)` plus insertion-order
+    // priority means this mock stops matching after its one hit, so the
+    // broader mock below handles every call after that.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-first",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": first_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-second",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": second_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-second-turn");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-second-turn");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"firstpromptunique\r")
+        .expect("failed to write first prompt to pty");
+
+    let first_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("firstpromptunique"),
+        "expected pty output to contain the first typed prompt, got: {output:?}"
+    );
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain the first mocked assistant response, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"secondpromptunique\r")
+        .expect("failed to write second prompt to pty");
+
+    let second_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < second_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("secondpromptunique"),
+        "expected pty output to contain the second typed prompt, got: {output:?}"
+    );
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain the second mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        received_requests.len() >= 2,
+        "expected at least 2 requests to /chat/completions, got {}: {received_requests:?}",
+        received_requests.len()
+    );
+
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    let second_request_body = String::from_utf8_lossy(&received_requests[1].body).into_owned();
+
+    assert!(
+        !first_request_body.contains("secondpromptunique"),
+        "expected the first request body to NOT already contain the second prompt's text, \
+         got: {first_request_body}"
+    );
+
+    assert!(
+        second_request_body.contains("firstpromptunique"),
+        "expected the second request body to contain the first prompt's text, proving the \
+         prior turn was included in the conversation history, got: {second_request_body}"
+    );
+    assert!(
+        second_request_body.contains(first_reply_text),
+        "expected the second request body to contain the first turn's assistant reply text, \
+         proving the prior turn was included in the conversation history, got: \
+         {second_request_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+#[tokio::test]
 async fn typed_prompt_renders_provider_error_in_view() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

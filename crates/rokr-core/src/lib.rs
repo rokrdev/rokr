@@ -79,26 +79,31 @@ impl_executable_tool!(rokr_tools::glob::GlobTool);
 impl_executable_tool!(rokr_tools::grep::GrepTool);
 impl_executable_tool!(rokr_tools::ls::LsTool);
 
-/// Runs the agent tool loop (ADR 0004): sends `input` as the first user turn
-/// to `provider`, and for as long as the reply contains `ToolUse` blocks,
+/// Runs the agent tool loop (ADR 0004) against the running conversation
+/// `transcript`, and for as long as the reply contains `ToolUse` blocks,
 /// executes each named tool from `tools` directly (no preview/permission
 /// gate — ADR 0005 restricts that to `PreviewableTool`s, which read-only
 /// tools never are) and feeds the results back as a new user turn before
-/// asking the provider again. Returns the first reply with no tool calls.
+/// asking the provider again. The caller owns `transcript` and is
+/// responsible for having already pushed the new user turn onto it before
+/// calling; this function appends the assistant/tool-call/tool-result
+/// messages it produces onto the same transcript in place, so the caller can
+/// reuse it (with the new turn already recorded) as the seed for a
+/// subsequent call. Returns the first reply with no tool calls, which is
+/// also pushed onto `transcript` before returning.
 ///
 /// A `ToolUse` naming a tool not present in `tools` produces an error
 /// `ToolResult` rather than failing the whole loop, so the provider can see
 /// the failure and recover (e.g. by trying a different tool or apologizing).
 pub async fn run_tool_loop<P: Provider>(
     provider: &P,
-    input: impl Into<String>,
+    transcript: &mut Vec<Message>,
     tools: &[&dyn ExecutableTool],
 ) -> Result<Message, P::Error> {
     let tool_specs: Vec<ToolSpec> = tools.iter().map(|tool| tool.to_tool_spec()).collect();
-    let mut transcript = vec![Message::user_text(input)];
 
     loop {
-        let reply = provider.send(&transcript, &tool_specs).await?;
+        let reply = provider.send(&transcript[..], &tool_specs).await?;
 
         let tool_uses: Vec<(String, String, serde_json::Value)> = reply
             .content
@@ -112,6 +117,7 @@ pub async fn run_tool_loop<P: Provider>(
             .collect();
 
         if tool_uses.is_empty() {
+            transcript.push(reply.clone());
             return Ok(reply);
         }
 
@@ -284,12 +290,20 @@ mod tests {
         let read_tool = FakeReadTool;
         let tools: [&dyn ExecutableTool; 1] = [&read_tool];
 
-        let result = run_tool_loop(&provider, "read the file", &tools)
+        let mut transcript = vec![Message::user_text("read the file")];
+
+        let result = run_tool_loop(&provider, &mut transcript, &tools)
             .await
             .expect("loop should succeed");
 
         assert_eq!(result.role, Role::Assistant);
         assert_eq!(result.text(), "final answer");
+
+        assert_eq!(
+            transcript.last(),
+            Some(&result),
+            "the final reply should also be pushed onto the running transcript"
+        );
 
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "provider should be called once per turn");

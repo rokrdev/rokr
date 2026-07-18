@@ -24,8 +24,16 @@ async fn main() -> ExitCode {
                 .map(Arc::new)
                 .map_err(|err| err.to_string());
 
+            // In-memory only (no persistence, per the PRD): accumulates
+            // every turn across submits for the lifetime of the process, so
+            // each new prompt is sent with the full prior conversation
+            // history rather than in isolation.
+            let transcript: Arc<tokio::sync::Mutex<Vec<rokr_core::Message>>> =
+                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
             let submit = move |input: String| {
                 let provider = provider.clone();
+                let transcript = transcript.clone();
                 async move {
                     let provider = provider?;
 
@@ -40,7 +48,10 @@ async fn main() -> ExitCode {
                     let ls = rokr_tools::ls::LsTool;
                     let tools: [&dyn rokr_core::ExecutableTool; 4] = [&read, &glob, &grep, &ls];
 
-                    rokr_core::run_tool_loop(provider.as_ref(), input, &tools)
+                    let mut transcript = transcript.lock().await;
+                    accumulate_user_turn(&mut transcript, input);
+
+                    rokr_core::run_tool_loop(provider.as_ref(), &mut transcript, &tools)
                         .await
                         .map(|message| message.text())
                         .map_err(|err| err.to_string())
@@ -71,5 +82,44 @@ async fn main() -> ExitCode {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Appends a new user-turn message onto the running conversation transcript.
+/// `run_tool_loop` appends the corresponding assistant/tool-call/tool-result
+/// messages as it executes; this is the seam where a fresh prompt joins that
+/// running history.
+fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
+    transcript.push(rokr_core::Message::user_text(input));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rokr_core::{Message, Role};
+
+    #[test]
+    fn running_transcript_accumulates_turns() {
+        let mut transcript: Vec<Message> = Vec::new();
+
+        accumulate_user_turn(&mut transcript, "first prompt".to_string());
+        transcript.push(Message::assistant_text("first reply"));
+
+        accumulate_user_turn(&mut transcript, "second prompt".to_string());
+        transcript.push(Message::assistant_text("second reply"));
+
+        assert_eq!(transcript.len(), 4);
+
+        assert_eq!(transcript[0].role, Role::User);
+        assert_eq!(transcript[0].text(), "first prompt");
+
+        assert_eq!(transcript[1].role, Role::Assistant);
+        assert_eq!(transcript[1].text(), "first reply");
+
+        assert_eq!(transcript[2].role, Role::User);
+        assert_eq!(transcript[2].text(), "second prompt");
+
+        assert_eq!(transcript[3].role, Role::Assistant);
+        assert_eq!(transcript[3].text(), "second reply");
     }
 }
