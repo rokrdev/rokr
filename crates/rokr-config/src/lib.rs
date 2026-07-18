@@ -19,6 +19,12 @@ pub enum ConfigError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("config file at {path} has unsupported version {found} (supported: {supported})")]
+    UnsupportedVersion {
+        path: std::path::PathBuf,
+        found: u32,
+        supported: u32,
+    },
 }
 
 /// Default system prompt for the Plan agent, scaffolded to `agents/plan.md`
@@ -89,6 +95,13 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
                 path: file_path.clone(),
                 source,
             })?;
+        if config.version != 1 {
+            return Err(ConfigError::UnsupportedVersion {
+                path: file_path.clone(),
+                found: config.version,
+                supported: 1,
+            });
+        }
         scaffold_agent_prompts(config_dir)?;
         return Ok(config);
     }
@@ -104,6 +117,7 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
 /// otherwise `$HOME/.config/rokr`.
 pub fn default_config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
@@ -205,5 +219,58 @@ mod tests {
             contents, user_content,
             "existing plan.md must not be overwritten by scaffolding"
         );
+    }
+
+    #[test]
+    fn load_or_init_rejects_unsupported_config_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        let existing = r#"{"version": 2}"#;
+        std::fs::write(&file_path, existing).unwrap();
+
+        let result = load_or_init(temp.path());
+
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::UnsupportedVersion { found: 2, supported: 1, .. })
+            ),
+            "expected UnsupportedVersion{{found: 2, supported: 1}}, got: {result:?}"
+        );
+
+        let contents = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            contents, existing,
+            "config file must not be modified when rejected for unsupported version"
+        );
+    }
+
+    #[test]
+    fn default_config_dir_treats_empty_xdg_config_home_as_unset() {
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENV_GUARD.lock().unwrap();
+
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let original_home = std::env::var_os("HOME");
+
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "");
+            std::env::set_var("HOME", "/tmp/rokr-test-home");
+        }
+
+        let dir = default_config_dir();
+
+        unsafe {
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(dir, PathBuf::from("/tmp/rokr-test-home/.config/rokr"));
     }
 }
