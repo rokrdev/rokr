@@ -90,8 +90,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
+        // Construct the guard before the fallible `execute!` below: if entering
+        // the alternate screen fails, the guard still gets dropped on the way
+        // out and disables raw mode instead of leaking it.
+        let guard = Self;
         execute!(io::stdout(), EnterAlternateScreen)?;
-        Ok(Self)
+        Ok(guard)
     }
 }
 
@@ -176,9 +180,15 @@ where
     // event loop without blocking it: each iteration does a non-blocking
     // `try_recv` alongside the existing crossterm poll.
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
+    // ADR 0008: redraw only on state change, never on a fixed timer with no
+    // change. Starts true so the first frame still paints.
+    let mut dirty = true;
 
     loop {
-        terminal.draw(|frame| draw(frame, state))?;
+        if dirty {
+            terminal.draw(|frame| draw(frame, state))?;
+            dirty = false;
+        }
 
         if let Ok(outcome) = rx.try_recv() {
             state.pending = false;
@@ -186,6 +196,7 @@ where
                 Ok(response) => state.view_lines.push(response),
                 Err(error) => state.view_lines.push(format!("Error: {error}")),
             }
+            dirty = true;
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -207,6 +218,7 @@ where
                         let input = std::mem::take(&mut state.prompt_input);
                         state.view_lines.push(format!("> {input}"));
                         state.pending = true;
+                        dirty = true;
 
                         let submit_fut = submit(input);
                         let tx = tx.clone();
@@ -215,9 +227,13 @@ where
                             let _ = tx.send(outcome);
                         });
                     }
-                    KeyCode::Char(c) => state.prompt_input.push(c),
+                    KeyCode::Char(c) => {
+                        state.prompt_input.push(c);
+                        dirty = true;
+                    }
                     KeyCode::Backspace => {
                         state.prompt_input.pop();
+                        dirty = true;
                     }
                     _ => {}
                 }
