@@ -7,7 +7,7 @@
 use rokr_core::{Message, Role};
 use rokr_provider::{OpenAiProvider, Provider};
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -16,6 +16,16 @@ async fn openai_provider_returns_assistant_message_from_mock_server() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-api-key"))
+        .and(body_partial_json(json!({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Say hello"
+                }
+            ]
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -30,6 +40,7 @@ async fn openai_provider_returns_assistant_message_from_mock_server() {
                 }
             ]
         })))
+        .expect(1)
         .mount(&mock_server)
         .await;
 
@@ -61,5 +72,67 @@ async fn openai_provider_surfaces_http_error_as_provider_error() {
     assert!(
         result.is_err(),
         "a 500 from the provider must surface as Err, not panic or Ok"
+    );
+}
+
+#[tokio::test]
+async fn openai_provider_surfaces_invalid_json_as_deserialize_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&mock_server)
+        .await;
+
+    let provider = OpenAiProvider::new(mock_server.uri(), "gpt-4o-mini", "test-api-key");
+
+    let result = provider.send(&[Message::user_text("Say hello")]).await;
+
+    assert!(
+        matches!(result, Err(rokr_provider::ProviderError::Deserialize(_))),
+        "a 200 with a non-JSON body must surface as ProviderError::Deserialize"
+    );
+}
+
+#[tokio::test]
+async fn openai_provider_surfaces_empty_choices_as_empty_response_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "choices": [] })))
+        .mount(&mock_server)
+        .await;
+
+    let provider = OpenAiProvider::new(mock_server.uri(), "gpt-4o-mini", "test-api-key");
+
+    let result = provider.send(&[Message::user_text("Say hello")]).await;
+
+    assert!(
+        matches!(result, Err(rokr_provider::ProviderError::EmptyResponse)),
+        "a 200 with an empty choices array must surface as ProviderError::EmptyResponse"
+    );
+}
+
+/// Guards `from_env` tests that mutate process-wide environment variables.
+/// Nothing else in this binary currently touches `ROKR_OPENAI_*`, but this
+/// mutex keeps that an enforced invariant rather than an assumed one, so a
+/// future test added to this file can't flakily race this one.
+static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn openai_provider_from_env_surfaces_missing_env_var() {
+    let _lock = ENV_GUARD.lock().unwrap();
+
+    std::env::remove_var(rokr_provider::openai::ENV_BASE_URL);
+    std::env::remove_var(rokr_provider::openai::ENV_MODEL);
+    std::env::remove_var(rokr_provider::openai::ENV_API_KEY);
+
+    let result = rokr_provider::OpenAiProvider::from_env();
+
+    assert!(
+        matches!(result, Err(rokr_provider::ProviderError::MissingEnvVar(_))),
+        "from_env() with unset env vars must surface as ProviderError::MissingEnvVar"
     );
 }
