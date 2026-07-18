@@ -45,12 +45,24 @@ pub struct AppState {
 /// A gated tool call awaiting user permission, described in primitives only
 /// (no dependency on `rokr-core`'s specific payload enum — see this
 /// module's `run` doc comment on staying decoupled from rokr-core/
-/// rokr-provider types). `detail` is a human-readable description of the
-/// tool's effect, e.g. the shell command for `bash`.
+/// rokr-provider types). `detail` is a description of the tool's effect,
+/// e.g. the shell command for `bash`, or an old/new diff for `write`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
     pub tool_name: String,
-    pub detail: String,
+    pub detail: PermissionDetail,
+}
+
+/// The primitive detail of what a gated tool call would do, shown in the
+/// permission prompt. Mirrors (but stays decoupled from, per this module's
+/// other docs) rokr-core's `PermissionPayload` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDetail {
+    /// A single free-form description, e.g. the shell command for `bash`.
+    Text(String),
+    /// Old/new content for a `write`-style change, rendered as a
+    /// line-level diff.
+    Diff { old: String, new: String },
 }
 
 /// Handle for requesting permission mid-`submit`, round-tripped through the
@@ -113,10 +125,18 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
 
     let mut view_lines = state.view_lines.clone();
     if let Some(request) = &state.permission_request {
-        view_lines.push(format!(
-            "permission needed: {} \"{}\"",
-            request.tool_name, request.detail
-        ));
+        match &request.detail {
+            PermissionDetail::Text(text) => {
+                view_lines.push(format!(
+                    "permission needed: {} \"{}\"",
+                    request.tool_name, text
+                ));
+            }
+            PermissionDetail::Diff { old, new } => {
+                view_lines.push(format!("permission needed: {}", request.tool_name));
+                view_lines.extend(diff_lines(old, new));
+            }
+        }
         view_lines.push("[y] allow  [n] deny".to_string());
     } else if state.pending {
         view_lines.push("...".to_string());
@@ -131,6 +151,17 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     let prompt = Paragraph::new(state.prompt_input.as_str())
         .block(Block::default().borders(Borders::ALL).title(PROMPT_TITLE));
     frame.render_widget(prompt, chunks[2]);
+}
+
+/// Renders `old` and `new` as a naive line-level diff: every line of `old`
+/// prefixed `-`, every line of `new` prefixed `+`. Not a minimal/LCS diff —
+/// deliberately simple per the ticket ("no new diff crate, plain old/new
+/// line comparison").
+fn diff_lines(old: &str, new: &str) -> Vec<String> {
+    old.lines()
+        .map(|line| format!("-{line}"))
+        .chain(new.lines().map(|line| format!("+{line}")))
+        .collect()
 }
 
 /// Ensures raw mode is disabled and the alternate screen is left, no matter

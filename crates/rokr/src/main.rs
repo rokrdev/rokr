@@ -38,17 +38,18 @@ async fn main() -> ExitCode {
                     let provider = provider?;
 
                     // Fixed tool set: read/glob/grep/ls auto-approve (ADR
-                    // 0005: none are `PreviewableTool`s), bash is gated and
-                    // round-trips through the permission callback below.
-                    // Agent-tier selection lands in a later ticket; for now
-                    // every prompt gets the same five tools.
+                    // 0005: none are `PreviewableTool`s), bash and write are
+                    // gated and round-trip through the permission callback
+                    // below. Agent-tier selection lands in a later ticket;
+                    // for now every prompt gets the same six tools.
                     let read = rokr_tools::read::ReadTool;
                     let glob = rokr_tools::glob::GlobTool;
                     let grep = rokr_tools::grep::GrepTool;
                     let ls = rokr_tools::ls::LsTool;
                     let bash = rokr_tools::bash::BashTool;
-                    let tools: [&dyn rokr_core::ExecutableTool; 5] =
-                        [&read, &glob, &grep, &ls, &bash];
+                    let write = rokr_tools::write::WriteTool;
+                    let tools: [&dyn rokr_core::ExecutableTool; 6] =
+                        [&read, &glob, &grep, &ls, &bash, &write];
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
@@ -61,9 +62,11 @@ async fn main() -> ExitCode {
                         let permission = permission.clone();
                         async move {
                             let detail = match request.payload {
-                                rokr_core::PermissionPayload::Command(command) => command,
+                                rokr_core::PermissionPayload::Command(command) => {
+                                    rokr_tui::PermissionDetail::Text(command)
+                                }
                                 rokr_core::PermissionPayload::Diff { old, new } => {
-                                    format!("--- old\n{old}\n+++ new\n{new}")
+                                    rokr_tui::PermissionDetail::Diff { old, new }
                                 }
                             };
                             permission

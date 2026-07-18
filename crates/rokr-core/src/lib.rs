@@ -155,6 +155,60 @@ macro_rules! impl_executable_tool_gated {
 
 impl_executable_tool_gated!(rokr_tools::bash::BashTool, PermissionPayload::Command);
 
+/// `write` can't use [`impl_executable_tool_gated!`]: that macro maps a
+/// `PreviewableTool::preview`'s single `String` through a tuple-variant
+/// constructor, but [`PermissionPayload::Diff`] is a struct variant needing
+/// two strings (old file content + new content), not one derived from the
+/// tool's own `PreviewableTool::preview`. So this reads `path`/`content`
+/// directly off the tool-call JSON and the file's current on-disk content,
+/// rather than going through `PreviewableTool`.
+impl ExecutableTool for rokr_tools::write::WriteTool {
+    fn name(&self) -> &'static str {
+        rokr_tools::Tool::name(self)
+    }
+
+    fn to_tool_spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: rokr_tools::Tool::name(self).to_string(),
+            description: rokr_tools::Tool::description(self).to_string(),
+            input_schema: rokr_tools::Tool::input_schema(self),
+        }
+    }
+
+    fn execute_boxed<'a>(
+        &'a self,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            <rokr_tools::write::WriteTool as rokr_tools::Tool>::execute(self, input).await
+        })
+    }
+
+    fn preview(
+        &self,
+        input: serde_json::Value,
+    ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
+        let path = match input.get("path").and_then(|v| v.as_str()) {
+            Some(path) => path,
+            None => {
+                return Some(Err(rokr_tools::ToolError::InvalidInput(
+                    "missing \"path\"".to_string(),
+                )))
+            }
+        };
+        let new = match input.get("content").and_then(|v| v.as_str()) {
+            Some(content) => content.to_string(),
+            None => {
+                return Some(Err(rokr_tools::ToolError::InvalidInput(
+                    "missing \"content\"".to_string(),
+                )))
+            }
+        };
+        let old = std::fs::read_to_string(path).unwrap_or_default();
+        Some(Ok(PermissionPayload::Diff { old, new }))
+    }
+}
+
 /// Runs the agent tool loop (ADR 0004) against the running conversation
 /// `transcript`, and for as long as the reply contains `ToolUse` blocks,
 /// executes each named tool from `tools` directly (no preview/permission
@@ -542,5 +596,53 @@ mod tests {
             }
             other => panic!("expected a single ToolResult block, got {other:?}"),
         }
+    }
+
+    /// Creates a fresh, uniquely-named directory under the system temp dir,
+    /// mirroring `crates/rokr/tests/tui_test.rs`'s `unique_temp_dir` helper
+    /// (duplicated here rather than shared, since rokr-core has no
+    /// `tempfile` dev-dependency to reach for instead).
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rokr-core-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_tool_preview_computed_before_permission_granted() {
+        let temp_dir = unique_temp_dir("write-preview");
+        let target_file = temp_dir.join("target.txt");
+        let old_content = "pre-existing content";
+        std::fs::write(&target_file, old_content).unwrap();
+        let target_path = target_file.to_string_lossy().into_owned();
+
+        let write_tool = rokr_tools::write::WriteTool;
+        let preview = write_tool.preview(serde_json::json!({
+            "path": target_path,
+            "content": "new content"
+        }));
+
+        match preview {
+            Some(Ok(PermissionPayload::Diff { old, new })) => {
+                assert_eq!(old, old_content);
+                assert_eq!(new, "new content");
+            }
+            other => panic!("expected Some(Ok(PermissionPayload::Diff {{ .. }})), got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&target_file).unwrap(),
+            old_content,
+            "preview must not have written to the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
