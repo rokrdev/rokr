@@ -155,16 +155,19 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     // pane. `Paragraph` has no bottom-anchor mode, so this computes an
     // explicit `scroll` offset instead.
     //
-    // Known limitation: this counts *unwrapped* lines against the pane's
-    // inner height, not post-wrap rendered rows, since wrapping depends on
-    // each line's content and isn't known until ratatui lays the paragraph
-    // out. For the short, mostly single-line entries this UI renders
-    // (transcript lines, diff lines, the prompt line) that's a good enough
-    // approximation; a very long unwrapped single line could still make the
-    // estimate short.
+    // Known limitation: this counts *unwrapped* logical lines against the
+    // pane's inner height, not post-wrap rendered rows, since wrapping
+    // depends on each line's content and isn't known until ratatui lays the
+    // paragraph out. Embedded newlines within a `view_lines` entry (e.g. a
+    // multi-paragraph model response pushed as a single entry) are counted
+    // exactly via `split('\n')` below, since `Paragraph::join("\n")` turns
+    // each one into a real rendered row regardless of pane width. Only
+    // *wrapping* of a long single logical line remains an approximation; a
+    // very long unwrapped line could still make the estimate short.
     let scroll_y = if showing_permission_prompt {
         let inner_height = chunks[1].height.saturating_sub(2); // top/bottom border
-        (view_lines.len() as u16).saturating_sub(inner_height)
+        let total_lines: usize = view_lines.iter().map(|line| line.split('\n').count()).sum();
+        (total_lines as u16).saturating_sub(inner_height)
     } else {
         0
     };
@@ -528,6 +531,46 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState {
             view_lines: (0..30).map(|i| format!("line {i}")).collect(),
+            permission_request: Some(PermissionRequest {
+                tool_name: "bash".to_string(),
+                detail: PermissionDetail::Text("some long command".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let prompt_visible = (area.y..area.y + area.height).any(|y| {
+            let row = row_text(buffer, y);
+            row.contains("[y] allow") && row.contains("[n] deny")
+        });
+        assert!(
+            prompt_visible,
+            "expected the '[y] allow  [n] deny' line to be visible somewhere in the rendered buffer"
+        );
+    }
+
+    /// F-010: a single `view_lines` entry containing many embedded `\n`
+    /// characters (as `event_loop` pushes whole model responses as one
+    /// entry) must still be counted toward the bottom-anchor scroll offset
+    /// on a per-rendered-line basis, not as a single Vec entry — otherwise
+    /// the scroll computation undercounts and the permission prompt gets
+    /// pushed off the bottom of the View pane, same symptom F-004 fixed.
+    #[test]
+    fn permission_prompt_stays_visible_with_embedded_newlines_in_single_entry() {
+        // 80 columns wide so none of the short lines below wrap, isolating
+        // the embedded-newline counting behavior under test from the
+        // separate wrap-approximation limitation documented on `draw`.
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let single_entry = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let state = AppState {
+            view_lines: vec![single_entry],
             permission_request: Some(PermissionRequest {
                 tool_name: "bash".to_string(),
                 detail: PermissionDetail::Text("some long command".to_string()),
