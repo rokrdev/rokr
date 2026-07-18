@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use tokio::sync::oneshot;
 
 /// Header block title, rendered at the top of the TUI.
 pub const HEADER_TITLE: &str = "Header";
@@ -33,6 +36,44 @@ pub struct AppState {
     /// pending indicator in [`draw`] and blocks new input/submission until
     /// the in-flight call resolves.
     pub pending: bool,
+    /// Set while a gated tool call is awaiting the user's accept/deny
+    /// decision. Drives the permission prompt in [`draw`] and, like
+    /// `pending`, blocks prompt input/submission until resolved.
+    pub permission_request: Option<PermissionRequest>,
+}
+
+/// A gated tool call awaiting user permission, described in primitives only
+/// (no dependency on `rokr-core`'s specific payload enum — see this
+/// module's `run` doc comment on staying decoupled from rokr-core/
+/// rokr-provider types). `detail` is a human-readable description of the
+/// tool's effect, e.g. the shell command for `bash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub detail: String,
+}
+
+/// Handle for requesting permission mid-`submit`, round-tripped through the
+/// render loop the same way the existing submit/response channel is (ADR
+/// 0008: provider/tool I/O stays off the render thread). `run` passes a
+/// fresh clone to each `submit` call; all clones share the same underlying
+/// channel into the render loop.
+#[derive(Clone)]
+pub struct PermissionHandle {
+    tx: mpsc::Sender<(PermissionRequest, oneshot::Sender<bool>)>,
+}
+
+impl PermissionHandle {
+    /// Sends `request` to the render loop and waits for the user's
+    /// accept/deny decision. Resolves to `false` (deny) if the render loop
+    /// is gone, so a gated tool fails closed rather than silently running.
+    pub async fn request(&self, request: PermissionRequest) -> bool {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self.tx.send((request, resp_tx)).is_err() {
+            return false;
+        }
+        resp_rx.await.unwrap_or(false)
+    }
 }
 
 /// Errors returned by [`run`].
@@ -71,10 +112,19 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     frame.render_widget(header, chunks[0]);
 
     let mut view_lines = state.view_lines.clone();
-    if state.pending {
+    if let Some(request) = &state.permission_request {
+        view_lines.push(format!(
+            "permission needed: {} \"{}\"",
+            request.tool_name, request.detail
+        ));
+        view_lines.push("[y] allow  [n] deny".to_string());
+    } else if state.pending {
         view_lines.push("...".to_string());
     }
+    // Wrapped so a long line (e.g. a bash command in a permission prompt)
+    // doesn't get silently clipped at the pane's width.
     let view = Paragraph::new(view_lines.join("\n"))
+        .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(VIEW_TITLE));
     frame.render_widget(view, chunks[1]);
 
@@ -128,16 +178,20 @@ fn install_panic_hook() {
 /// terminal on every exit path. Fails fast with [`TuiError::NotATty`] if
 /// stdout isn't a terminal, rather than corrupting non-interactive output.
 ///
-/// `submit` is called with the prompt text whenever the user presses Enter
-/// on a non-empty prompt; it is deliberately generic (rather than depending
-/// on `rokr-core`/`rokr-provider` types) so this crate stays decoupled from
-/// the message model and provider abstraction — the caller (typically
-/// `rokr`'s `main.rs`) wires those in. The call runs on a spawned tokio
+/// `submit` is called with the prompt text and a [`PermissionHandle`]
+/// whenever the user presses Enter on a non-empty prompt; it is
+/// deliberately generic (rather than depending on `rokr-core`/
+/// `rokr-provider` types) so this crate stays decoupled from the message
+/// model and provider abstraction — the caller (typically `rokr`'s
+/// `main.rs`) wires those in, bridging its own permission-request type to
+/// [`PermissionRequest`] via the handle. The call runs on a spawned tokio
 /// task so the blocking crossterm event loop never stalls waiting on it;
-/// [`AppState::pending`] reflects the in-flight state in the meantime.
+/// [`AppState::pending`] reflects the in-flight state in the meantime, and
+/// [`AppState::permission_request`] reflects a gated tool call awaiting the
+/// user's decision mid-`submit`.
 pub async fn run<F, Fut>(submit: F) -> Result<(), TuiError>
 where
-    F: Fn(String) -> Fut + Send + Sync + 'static,
+    F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
 {
     if !io::stdout().is_terminal() {
@@ -153,7 +207,7 @@ where
 
 fn run_blocking<F, Fut>(handle: tokio::runtime::Handle, submit: F) -> Result<(), TuiError>
 where
-    F: Fn(String) -> Fut + Send + Sync + 'static,
+    F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
 {
     install_panic_hook();
@@ -173,13 +227,21 @@ fn event_loop<F, Fut>(
     submit: &F,
 ) -> Result<(), TuiError>
 where
-    F: Fn(String) -> Fut + Send + Sync + 'static,
+    F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
 {
     // Carries the outcome of a spawned `submit` call back into the blocking
     // event loop without blocking it: each iteration does a non-blocking
     // `try_recv` alongside the existing crossterm poll.
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
+    // Carries permission requests from a spawned `submit` call into the
+    // render loop the same way, paired with a oneshot the render loop uses
+    // to send the user's decision back out to the awaiting `submit` call.
+    let (perm_tx, perm_rx) = mpsc::channel::<(PermissionRequest, oneshot::Sender<bool>)>();
+    // The responder for whichever request `state.permission_request`
+    // currently holds. Kept outside `AppState` because `oneshot::Sender`
+    // isn't `Clone`/`Debug`, which `AppState`'s derives require.
+    let mut pending_permission_responder: Option<oneshot::Sender<bool>> = None;
     // ADR 0008: redraw only on state change, never on a fixed timer with no
     // change. Starts true so the first frame still paints.
     let mut dirty = true;
@@ -188,6 +250,12 @@ where
         if dirty {
             terminal.draw(|frame| draw(frame, state))?;
             dirty = false;
+        }
+
+        if let Ok((request, responder)) = perm_rx.try_recv() {
+            state.permission_request = Some(request);
+            pending_permission_responder = Some(responder);
+            dirty = true;
         }
 
         if let Ok(outcome) = rx.try_recv() {
@@ -210,6 +278,33 @@ where
                         return Ok(());
                     }
 
+                    if let Some(responder) = pending_permission_responder.take() {
+                        match key.code {
+                            KeyCode::Char('y') => {
+                                let _ = responder.send(true);
+                                state.permission_request = None;
+                                dirty = true;
+                            }
+                            KeyCode::Char('n') => {
+                                if let Some(request) = &state.permission_request {
+                                    state
+                                        .view_lines
+                                        .push(format!("{}: permission denied", request.tool_name));
+                                }
+                                let _ = responder.send(false);
+                                state.permission_request = None;
+                                dirty = true;
+                            }
+                            _ => {
+                                // Not a decision key: put the responder back
+                                // and keep waiting, same as ignoring any
+                                // other key while `pending` is true below.
+                                pending_permission_responder = Some(responder);
+                            }
+                        }
+                        continue;
+                    }
+
                     if state.pending {
                         continue;
                     }
@@ -221,7 +316,10 @@ where
                             state.pending = true;
                             dirty = true;
 
-                            let submit_fut = submit(input);
+                            let permission = PermissionHandle {
+                                tx: perm_tx.clone(),
+                            };
+                            let submit_fut = submit(input, permission);
                             let tx = tx.clone();
                             handle.spawn(async move {
                                 let outcome = submit_fut.await;
@@ -257,19 +355,14 @@ fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
 
     fn row_text(buffer: &Buffer, y: u16) -> String {
         let area = buffer.area;
         (area.x..area.x + area.width)
-            .map(|x| {
-                buffer
-                    .cell((x, y))
-                    .map(|cell| cell.symbol())
-                    .unwrap_or(" ")
-            })
+            .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "))
             .collect()
     }
 

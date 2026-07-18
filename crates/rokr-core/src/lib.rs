@@ -18,6 +18,29 @@ pub struct ToolSpec {
     pub input_schema: serde_json::Value,
 }
 
+/// Primitive description of what a gated tool's execution would do, shown to
+/// the user before granting permission (`docs/adr/0005-permission-model.md`).
+/// `Command` covers `bash`, the only gated tool this ticket wires up.
+/// `Diff` is shaped now for the `write`/`edit` tools landing in later
+/// tickets, per ADR 0005's "permission-aware from the first tool onward" —
+/// nothing produces it yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionPayload {
+    Command(String),
+    Diff { old: String, new: String },
+}
+
+/// A gated tool call awaiting user permission: the tool's name plus a
+/// primitive description of its effect. Deliberately made of primitives
+/// only (no `serde_json::Value`, no tool objects), so a UI layer like
+/// `rokr-tui` can render it without depending on `rokr-core`/`rokr-tools`
+/// types (see that crate's `run` doc comment on staying decoupled).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub payload: PermissionPayload,
+}
+
 /// Object-safe veneer over `rokr_tools::Tool`, needed because `Tool::execute`
 /// is a native `async fn` and therefore not itself dyn-compatible. The tool
 /// loop needs to hold a heterogeneous, runtime-selectable set of tools (the
@@ -43,6 +66,20 @@ pub trait ExecutableTool: Send + Sync {
         &'a self,
         input: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>>;
+
+    /// Side-effect-free preview for gated tools (ADR 0005). `None` (the
+    /// default) for tools that don't implement `rokr_tools::PreviewableTool`
+    /// — read/glob/grep/ls stay auto-approved via this default, never
+    /// calling into the permission machinery. `Some(Ok(payload))` for a
+    /// gated tool, wrapping its preview into the matching
+    /// [`PermissionPayload`] variant; `Some(Err(_))` if the preview itself
+    /// failed (e.g. malformed input).
+    fn preview(
+        &self,
+        _input: serde_json::Value,
+    ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
+        None
+    }
 }
 
 /// Implements [`ExecutableTool`] for a concrete `rokr_tools::Tool` type by
@@ -79,6 +116,45 @@ impl_executable_tool!(rokr_tools::glob::GlobTool);
 impl_executable_tool!(rokr_tools::grep::GrepTool);
 impl_executable_tool!(rokr_tools::ls::LsTool);
 
+/// Like [`impl_executable_tool`], but for a `rokr_tools::PreviewableTool`:
+/// also implements [`ExecutableTool::preview`] by delegating to
+/// `PreviewableTool::preview` and wrapping its output in `$wrap`, the
+/// [`PermissionPayload`] variant constructor for this tool's preview shape.
+macro_rules! impl_executable_tool_gated {
+    ($ty:ty, $wrap:path) => {
+        impl ExecutableTool for $ty {
+            fn name(&self) -> &'static str {
+                rokr_tools::Tool::name(self)
+            }
+
+            fn to_tool_spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: rokr_tools::Tool::name(self).to_string(),
+                    description: rokr_tools::Tool::description(self).to_string(),
+                    input_schema: rokr_tools::Tool::input_schema(self),
+                }
+            }
+
+            fn execute_boxed<'a>(
+                &'a self,
+                input: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>>
+            {
+                Box::pin(async move { <$ty as rokr_tools::Tool>::execute(self, input).await })
+            }
+
+            fn preview(
+                &self,
+                input: serde_json::Value,
+            ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
+                Some(rokr_tools::PreviewableTool::preview(self, input).map($wrap))
+            }
+        }
+    };
+}
+
+impl_executable_tool_gated!(rokr_tools::bash::BashTool, PermissionPayload::Command);
+
 /// Runs the agent tool loop (ADR 0004) against the running conversation
 /// `transcript`, and for as long as the reply contains `ToolUse` blocks,
 /// executes each named tool from `tools` directly (no preview/permission
@@ -95,11 +171,26 @@ impl_executable_tool!(rokr_tools::ls::LsTool);
 /// A `ToolUse` naming a tool not present in `tools` produces an error
 /// `ToolResult` rather than failing the whole loop, so the provider can see
 /// the failure and recover (e.g. by trying a different tool or apologizing).
-pub async fn run_tool_loop<P: Provider>(
+///
+/// For a gated tool (one whose [`ExecutableTool::preview`] returns
+/// `Some(_)`), the loop previews it, calls `request_permission` with the
+/// resulting [`PermissionRequest`], and only executes on `true`; a `false`
+/// (rejected) decision skips execution entirely and instead produces an
+/// error `ToolResult` reflecting the rejection, same as an unknown-tool
+/// error — the loop continues rather than aborting. Non-gated tools
+/// (`preview` returns `None`) skip the permission check and execute
+/// directly, exactly as before.
+pub async fn run_tool_loop<P, F, Fut>(
     provider: &P,
     transcript: &mut Vec<Message>,
     tools: &[&dyn ExecutableTool],
-) -> Result<Message, P::Error> {
+    request_permission: F,
+) -> Result<Message, P::Error>
+where
+    P: Provider,
+    F: Fn(PermissionRequest) -> Fut,
+    Fut: Future<Output = bool>,
+{
     let tool_specs: Vec<ToolSpec> = tools.iter().map(|tool| tool.to_tool_spec()).collect();
 
     loop {
@@ -126,9 +217,26 @@ pub async fn run_tool_loop<P: Provider>(
         let mut result_blocks = Vec::with_capacity(tool_uses.len());
         for (id, name, input) in tool_uses {
             let (content, is_error) = match tools.iter().find(|tool| tool.name() == name.as_str()) {
-                Some(tool) => match tool.execute_boxed(input).await {
-                    Ok(output) => (output, false),
-                    Err(err) => (err.to_string(), true),
+                Some(tool) => match tool.preview(input.clone()) {
+                    None => match tool.execute_boxed(input).await {
+                        Ok(output) => (output, false),
+                        Err(err) => (err.to_string(), true),
+                    },
+                    Some(Err(preview_err)) => (preview_err.to_string(), true),
+                    Some(Ok(payload)) => {
+                        let request = PermissionRequest {
+                            tool_name: name.clone(),
+                            payload,
+                        };
+                        if request_permission(request).await {
+                            match tool.execute_boxed(input).await {
+                                Ok(output) => (output, false),
+                                Err(err) => (err.to_string(), true),
+                            }
+                        } else {
+                            ("permission denied by user".to_string(), true)
+                        }
+                    }
                 },
                 None => (format!("unknown tool: {name}"), true),
             };
@@ -292,9 +400,11 @@ mod tests {
 
         let mut transcript = vec![Message::user_text("read the file")];
 
-        let result = run_tool_loop(&provider, &mut transcript, &tools)
-            .await
-            .expect("loop should succeed");
+        let result = run_tool_loop(&provider, &mut transcript, &tools, |_request| async {
+            true
+        })
+        .await
+        .expect("loop should succeed");
 
         assert_eq!(result.role, Role::Assistant);
         assert_eq!(result.text(), "final answer");
@@ -328,6 +438,107 @@ mod tests {
                 assert_eq!(tool_use_id, "call_1");
                 assert!(content.contains("/tmp/whatever.txt"));
                 assert!(!is_error);
+            }
+            other => panic!("expected a single ToolResult block, got {other:?}"),
+        }
+    }
+
+    /// A fake gated tool (analogous to `bash`, which implements
+    /// `PreviewableTool`) that records whether it was actually executed via
+    /// a shared flag, so a test can assert the loop skipped execution when
+    /// permission was denied.
+    struct FakeGatedTool {
+        executed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl rokr_tools::Tool for FakeGatedTool {
+        fn name(&self) -> &'static str {
+            "fake_gated"
+        }
+
+        fn description(&self) -> &'static str {
+            "fake gated tool for tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+        ) -> Result<String, rokr_tools::ToolError> {
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("executed".to_string())
+        }
+    }
+
+    impl rokr_tools::PreviewableTool for FakeGatedTool {
+        fn preview(&self, _input: serde_json::Value) -> Result<String, rokr_tools::ToolError> {
+            Ok("fake command".to_string())
+        }
+    }
+
+    impl_executable_tool_gated!(FakeGatedTool, PermissionPayload::Command);
+
+    #[tokio::test]
+    async fn loop_skips_execution_when_permission_rejected() {
+        let tool_call_reply = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "fake_gated".to_string(),
+                input: serde_json::json!({}),
+            }],
+        };
+        let final_reply = Message::assistant_text("final answer after rejection");
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_reply.clone(),
+                final_reply.clone(),
+            ])),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gated_tool = FakeGatedTool {
+            executed: executed.clone(),
+        };
+        let tools: [&dyn ExecutableTool; 1] = [&gated_tool];
+
+        let mut transcript = vec![Message::user_text("run the command")];
+
+        let result = run_tool_loop(&provider, &mut transcript, &tools, |_request| async {
+            false
+        })
+        .await
+        .expect("loop should succeed even when permission is rejected");
+
+        assert_eq!(result.text(), "final answer after rejection");
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "tool must not execute when permission is rejected"
+        );
+
+        let calls = provider.calls.lock().unwrap();
+        match &calls[1][2].content[..] {
+            [ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            }] => {
+                assert_eq!(tool_use_id, "call_1");
+                assert!(
+                    *is_error,
+                    "a rejected tool call should be reflected as an error result"
+                );
+                assert!(
+                    content.to_lowercase().contains("denied")
+                        || content.to_lowercase().contains("reject"),
+                    "result content should reflect the rejection, got: {content}"
+                );
             }
             other => panic!("expected a single ToolResult block, got {other:?}"),
         }

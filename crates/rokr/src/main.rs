@@ -31,30 +31,62 @@ async fn main() -> ExitCode {
             let transcript: Arc<tokio::sync::Mutex<Vec<rokr_core::Message>>> =
                 Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-            let submit = move |input: String| {
+            let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
                 async move {
                     let provider = provider?;
 
-                    // Fixed read-only tool set (ADR 0005: no
-                    // preview/permission gate needed since none of these
-                    // are `PreviewableTool`s). Agent-tier selection lands
-                    // in a later ticket; for now every prompt gets the same
-                    // four tools.
+                    // Fixed tool set: read/glob/grep/ls auto-approve (ADR
+                    // 0005: none are `PreviewableTool`s), bash is gated and
+                    // round-trips through the permission callback below.
+                    // Agent-tier selection lands in a later ticket; for now
+                    // every prompt gets the same five tools.
                     let read = rokr_tools::read::ReadTool;
                     let glob = rokr_tools::glob::GlobTool;
                     let grep = rokr_tools::grep::GrepTool;
                     let ls = rokr_tools::ls::LsTool;
-                    let tools: [&dyn rokr_core::ExecutableTool; 4] = [&read, &glob, &grep, &ls];
+                    let bash = rokr_tools::bash::BashTool;
+                    let tools: [&dyn rokr_core::ExecutableTool; 5] =
+                        [&read, &glob, &grep, &ls, &bash];
+
+                    // Bridges rokr-core's `PermissionRequest` (tool name +
+                    // `PermissionPayload`) to rokr-tui's primitive
+                    // `PermissionRequest` (tool name + a display string),
+                    // round-tripping through the TUI's render loop via
+                    // `permission`. This is the seam rokr-tui's `run` doc
+                    // comment calls out: rokr-tui stays decoupled from
+                    // rokr-core's specific types, so main.rs bridges them.
+                    let request_permission = move |request: rokr_core::PermissionRequest| {
+                        let permission = permission.clone();
+                        async move {
+                            let detail = match request.payload {
+                                rokr_core::PermissionPayload::Command(command) => command,
+                                rokr_core::PermissionPayload::Diff { old, new } => {
+                                    format!("--- old\n{old}\n+++ new\n{new}")
+                                }
+                            };
+                            permission
+                                .request(rokr_tui::PermissionRequest {
+                                    tool_name: request.tool_name,
+                                    detail,
+                                })
+                                .await
+                        }
+                    };
 
                     let mut transcript = transcript.lock().await;
                     accumulate_user_turn(&mut transcript, input);
 
-                    rokr_core::run_tool_loop(provider.as_ref(), &mut transcript, &tools)
-                        .await
-                        .map(|message| message.text())
-                        .map_err(|err| err.to_string())
+                    rokr_core::run_tool_loop(
+                        provider.as_ref(),
+                        &mut transcript,
+                        &tools,
+                        request_permission,
+                    )
+                    .await
+                    .map(|message| message.text())
+                    .map_err(|err| err.to_string())
                 }
             };
 
