@@ -1,18 +1,78 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-const USAGE: &str = "Usage: rokr [--version]";
+const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>]";
+
+/// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
+/// when no flag is given. `Plan` is read-only: read/glob/grep/ls only, so
+/// the agent can explore and reason about a codebase without being able to
+/// change anything. `Build` adds bash/write/edit on top, unlocking actual
+/// mutation. Each tier's tools are all wired through the same
+/// `rokr_core::run_tool_loop`; the tier only changes which tools are handed
+/// in and which system prompt (`{config_dir}/agents/{tier}.md`) is seeded.
+#[derive(Clone, Copy)]
+enum AgentTier {
+    Plan,
+    Build,
+}
+
+impl AgentTier {
+    fn prompt_name(self) -> &'static str {
+        match self {
+            AgentTier::Plan => "plan",
+            AgentTier::Build => "build",
+        }
+    }
+}
+
+/// Parses the raw CLI args (already stripped of argv[0]) into an
+/// `AgentTier`. No args at all defaults to `Plan`; `--agent plan` and
+/// `--agent build` select explicitly; anything else is a usage error.
+fn parse_agent_tier(args: &[String]) -> Result<AgentTier, ()> {
+    match args {
+        [] => Ok(AgentTier::Plan),
+        [flag, value] if flag == "--agent" => match value.as_str() {
+            "plan" => Ok(AgentTier::Plan),
+            "build" => Ok(AgentTier::Build),
+            _ => Err(()),
+        },
+        _ => Err(()),
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.as_slice() {
-        [] => {
+        [flag] if flag == "--version" => {
+            println!("rokr {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        _ => {
+            let agent = match parse_agent_tier(&args) {
+                Ok(agent) => agent,
+                Err(()) => {
+                    eprintln!("{USAGE}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
             if let Err(err) = rokr_config::load_or_init_default() {
                 eprintln!("failed to initialize config: {err}");
                 return ExitCode::FAILURE;
             }
+
+            let system_prompt = match rokr_config::read_agent_prompt(
+                &rokr_config::default_config_dir(),
+                agent.prompt_name(),
+            ) {
+                Ok(prompt) => prompt,
+                Err(err) => {
+                    eprintln!("failed to read agent prompt: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
 
             // Constructed once at startup (so a missing/invalid env var
             // doesn't crash the TUI — it's reported the first time the
@@ -27,9 +87,12 @@ async fn main() -> ExitCode {
             // In-memory only (no persistence, per the PRD): accumulates
             // every turn across submits for the lifetime of the process, so
             // each new prompt is sent with the full prior conversation
-            // history rather than in isolation.
+            // history rather than in isolation. Seeded with the agent
+            // tier's system prompt before any user turn is added.
+            let mut transcript: Vec<rokr_core::Message> = Vec::new();
+            transcript.push(rokr_core::Message::system_text(system_prompt));
             let transcript: Arc<tokio::sync::Mutex<Vec<rokr_core::Message>>> =
-                Arc::new(tokio::sync::Mutex::new(Vec::new()));
+                Arc::new(tokio::sync::Mutex::new(transcript));
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
@@ -37,11 +100,13 @@ async fn main() -> ExitCode {
                 async move {
                     let provider = provider?;
 
-                    // Fixed tool set: read/glob/grep/ls auto-approve (ADR
-                    // 0005: none are `PreviewableTool`s), bash, write, and
-                    // edit are gated and round-trip through the permission
-                    // callback below. Agent-tier selection lands in a later
-                    // ticket; for now every prompt gets the same seven tools.
+                    // All seven tools are constructed unconditionally
+                    // (they're cheap zero-sized unit structs); which ones
+                    // actually land in `tools` depends on the agent tier.
+                    // read/glob/grep/ls auto-approve (ADR 0005: none are
+                    // `PreviewableTool`s); bash, write, and edit are gated
+                    // and round-trip through the permission callback below,
+                    // and only exist in the tool set for the `Build` tier.
                     let read = rokr_tools::read::ReadTool;
                     let glob = rokr_tools::glob::GlobTool;
                     let grep = rokr_tools::grep::GrepTool;
@@ -49,8 +114,10 @@ async fn main() -> ExitCode {
                     let bash = rokr_tools::bash::BashTool;
                     let write = rokr_tools::write::WriteTool;
                     let edit = rokr_tools::edit::EditTool;
-                    let tools: [&dyn rokr_core::ExecutableTool; 7] =
-                        [&read, &glob, &grep, &ls, &bash, &write, &edit];
+                    let tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
+                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
+                        AgentTier::Build => vec![&read, &glob, &grep, &ls, &bash, &write, &edit],
+                    };
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
@@ -109,14 +176,6 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
-        }
-        [flag] if flag == "--version" => {
-            println!("rokr {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("{USAGE}");
-            ExitCode::FAILURE
         }
     }
 }

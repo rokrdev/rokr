@@ -78,6 +78,14 @@ fn scaffold_agent_prompts(config_dir: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Read the scaffolded system prompt for `agent` (e.g. `"plan"` or
+/// `"build"`) from `{config_dir}/agents/{agent}.md`.
+pub fn read_agent_prompt(config_dir: &Path, agent: &str) -> Result<String, ConfigError> {
+    let path = config_dir.join("agents").join(format!("{agent}.md"));
+    let contents = std::fs::read_to_string(path)?;
+    Ok(contents)
+}
+
 /// Load config from `config_dir/rokr.json`, creating it with `"version": 1`
 /// if it does not already exist. Never overwrites an existing file; an
 /// existing file is parsed and returned as-is.
@@ -206,9 +214,10 @@ mod tests {
         // Scaffolding still runs for the untouched file, proving this test
         // actually exercises the scaffold path rather than trivially passing
         // because nothing writes to agents/ at all.
-        let build_contents = std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(
-            |e| panic!("expected build.md to be scaffolded alongside untouched plan.md: {e}"),
-        );
+        let build_contents =
+            std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(|e| {
+                panic!("expected build.md to be scaffolded alongside untouched plan.md: {e}")
+            });
         assert!(
             !build_contents.trim().is_empty(),
             "expected build.md to have non-empty content"
@@ -218,6 +227,25 @@ mod tests {
         assert_eq!(
             contents, user_content,
             "existing plan.md must not be overwritten by scaffolding"
+        );
+    }
+
+    #[test]
+    fn read_agent_prompt_returns_scaffolded_content() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let _ = load_or_init(temp.path()).unwrap();
+
+        let plan_prompt = read_agent_prompt(temp.path(), "plan").unwrap();
+        let build_prompt = read_agent_prompt(temp.path(), "build").unwrap();
+
+        assert!(
+            plan_prompt.contains("# Plan Agent"),
+            "expected plan prompt to contain scaffolded plan.md content, got: {plan_prompt}"
+        );
+        assert!(
+            build_prompt.contains("# Build Agent"),
+            "expected build prompt to contain scaffolded build.md content, got: {build_prompt}"
         );
     }
 
@@ -233,7 +261,11 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(ConfigError::UnsupportedVersion { found: 2, supported: 1, .. })
+                Err(ConfigError::UnsupportedVersion {
+                    found: 2,
+                    supported: 1,
+                    ..
+                })
             ),
             "expected UnsupportedVersion{{found: 2, supported: 1}}, got: {result:?}"
         );
