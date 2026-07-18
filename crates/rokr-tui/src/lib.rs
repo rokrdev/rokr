@@ -25,6 +25,12 @@ pub const PROMPT_TITLE: &str = "Prompt";
 
 const HEADER_HEIGHT: u16 = 3;
 const PROMPT_HEIGHT: u16 = 3;
+/// Caps how many lines of a `write`-style diff are shown in the permission
+/// prompt before being truncated with a "(N more lines)" marker, so a huge
+/// diff can't push the prompt itself further off the bottom of the View
+/// pane than the scroll-to-bottom logic in [`draw`] already has to account
+/// for.
+const MAX_DIFF_LINES: usize = 18;
 
 /// State rendered into the TUI's View section. Owns the scrollback lines
 /// shown in the View pane and the current prompt input buffer.
@@ -124,6 +130,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     frame.render_widget(header, chunks[0]);
 
     let mut view_lines = state.view_lines.clone();
+    let showing_permission_prompt = state.permission_request.is_some();
     if let Some(request) = &state.permission_request {
         match &request.detail {
             PermissionDetail::Text(text) => {
@@ -134,17 +141,38 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             }
             PermissionDetail::Diff { old, new } => {
                 view_lines.push(format!("permission needed: {}", request.tool_name));
-                view_lines.extend(diff_lines(old, new));
+                view_lines.extend(truncate_diff(diff_lines(old, new)));
             }
         }
         view_lines.push("[y] allow  [n] deny".to_string());
     } else if state.pending {
         view_lines.push("...".to_string());
     }
+    // While a permission prompt is showing, anchor the Paragraph's scroll to
+    // the bottom so the prompt + "[y]/[n]" line stay visible even when a
+    // long transcript (or, previously, a long diff — now capped by
+    // MAX_DIFF_LINES) would otherwise push them past the bottom of the View
+    // pane. `Paragraph` has no bottom-anchor mode, so this computes an
+    // explicit `scroll` offset instead.
+    //
+    // Known limitation: this counts *unwrapped* lines against the pane's
+    // inner height, not post-wrap rendered rows, since wrapping depends on
+    // each line's content and isn't known until ratatui lays the paragraph
+    // out. For the short, mostly single-line entries this UI renders
+    // (transcript lines, diff lines, the prompt line) that's a good enough
+    // approximation; a very long unwrapped single line could still make the
+    // estimate short.
+    let scroll_y = if showing_permission_prompt {
+        let inner_height = chunks[1].height.saturating_sub(2); // top/bottom border
+        (view_lines.len() as u16).saturating_sub(inner_height)
+    } else {
+        0
+    };
     // Wrapped so a long line (e.g. a bash command in a permission prompt)
     // doesn't get silently clipped at the pane's width.
     let view = Paragraph::new(view_lines.join("\n"))
         .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0))
         .block(Block::default().borders(Borders::ALL).title(VIEW_TITLE));
     frame.render_widget(view, chunks[1]);
 
@@ -162,6 +190,18 @@ fn diff_lines(old: &str, new: &str) -> Vec<String> {
         .map(|line| format!("-{line}"))
         .chain(new.lines().map(|line| format!("+{line}")))
         .collect()
+}
+
+/// Caps `lines` at [`MAX_DIFF_LINES`], appending a "(N more lines)" marker
+/// summarizing the remainder, so a huge write diff can't bury the
+/// permission prompt under an arbitrarily long transcript entry.
+fn truncate_diff(mut lines: Vec<String>) -> Vec<String> {
+    if lines.len() > MAX_DIFF_LINES {
+        let remaining = lines.len() - MAX_DIFF_LINES;
+        lines.truncate(MAX_DIFF_LINES);
+        lines.push(format!("({remaining} more lines)"));
+    }
+    lines
 }
 
 /// Ensures raw mode is disabled and the alternate screen is left, no matter
@@ -305,18 +345,23 @@ where
                         continue;
                     }
 
-                    if should_quit(key.code, key.modifiers, state.prompt_input.is_empty()) {
-                        return Ok(());
-                    }
-
+                    // Checked before `should_quit` (F-006): while a
+                    // permission decision is pending, `q` must deny that
+                    // decision rather than fall through to `should_quit`'s
+                    // "q quits when the prompt is empty" branch, which
+                    // would otherwise always fire here since the prompt
+                    // input box isn't being typed into during a permission
+                    // decision. Ctrl+C is still a hard quit even here —
+                    // `handle_permission_key` returns `Quit` for it.
                     if let Some(responder) = pending_permission_responder.take() {
-                        match key.code {
-                            KeyCode::Char('y') => {
+                        match handle_permission_key(key.code, key.modifiers) {
+                            PermissionKeyAction::Quit => return Ok(()),
+                            PermissionKeyAction::Allow => {
                                 let _ = responder.send(true);
                                 state.permission_request = None;
                                 dirty = true;
                             }
-                            KeyCode::Char('n') => {
+                            PermissionKeyAction::Deny => {
                                 if let Some(request) = &state.permission_request {
                                     state
                                         .view_lines
@@ -326,7 +371,7 @@ where
                                 state.permission_request = None;
                                 dirty = true;
                             }
-                            _ => {
+                            PermissionKeyAction::Ignore => {
                                 // Not a decision key: put the responder back
                                 // and keep waiting, same as ignoring any
                                 // other key while `pending` is true below.
@@ -334,6 +379,10 @@ where
                             }
                         }
                         continue;
+                    }
+
+                    if should_quit(key.code, key.modifiers, state.prompt_input.is_empty()) {
+                        return Ok(());
                     }
 
                     if state.pending {
@@ -383,6 +432,39 @@ fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool) ->
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
 }
 
+/// What a keypress means while a permission prompt is showing (i.e.
+/// `pending_permission_responder` is `Some` in [`event_loop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionKeyAction {
+    /// `y`: run the gated tool call.
+    Allow,
+    /// `n`, `q`, or `Esc`: deny the gated tool call. `q`/`Esc` intentionally
+    /// do *not* fall through to whole-app quit here (see F-006) — a
+    /// permission prompt already blocks all other input, so "back out of
+    /// this decision" reads more naturally as deny than as exiting the
+    /// entire session.
+    Deny,
+    /// Ctrl+C: hard-quit escape hatch that survives even a pending
+    /// permission decision.
+    Quit,
+    /// Any other key: not a decision, keep waiting.
+    Ignore,
+}
+
+/// Decides the [`PermissionKeyAction`] for a keypress received while a
+/// permission prompt is showing. Extracted as a pure function so it's
+/// unit-testable without driving a live `Terminal`/event loop.
+fn handle_permission_key(code: KeyCode, modifiers: KeyModifiers) -> PermissionKeyAction {
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        return PermissionKeyAction::Quit;
+    }
+    match code {
+        KeyCode::Char('y') => PermissionKeyAction::Allow,
+        KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => PermissionKeyAction::Deny,
+        _ => PermissionKeyAction::Ignore,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +511,108 @@ mod tests {
             prompt_row,
             20 - 3,
             "Prompt should occupy the bottom fixed-height section"
+        );
+    }
+
+    /// F-004: a long transcript pushing the permission prompt line past the
+    /// bottom of the View pane must not hide it — `draw` should scroll so
+    /// "[y] allow  [n] deny" stays on screen.
+    #[test]
+    fn permission_prompt_stays_visible_with_long_transcript() {
+        // 80 columns wide (only the height is constrained, per the ticket)
+        // so none of the short lines below wrap — that isolates the
+        // scroll-offset behavior under test from the unwrapped-line-count
+        // approximation's known limitation (documented on `draw`), which is
+        // a separate concern from F-004's bottom-anchoring fix.
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            view_lines: (0..30).map(|i| format!("line {i}")).collect(),
+            permission_request: Some(PermissionRequest {
+                tool_name: "bash".to_string(),
+                detail: PermissionDetail::Text("some long command".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let prompt_visible = (area.y..area.y + area.height).any(|y| {
+            let row = row_text(buffer, y);
+            row.contains("[y] allow") && row.contains("[n] deny")
+        });
+        assert!(
+            prompt_visible,
+            "expected the '[y] allow  [n] deny' line to be visible somewhere in the rendered buffer"
+        );
+    }
+
+    #[test]
+    fn truncate_diff_leaves_short_diffs_untouched() {
+        let lines: Vec<String> = (0..5).map(|i| format!("-{i}")).collect();
+        let result = truncate_diff(lines.clone());
+        assert_eq!(result, lines);
+    }
+
+    #[test]
+    fn truncate_diff_caps_long_diffs_with_marker() {
+        let lines: Vec<String> = (0..25).map(|i| format!("-{i}")).collect();
+        let result = truncate_diff(lines);
+        assert_eq!(result.len(), MAX_DIFF_LINES + 1);
+        assert_eq!(result[MAX_DIFF_LINES], "(7 more lines)");
+    }
+
+    #[test]
+    fn handle_permission_key_allow_on_y() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Char('y'), KeyModifiers::NONE),
+            PermissionKeyAction::Allow
+        );
+    }
+
+    #[test]
+    fn handle_permission_key_deny_on_n() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Char('n'), KeyModifiers::NONE),
+            PermissionKeyAction::Deny
+        );
+    }
+
+    /// F-006: `q` while a permission prompt is pending must deny the
+    /// decision, not fall through to whole-app quit.
+    #[test]
+    fn handle_permission_key_deny_on_q() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Char('q'), KeyModifiers::NONE),
+            PermissionKeyAction::Deny
+        );
+    }
+
+    #[test]
+    fn handle_permission_key_deny_on_esc() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Esc, KeyModifiers::NONE),
+            PermissionKeyAction::Deny
+        );
+    }
+
+    /// F-006: Ctrl+C must stay a hard quit even during a pending permission
+    /// decision.
+    #[test]
+    fn handle_permission_key_quit_on_ctrl_c() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            PermissionKeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn handle_permission_key_ignores_other_keys() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Char('x'), KeyModifiers::NONE),
+            PermissionKeyAction::Ignore
         );
     }
 }
