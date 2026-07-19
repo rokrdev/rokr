@@ -35,6 +35,9 @@ pub enum ProviderError {
 
     #[error("provider response contained no choices")]
     EmptyResponse,
+
+    #[error("unknown provider: {0}")]
+    UnknownProvider(String),
 }
 
 impl ProviderError {
@@ -68,7 +71,8 @@ impl ProviderError {
             },
             ProviderError::MissingEnvVar(_)
             | ProviderError::Deserialize(_)
-            | ProviderError::EmptyResponse => RetryHint::NonRetryable,
+            | ProviderError::EmptyResponse
+            | ProviderError::UnknownProvider(_) => RetryHint::NonRetryable,
         }
     }
 }
@@ -92,6 +96,7 @@ pub use resilience::ResilientProvider;
 
 pub const ENV_PROVIDER: &str = "ROKR_PROVIDER";
 
+#[derive(Clone)]
 pub enum AnyProvider {
     OpenAi(OpenAiProvider),
     Anthropic(AnthropicProvider),
@@ -104,6 +109,19 @@ impl AnyProvider {
         match std::env::var(ENV_PROVIDER).as_deref() {
             Ok("anthropic") => Ok(AnyProvider::Anthropic(AnthropicProvider::from_env()?)),
             _ => Ok(AnyProvider::OpenAi(OpenAiProvider::from_env()?)),
+        }
+    }
+
+    /// Constructs the provider named by `name` (case-insensitive: `"openai"`
+    /// or `"anthropic"`), reading that provider's own env vars — the same
+    /// name-to-adapter dispatch `from_env` uses, but selectable at runtime
+    /// instead of fixed via `ROKR_PROVIDER`. This is what `/model` (ticket
+    /// 29: session-scoped model switch) resolves a typed name to.
+    pub fn from_name(name: &str) -> Result<Self, ProviderError> {
+        match name.to_ascii_lowercase().as_str() {
+            "openai" => Ok(AnyProvider::OpenAi(OpenAiProvider::from_env()?)),
+            "anthropic" => Ok(AnyProvider::Anthropic(AnthropicProvider::from_env()?)),
+            other => Err(ProviderError::UnknownProvider(other.to_string())),
         }
     }
 }
@@ -150,6 +168,40 @@ mod tests {
         std::env::remove_var(anthropic::ENV_BASE_URL);
         std::env::remove_var(anthropic::ENV_MODEL);
         std::env::remove_var(anthropic::ENV_API_KEY);
+    }
+
+    #[test]
+    fn any_provider_from_name_dispatches_to_anthropic_when_configured() {
+        let _lock = ENV_GUARD.lock().unwrap();
+
+        std::env::set_var(anthropic::ENV_BASE_URL, "http://localhost:9");
+        std::env::set_var(anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        std::env::set_var(anthropic::ENV_API_KEY, "test-key");
+
+        let provider = AnyProvider::from_name("Anthropic")
+            .expect("from_name(\"Anthropic\") should succeed with all required env vars set");
+
+        assert!(
+            matches!(provider, AnyProvider::Anthropic(_)),
+            "from_name(\"Anthropic\") should select the Anthropic adapter, case-insensitively"
+        );
+
+        std::env::remove_var(anthropic::ENV_BASE_URL);
+        std::env::remove_var(anthropic::ENV_MODEL);
+        std::env::remove_var(anthropic::ENV_API_KEY);
+    }
+
+    #[test]
+    fn any_provider_from_name_rejects_unknown_name() {
+        let _lock = ENV_GUARD.lock().unwrap();
+
+        match AnyProvider::from_name("not-a-real-provider") {
+            Err(ProviderError::UnknownProvider(name)) => {
+                assert_eq!(name, "not-a-real-provider");
+            }
+            Err(other) => panic!("expected ProviderError::UnknownProvider, got: {other}"),
+            Ok(_) => panic!("an unrecognized provider name should not resolve"),
+        }
     }
 
     #[test]

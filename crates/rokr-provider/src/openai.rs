@@ -252,6 +252,7 @@ pub const ENV_API_KEY: &str = "ROKR_OPENAI_API_KEY";
 /// An OpenAI-compatible chat completions provider. Configured with a base
 /// URL, model name, and API key so any OpenAI-compatible endpoint (OpenAI
 /// itself, or a compatible proxy) can be targeted.
+#[derive(Clone)]
 pub struct OpenAiProvider {
     base_url: String,
     model: String,

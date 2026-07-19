@@ -4002,3 +4002,236 @@ async fn repo_map_regenerates_on_compact_to_pick_up_new_file() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+/// Ticket 29 (model-session-switch): typing `/model anthropic` mid-session
+/// switches which provider `submit` sends the *next* prompt to, without
+/// touching `rokr.json` on disk. Proven by asserting the second prompt
+/// lands on the Anthropic mock (not the OpenAI one the session started
+/// with) and that the config file's bytes are unchanged before vs. after.
+#[tokio::test]
+async fn typing_model_command_switches_active_provider_for_next_turn() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let openai_mock_server = MockServer::start().await;
+    let anthropic_mock_server = MockServer::start().await;
+
+    let first_reply_text = "FirstReplyFromOpenAiForModelSwitchTesting";
+    let second_reply_text = "SecondReplyFromAnthropicForModelSwitchTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-first",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": first_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&openai_mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg-test-second",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": second_reply_text }]
+        })))
+        .mount(&anthropic_mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-model-command");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-model-command");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", openai_mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-openai-api-key");
+    cmd.env("ROKR_ANTHROPIC_BASE_URL", anthropic_mock_server.uri());
+    cmd.env("ROKR_ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022");
+    cmd.env("ROKR_ANTHROPIC_API_KEY", "test-anthropic-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    let config_file_path = xdg_config_home.join("rokr").join("rokr.json");
+    let config_before = std::fs::read_to_string(&config_file_path)
+        .expect("config file should exist after startup's load_or_init_default");
+
+    writer
+        .write_all(b"firstpromptunique\r")
+        .expect("failed to write first prompt to pty");
+
+    let first_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain the first (OpenAI) mocked assistant response, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/model anthropic\r")
+        .expect("failed to write /model anthropic to pty");
+
+    // Wait for the switch confirmation, not merely the echoed command — see
+    // the `/compact` test's comment on this exact race. "switched." is a
+    // single contiguous token that survives the diff-renderer's cell-skip
+    // quirk and, unlike repeating the provider name in the confirmation
+    // message would, never collides with the echoed "/model anthropic"
+    // input line (which is why the confirmation message below is
+    // deliberately name-agnostic).
+    let switch_confirmation_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < switch_confirmation_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("switched.") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("switched."),
+        "expected pty output to contain the model-switch confirmation after /model anthropic, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"secondpromptunique\r")
+        .expect("failed to write second prompt to pty");
+
+    let second_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < second_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain the second (Anthropic) mocked assistant response after switching providers, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let openai_requests = openai_mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+    let anthropic_requests = anthropic_mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert_eq!(
+        openai_requests.len(),
+        1,
+        "expected exactly one request to the OpenAI mock (the first prompt only), got {}: {openai_requests:?}",
+        openai_requests.len()
+    );
+    assert_eq!(
+        anthropic_requests.len(),
+        1,
+        "expected exactly one request to the Anthropic mock (the second, post-switch prompt), got {}: {anthropic_requests:?}",
+        anthropic_requests.len()
+    );
+
+    let config_after = std::fs::read_to_string(&config_file_path)
+        .expect("config file should still exist after the session");
+    assert_eq!(
+        config_before, config_after,
+        "expected rokr.json to be byte-identical before and after /model anthropic — the \
+         active provider must never be persisted to disk"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}

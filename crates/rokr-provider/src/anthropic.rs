@@ -198,6 +198,7 @@ pub const ENV_API_KEY: &str = "ROKR_ANTHROPIC_API_KEY";
 
 /// An Anthropic Messages API provider. Configured with a base URL, model
 /// name, and API key.
+#[derive(Clone)]
 pub struct AnthropicProvider {
     base_url: String,
     model: String,

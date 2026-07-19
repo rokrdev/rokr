@@ -115,8 +115,16 @@ async fn main() -> ExitCode {
             // `rokr_core::run_tool_loop`. `rokr-tui` stays decoupled from
             // `rokr-core`/`rokr-provider`, so this closure is where the
             // message model and provider abstraction meet the TUI.
+            //
+            // Ticket 29 (model-session-switch): held behind a
+            // `tokio::sync::RwLock` (never written to `rokr_config::Config`
+            // or disk — there is no field for it in the config schema) so
+            // `/model <name>` can swap the active provider at runtime.
+            // Readers (`submit`, `/compact`) clone the `AnyProvider` out
+            // from behind the read lock and drop the guard before any
+            // `.await` that uses it.
             let provider = rokr_provider::AnyProvider::from_env()
-                .map(Arc::new)
+                .map(|any| Arc::new(tokio::sync::RwLock::new(any)))
                 .map_err(|err| err.to_string());
 
             // In-memory only (no persistence, per the PRD): accumulates
@@ -149,10 +157,13 @@ async fn main() -> ExitCode {
             // Ticket 21 (manual-compact-command): cloned here, before
             // `submit`'s `move` closure below takes ownership of the
             // original `provider`/`transcript` bindings, so `command` can
-            // independently share the same provider and running transcript.
-            // `command_cwd`/`command_repo_map` (F-001 fix) let the
-            // `/compact` handler regenerate the repo map in the same
-            // shared state `submit` reads from.
+            // independently share the same provider lock and running
+            // transcript. `command_cwd`/`command_repo_map` (F-001 fix) let
+            // the `/compact` handler regenerate the repo map in the same
+            // shared state `submit` reads from. Ticket 29
+            // (model-session-switch): `command_provider` is also how
+            // `/model` writes a newly selected provider into the same
+            // `Arc<RwLock<AnyProvider>>` that `submit` reads.
             let command_provider = provider.clone();
             let command_transcript = transcript.clone();
             let command_cwd = cwd.clone();
@@ -166,6 +177,10 @@ async fn main() -> ExitCode {
                 let last_known_usage = last_known_usage.clone();
                 async move {
                     let provider = provider?;
+                    // Ticket 29 (model-session-switch): clone the current
+                    // `AnyProvider` out from behind the read lock and drop
+                    // the guard immediately — never held across an `.await`.
+                    let provider: rokr_provider::AnyProvider = provider.read().await.clone();
 
                     // All eight tools are constructed unconditionally
                     // (they're cheap zero-sized unit structs); which ones
@@ -271,7 +286,7 @@ async fn main() -> ExitCode {
                     let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
 
                     let (reply, usage) = rokr_core::run_tool_loop(
-                        provider.as_ref(),
+                        &provider,
                         &system_prompt,
                         repo_map_snapshot.as_deref(),
                         &mut transcript,
@@ -304,7 +319,7 @@ async fn main() -> ExitCode {
                         context_window_size,
                         auto_compact_threshold,
                     ) {
-                        match rokr_core::compact_transcript(provider.as_ref(), &transcript).await {
+                        match rokr_core::compact_transcript(&provider, &transcript).await {
                             Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
                                 *transcript = compacted;
                                 None
@@ -330,17 +345,38 @@ async fn main() -> ExitCode {
             // this closure is where a literal command string like
             // `/compact` gets meaning. Deliberately a single minimal match
             // arm, not a registry/parser framework (a later phase extends
-            // this seam).
+            // this seam). Ticket 29 (model-session-switch) adds `/model
+            // <name>` ahead of that match: it performs provider
+            // *selection* ("openai" or "anthropic"), not per-field
+            // model-string editing — `<name>` resolves via
+            // `AnyProvider::from_name`, which reads that provider's own env
+            // vars, mirroring how `AnyProvider::from_env` already dispatches
+            // via `ROKR_PROVIDER` at startup, just made selectable at
+            // runtime.
             let command = move |input: String| {
                 let provider = command_provider.clone();
                 let transcript = command_transcript.clone();
                 let cwd = command_cwd.clone();
                 let repo_map = command_repo_map.clone();
                 async move {
+                    if let Some(name) = input.strip_prefix("/model ") {
+                        let name = name.trim();
+                        return match &provider {
+                            Ok(lock) => match rokr_provider::AnyProvider::from_name(name) {
+                                Ok(new_provider) => {
+                                    set_active_provider(lock, new_provider).await;
+                                    "Active provider switched.".to_string()
+                                }
+                                Err(err) => format!("failed to switch provider: {err}"),
+                            },
+                            Err(err) => format!("cannot switch provider: {err}"),
+                        };
+                    }
+
                     match input.as_str() {
                         "/compact" => {
-                            let provider = match provider {
-                                Ok(provider) => provider,
+                            let provider_snapshot = match &provider {
+                                Ok(lock) => lock.read().await.clone(),
                                 Err(err) => {
                                     return format!(
                                         "compaction failed, transcript left intact: {err}"
@@ -348,7 +384,7 @@ async fn main() -> ExitCode {
                                 }
                             };
                             let mut transcript = transcript.lock().await;
-                            match rokr_core::compact_transcript(provider.as_ref(), &transcript)
+                            match rokr_core::compact_transcript(&provider_snapshot, &transcript)
                                 .await
                             {
                                 Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
@@ -399,6 +435,18 @@ fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String)
     transcript.push(rokr_core::Message::user_text(input));
 }
 
+/// Writes `new_provider` into the shared active-provider state under the
+/// write lock (ticket 29: `/model`). Kept separate from name resolution
+/// (`AnyProvider::from_name`) so the state-mutation itself is
+/// unit-testable without real provider credentials — see
+/// `model_command_updates_shared_provider_state`.
+async fn set_active_provider(
+    active_provider: &tokio::sync::RwLock<rokr_provider::AnyProvider>,
+    new_provider: rokr_provider::AnyProvider,
+) {
+    *active_provider.write().await = new_provider;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +475,30 @@ mod tests {
 
         assert_eq!(transcript[3].role, Role::Assistant);
         assert_eq!(transcript[3].text(), "second reply");
+    }
+
+    #[tokio::test]
+    async fn model_command_updates_shared_provider_state() {
+        let initial = rokr_provider::AnyProvider::OpenAi(rokr_provider::OpenAiProvider::new(
+            "http://initial.invalid",
+            "gpt-4o-mini",
+            "initial-key",
+        ));
+        let active_provider = tokio::sync::RwLock::new(initial);
+
+        let replacement =
+            rokr_provider::AnyProvider::Anthropic(rokr_provider::AnthropicProvider::new(
+                "http://replacement.invalid",
+                "claude-3-5-sonnet-20241022",
+                "replacement-key",
+            ));
+
+        set_active_provider(&active_provider, replacement).await;
+
+        let guard = active_provider.read().await;
+        assert!(
+            matches!(*guard, rokr_provider::AnyProvider::Anthropic(_)),
+            "expected set_active_provider to replace the shared state with the Anthropic variant"
+        );
     }
 }
