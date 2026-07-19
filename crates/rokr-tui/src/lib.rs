@@ -401,7 +401,7 @@ where
                         continue;
                     }
 
-                    if should_quit(key.code, key.modifiers, state.prompt_input.is_empty()) {
+                    if should_quit(key.code, key.modifiers, state.prompt_input.is_empty(), state.pending) {
                         return Ok(());
                     }
 
@@ -456,11 +456,17 @@ where
     }
 }
 
-/// `q` quits only when the prompt is empty, so it doesn't clash with typing
-/// a prompt that uses the letter; Ctrl+C always quits as a hard escape
-/// hatch regardless of prompt content.
-fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool) -> bool {
-    (matches!(code, KeyCode::Char('q')) && prompt_is_empty)
+/// `q` quits only when the prompt is empty AND no submit/command call is
+/// still in flight, so it doesn't clash with typing a prompt that uses the
+/// letter. Without the `!pending` guard, a `q` keystroke arriving while
+/// `pending` is true would still see an empty prompt — keystrokes typed
+/// during a pending call are dropped rather than accumulated into
+/// `prompt_input` (see `event_loop`) — and would quit the whole app out
+/// from under a user who was mid-typing their next message, silently
+/// discarding it. Ctrl+C always quits as a hard escape hatch regardless of
+/// prompt content or pending state.
+fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool, pending: bool) -> bool {
+    (matches!(code, KeyCode::Char('q')) && prompt_is_empty && !pending)
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
 }
 
@@ -708,6 +714,34 @@ mod tests {
             handle_permission_key(KeyCode::Char('x'), KeyModifiers::NONE),
             PermissionKeyAction::Ignore
         );
+    }
+
+    #[test]
+    fn should_quit_on_bare_q_when_prompt_empty_and_not_pending() {
+        assert!(should_quit(KeyCode::Char('q'), KeyModifiers::NONE, true, false));
+    }
+
+    /// Regression test for the bug fixed here: a `q` keystroke arriving while a
+    /// submit/command call is still pending must not quit the app. Keystrokes
+    /// typed during `pending` are dropped without being added to
+    /// `prompt_input` (see `event_loop`), so `prompt_is_empty` is always true
+    /// throughout the pending window — without the `!pending` guard, any `q`
+    /// anywhere in a user's next message (e.g. the "q" in "any question?")
+    /// would silently quit the whole app before the message could be
+    /// submitted.
+    #[test]
+    fn should_quit_does_not_fire_on_bare_q_while_pending() {
+        assert!(!should_quit(KeyCode::Char('q'), KeyModifiers::NONE, true, true));
+    }
+
+    #[test]
+    fn should_quit_on_ctrl_c_even_while_pending() {
+        assert!(should_quit(KeyCode::Char('c'), KeyModifiers::CONTROL, true, true));
+    }
+
+    #[test]
+    fn should_quit_does_not_fire_on_q_when_prompt_not_empty() {
+        assert!(!should_quit(KeyCode::Char('q'), KeyModifiers::NONE, false, false));
     }
 
     #[test]

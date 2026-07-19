@@ -892,19 +892,40 @@ async fn typing_compact_command_compacts_transcript_immediately() {
         .write_all(b"/compact\r")
         .expect("failed to write /compact to pty");
 
+    // Wait for the command to actually finish — the "Transcript compacted."
+    // confirmation `main.rs`'s `/compact` handler pushes once the async
+    // compaction call resolves — not merely for "/compact" to be echoed
+    // back. The echo appears the instant Enter is pressed, before the
+    // command even starts running; racing ahead on it left `state.pending`
+    // still true when the next prompt's keystrokes arrived, and the render
+    // loop silently drops keystrokes typed while pending (see
+    // `rokr-tui::event_loop`), so "thirdpromptunique" below could be typed
+    // away before compaction ever completed.
+    //
+    // We match on "compacted." rather than the full "Transcript compacted."
+    // phrase: the TUI's renderer diffs cells and skips repainting ones that
+    // are already correct (e.g. a space that's already blank), emitting a
+    // cursor-address escape instead of a literal space byte. That splits
+    // "Transcript compacted." across an escape sequence in the raw PTY
+    // stream, so the two-word phrase never appears as a contiguous
+    // substring. "compacted." itself is one uninterrupted run of cells and
+    // renders contiguously, and — like the rest of this file's assertions,
+    // which all match single tokens for the same reason — is unambiguous
+    // here (it doesn't collide with any other text the test produces, e.g.
+    // "...BeforeCompactForTesting").
     let compact_confirmation_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < compact_confirmation_deadline {
         while let Ok(chunk) = rx.try_recv() {
             output.push_str(&String::from_utf8_lossy(&chunk));
         }
-        if output.to_lowercase().contains("compact") {
+        if output.contains("compacted.") {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        output.to_lowercase().contains("compact"),
-        "expected pty output to contain a compaction confirmation after /compact, got: {output:?}"
+        output.contains("compacted."),
+        "expected pty output to contain the compaction completion confirmation after /compact, got: {output:?}"
     );
 
     writer
@@ -3871,19 +3892,40 @@ async fn repo_map_regenerates_on_compact_to_pick_up_new_file() {
         .write_all(b"/compact\r")
         .expect("failed to write /compact to pty");
 
+    // Wait for the command to actually finish — the "Transcript compacted."
+    // confirmation `main.rs`'s `/compact` handler pushes once the async
+    // compaction call resolves — not merely for "/compact" to be echoed
+    // back. The echo appears the instant Enter is pressed, before the
+    // command even starts running; racing ahead on it left `state.pending`
+    // still true when the next prompt's keystrokes arrived, and the render
+    // loop silently drops keystrokes typed while pending (see
+    // `rokr-tui::event_loop`), so "thirdpromptunique" below could be typed
+    // away before compaction ever completed.
+    //
+    // We match on "compacted." rather than the full "Transcript compacted."
+    // phrase: the TUI's renderer diffs cells and skips repainting ones that
+    // are already correct (e.g. a space that's already blank), emitting a
+    // cursor-address escape instead of a literal space byte. That splits
+    // "Transcript compacted." across an escape sequence in the raw PTY
+    // stream, so the two-word phrase never appears as a contiguous
+    // substring. "compacted." itself is one uninterrupted run of cells and
+    // renders contiguously, and — like the rest of this file's assertions,
+    // which all match single tokens for the same reason — is unambiguous
+    // here (it doesn't collide with any other text the test produces, e.g.
+    // "...BeforeCompactForTesting").
     let compact_confirmation_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < compact_confirmation_deadline {
         while let Ok(chunk) = rx.try_recv() {
             output.push_str(&String::from_utf8_lossy(&chunk));
         }
-        if output.to_lowercase().contains("compact") {
+        if output.contains("compacted.") {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        output.to_lowercase().contains("compact"),
-        "expected pty output to contain a compaction confirmation after /compact, got: {output:?}"
+        output.contains("compacted."),
+        "expected pty output to contain the compaction completion confirmation after /compact, got: {output:?}"
     );
 
     writer
