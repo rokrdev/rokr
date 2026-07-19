@@ -46,14 +46,30 @@ pub struct CacheControl {
 ///
 /// Deliberately NOT `#[non_exhaustive]`: adding a variant must break every
 /// provider adapter's `match` at compile time.
-// Phase 2:  ToolUse { id, name, input }
-//           ToolResult { tool_use_id, content, is_error }
 // Phase 8:  Image { source, cache_control }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text {
         text: String,
         cache_control: Option<CacheControl>,
+    },
+    /// A model-issued request to invoke a tool. `id` correlates this block
+    /// with the [`ContentBlock::ToolResult`] that answers it; `input` is the
+    /// tool's arguments as the provider's raw JSON, un-typed here because
+    /// `rokr-core` has no dependency on tool schemas (ADR 0006).
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// The outcome of executing a [`ContentBlock::ToolUse`], keyed back to it
+    /// by `tool_use_id`. `content` is the tool's output rendered as text;
+    /// `is_error` distinguishes a tool failure from a successful result so
+    /// providers can convey that distinction on the wire.
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
     },
 }
 
@@ -90,12 +106,14 @@ impl Message {
     }
 
     /// Concatenates all `Text` blocks in order. Convenience accessor for the
-    /// render layer; other block kinds contribute nothing until they exist.
+    /// render layer; other block kinds (tool use/result, and future
+    /// modalities) contribute nothing here.
     pub fn text(&self) -> String {
         self.content
             .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text, .. } => text.as_str(),
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("")
@@ -116,10 +134,61 @@ mod tests {
         assert_eq!(restored.role, Role::User);
         assert_eq!(restored.content.len(), 1);
         match &restored.content[0] {
-            ContentBlock::Text { text, cache_control } => {
+            ContentBlock::Text {
+                text,
+                cache_control,
+            } => {
                 assert_eq!(text, "hello world");
                 assert!(cache_control.is_none());
             }
+            other => panic!("expected Text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_use_and_tool_result_round_trip_serialization() {
+        let original = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({ "path": "src/lib.rs" }),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "file contents".to_string(),
+                    is_error: false,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize message");
+        let restored: Message = serde_json::from_str(&json).expect("deserialize message");
+
+        assert_eq!(restored.role, Role::Assistant);
+        assert_eq!(restored.content.len(), 2);
+
+        match &restored.content[0] {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &serde_json::json!({ "path": "src/lib.rs" }));
+            }
+            other => panic!("expected ToolUse block, got {other:?}"),
+        }
+
+        match &restored.content[1] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "call_1");
+                assert_eq!(content, "file contents");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult block, got {other:?}"),
         }
     }
 }

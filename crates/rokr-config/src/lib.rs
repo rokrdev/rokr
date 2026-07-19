@@ -78,6 +78,34 @@ fn scaffold_agent_prompts(config_dir: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Read the scaffolded system prompt for `agent` (e.g. `"plan"` or
+/// `"build"`) from `{config_dir}/agents/{agent}.md`.
+pub fn read_agent_prompt(config_dir: &Path, agent: &str) -> Result<String, ConfigError> {
+    let path = config_dir.join("agents").join(format!("{agent}.md"));
+    let contents = std::fs::read_to_string(path)?;
+    Ok(contents)
+}
+
+/// Reads project-level context from `cwd`, if any is present. Looks for
+/// `AGENTS.md` first; if it isn't there, falls back to `CLAUDE.md`. Never
+/// reads both. Neither present is not an error — just no project context.
+/// The fallback only triggers when `AGENTS.md` is absent (`NotFound`); a
+/// read error for any other reason (e.g. a permissions error, or the path
+/// existing but not being a readable file) is treated as no context,
+/// without falling back to `CLAUDE.md`.
+/// This is a one-time, unconditional, side-effect-free read intended to be
+/// folded into the system prompt at startup — not a tool, not permission-
+/// gated.
+pub fn load_project_context(cwd: &Path) -> Option<String> {
+    match std::fs::read_to_string(cwd.join("AGENTS.md")) {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::read_to_string(cwd.join("CLAUDE.md")).ok()
+        }
+        Err(_) => None,
+    }
+}
+
 /// Load config from `config_dir/rokr.json`, creating it with `"version": 1`
 /// if it does not already exist. Never overwrites an existing file; an
 /// existing file is parsed and returned as-is.
@@ -206,9 +234,10 @@ mod tests {
         // Scaffolding still runs for the untouched file, proving this test
         // actually exercises the scaffold path rather than trivially passing
         // because nothing writes to agents/ at all.
-        let build_contents = std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(
-            |e| panic!("expected build.md to be scaffolded alongside untouched plan.md: {e}"),
-        );
+        let build_contents =
+            std::fs::read_to_string(agents_dir.join("build.md")).unwrap_or_else(|e| {
+                panic!("expected build.md to be scaffolded alongside untouched plan.md: {e}")
+            });
         assert!(
             !build_contents.trim().is_empty(),
             "expected build.md to have non-empty content"
@@ -218,6 +247,25 @@ mod tests {
         assert_eq!(
             contents, user_content,
             "existing plan.md must not be overwritten by scaffolding"
+        );
+    }
+
+    #[test]
+    fn read_agent_prompt_returns_scaffolded_content() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let _ = load_or_init(temp.path()).unwrap();
+
+        let plan_prompt = read_agent_prompt(temp.path(), "plan").unwrap();
+        let build_prompt = read_agent_prompt(temp.path(), "build").unwrap();
+
+        assert!(
+            plan_prompt.contains("# Plan Agent"),
+            "expected plan prompt to contain scaffolded plan.md content, got: {plan_prompt}"
+        );
+        assert!(
+            build_prompt.contains("# Build Agent"),
+            "expected build prompt to contain scaffolded build.md content, got: {build_prompt}"
         );
     }
 
@@ -233,7 +281,11 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(ConfigError::UnsupportedVersion { found: 2, supported: 1, .. })
+                Err(ConfigError::UnsupportedVersion {
+                    found: 2,
+                    supported: 1,
+                    ..
+                })
             ),
             "expected UnsupportedVersion{{found: 2, supported: 1}}, got: {result:?}"
         );
@@ -268,5 +320,65 @@ mod tests {
         }
 
         assert_eq!(dir, PathBuf::from("/tmp/rokr-test-home/.config/rokr"));
+    }
+
+    #[test]
+    fn load_project_context_reads_agents_md_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents_content = "# Project AGENTS.md\nUse tabs, not spaces, in this repo.";
+        std::fs::write(temp.path().join("AGENTS.md"), agents_content).unwrap();
+
+        let context = load_project_context(temp.path());
+
+        assert_eq!(context.as_deref(), Some(agents_content));
+    }
+
+    #[test]
+    fn load_project_context_falls_back_to_claude_md_when_agents_md_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_content = "# Project CLAUDE.md\nRun tests before committing.";
+        std::fs::write(temp.path().join("CLAUDE.md"), claude_content).unwrap();
+
+        let context = load_project_context(temp.path());
+
+        assert_eq!(context.as_deref(), Some(claude_content));
+    }
+
+    // Unix-only: relies on chmod semantics to make AGENTS.md unreadable,
+    // which have no portable Windows equivalent.
+    //
+    // Note: if this test is ever run as root (e.g. some CI/sandbox setups),
+    // permission bits on files owned by root don't block root's own reads,
+    // so the read may unexpectedly succeed and this test would need a
+    // root-detection guard. No such guard exists elsewhere in this
+    // workspace to mirror, so it's intentionally omitted here.
+    #[cfg(unix)]
+    #[test]
+    fn load_project_context_does_not_fall_back_when_agents_md_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let agents_path = temp.path().join("AGENTS.md");
+        let claude_content = "# Project CLAUDE.md\nThis must not be loaded.";
+        std::fs::write(&agents_path, "# Project AGENTS.md\nUnreadable.").unwrap();
+        std::fs::write(temp.path().join("CLAUDE.md"), claude_content).unwrap();
+
+        std::fs::set_permissions(&agents_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let context = load_project_context(temp.path());
+
+        // Restore permissions before the tempdir drops, so cleanup can
+        // delete the file.
+        std::fs::set_permissions(&agents_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_ne!(
+            context.as_deref(),
+            Some(claude_content),
+            "must not silently fall back to CLAUDE.md when AGENTS.md exists but is unreadable"
+        );
+        assert_eq!(
+            context, None,
+            "a non-NotFound read error on AGENTS.md must yield no project context"
+        );
     }
 }

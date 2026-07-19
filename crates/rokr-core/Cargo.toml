@@ -6,7 +6,8 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
+rokr-tools = { path = "../rokr-tools" }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -1260,6 +1260,7 @@ dependencies = [
 name = "rokr-core"
 version = "0.1.0"
 dependencies = [
+ "rokr-tools",
  "serde",
  "serde_json",
  "tokio",
@@ -1285,6 +1286,13 @@ version = "0.1.0"
 [[package]]
 name = "rokr-tools"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
 
 [[package]]
 name = "rokr-tui"
