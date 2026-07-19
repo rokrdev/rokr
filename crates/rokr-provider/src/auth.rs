@@ -117,12 +117,49 @@ impl TokenStore for FileTokenStore {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string(auth)?;
-        std::fs::write(&self.path, json)?;
+
+        // Unix: create the file via `OpenOptions` with `mode(0o600)` so it
+        // never exists on disk with broader-than-0600 permissions, not even
+        // momentarily. `std::fs::write` (used on other platforms) creates
+        // the file with the umask-default mode (typically 0644) and only
+        // narrows it in a later `set_permissions` call, leaving a window
+        // where the token file is world-readable -- and if the process
+        // dies between the two calls, it stays world-readable permanently.
+        // `mode()` on `OpenOptions` only takes effect when the file is
+        // actually created (`O_CREAT`); if `self.path` already exists from
+        // a previous save, `create(true)` opens it as-is without changing
+        // its mode, so the trailing `set_permissions` call below still runs
+        // unconditionally to narrow that case too (matches the previous
+        // behavior for already-existing files, just without ever widening
+        // the window for newly-created ones).
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)?;
+            file.write_all(json.as_bytes())?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&self.path, &json)?;
+        }
 
         // Unix-only: Windows has no equivalent permission-bit model, so the
         // 0600 hardening is best-effort/skipped there (matches the
         // `#[cfg(unix)]` precedent already in this workspace, e.g.
         // rokr-config's `load_project_context_does_not_fall_back_when_agents_md_is_unreadable`).
+        // Kept even though the `OpenOptions` path above already creates the
+        // file at 0600: this still narrows permissions on a file that
+        // already existed (with broader perms) before this save, since
+        // `mode()` only governs perms at creation time, not on an
+        // already-existing file opened with `create(true)`.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -749,6 +786,77 @@ mod tests {
             .load()
             .expect("load should fall back to the file store");
         assert_eq!(loaded, Some(auth));
+    }
+
+    /// F-002: `FileTokenStore::save` must never leave the token file
+    /// observable with permissions broader than `0600` on disk -- directly
+    /// exercises `FileTokenStore::save` (not through
+    /// `KeychainWithFileFallback`, unlike the test above) so this is a
+    /// direct check of the file-creation path itself, not just its
+    /// eventual state after a `set_permissions` call.
+    #[test]
+    #[cfg(unix)]
+    fn file_token_store_save_creates_file_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("nested").join("oauth_token.json");
+        let store = FileTokenStore::new(file_path.clone());
+
+        let auth = Auth::OAuth {
+            access_token: "test-access-token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+        };
+        store.save(&auth).expect("save should succeed");
+
+        let metadata = std::fs::metadata(&file_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected token file permissions to be 0600 immediately after save, got {mode:o}"
+        );
+
+        // Re-saving (the file already exists) must also leave it at 0600.
+        store.save(&auth).expect("second save should succeed");
+        let metadata = std::fs::metadata(&file_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected token file permissions to remain 0600 after a second save, got {mode:o}"
+        );
+    }
+
+    /// F-002: a file that already existed at broader permissions (e.g. left
+    /// over from a version of this code predating the fix, or created by
+    /// some other process) must be narrowed to `0600` by `save`, since
+    /// `OpenOptions::mode()` only governs permissions at creation time and
+    /// has no effect on a pre-existing file opened with `create(true)`.
+    #[test]
+    #[cfg(unix)]
+    fn file_token_store_save_narrows_preexisting_broad_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("oauth_token.json");
+        std::fs::write(&file_path, "stale-contents").unwrap();
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = FileTokenStore::new(file_path.clone());
+        store
+            .save(&Auth::OAuth {
+                access_token: "test-access-token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+            })
+            .expect("save should succeed");
+
+        let metadata = std::fs::metadata(&file_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected save to narrow a pre-existing 0644 file down to 0600, got {mode:o}"
+        );
     }
 
     /// Sanity check for the hand-rolled base64url encoder and SHA-256

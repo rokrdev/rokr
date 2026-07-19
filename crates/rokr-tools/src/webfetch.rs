@@ -114,16 +114,30 @@ fn truncate_to_cap(contents: &str, cap: usize) -> (&str, Option<String>) {
 /// defensively.
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
-        }
+        IpAddr::V4(v4) => is_blocked_v4(v4),
         IpAddr::V6(v6) => {
+            // IPv4-mapped (`::ffff:a.b.c.d`) addresses are unmapped and
+            // checked against the same V4 rules *first*: the OS routes a
+            // connect to a v4-mapped address to the underlying IPv4
+            // address, so `::ffff:127.0.0.1` / `::ffff:169.254.169.254` /
+            // `::ffff:10.0.0.1` etc. are exactly as dangerous as their bare
+            // IPv4 form and must not be allowed to sail through the V6
+            // rules below, which don't know anything about private/
+            // link-local IPv4 ranges (F-001).
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_v4(&v4);
+            }
+
             v6.is_loopback()
                 || v6.is_unicast_link_local()
                 || v6.is_unique_local()
                 || v6.is_unspecified()
         }
     }
+}
+
+fn is_blocked_v4(v4: &std::net::Ipv4Addr) -> bool {
+    v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
 }
 
 /// Resolves `host` and validates every resolved address against `is_blocked`
@@ -368,7 +382,7 @@ mod tests {
 
     #[test]
     fn is_blocked_ip_rejects_all_documented_ranges() {
-        let blocked: [IpAddr; 7] = [
+        let blocked: [IpAddr; 12] = [
             "127.0.0.1".parse().unwrap(),
             "10.0.0.1".parse().unwrap(),
             "192.168.1.1".parse().unwrap(),
@@ -376,6 +390,11 @@ mod tests {
             "0.0.0.0".parse().unwrap(),
             "::1".parse().unwrap(),
             "fe80::1".parse().unwrap(),
+            "fd00::1".parse().unwrap(),
+            "::".parse().unwrap(),
+            "::ffff:127.0.0.1".parse().unwrap(),
+            "::ffff:169.254.169.254".parse().unwrap(),
+            "::ffff:10.0.0.1".parse().unwrap(),
         ];
         for ip in blocked {
             assert!(is_blocked_ip(&ip), "expected {ip} to be blocked");
@@ -429,6 +448,52 @@ mod tests {
                 other => panic!("expected Err(ToolError::ExecutionFailed(_)) for {url}, got {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn webfetch_rejects_ipv4_mapped_ipv6_addresses_without_request() {
+        // A real mock server bound to loopback: if the V6 arm of
+        // `is_blocked_ip` failed to unmap an IPv4-mapped address before
+        // checking it (the F-001 SSRF bypass), an IPv4-mapped-loopback
+        // literal pointed at this server's own port would sail through the
+        // guard, get pinned via `resolve_to_addrs`, and the server would
+        // actually receive the request.
+        let server = MockServer::start().await;
+        let port = server.address().port();
+
+        let tool = WebfetchTool;
+
+        // The literal from F-001: the IPv4-mapped IPv6 form of the cloud
+        // metadata address. Must be rejected by the real guard through the
+        // real `execute()` entry point, same as any other blocked address.
+        let metadata_url = "http://[::ffff:169.254.169.254]/";
+        match tool.execute(json!({ "url": metadata_url })).await {
+            Err(ToolError::ExecutionFailed(msg)) => {
+                assert!(
+                    msg.to_lowercase().contains("blocked"),
+                    "expected a blocked-address rejection message for {metadata_url}, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(ToolError::ExecutionFailed(_)) for {metadata_url}, got {other:?}"
+            ),
+        }
+
+        // Concrete proof no request escapes: an IPv4-mapped literal for the
+        // mock server's own loopback port.
+        let mapped_loopback_url = format!("http://[::ffff:127.0.0.1]:{port}/");
+        let result = tool.execute(json!({ "url": mapped_loopback_url })).await;
+        assert!(
+            result.is_err(),
+            "expected the IPv4-mapped loopback literal to be rejected, got Ok"
+        );
+
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "the SSRF guard must reject IPv4-mapped IPv6 addresses before any request \
+             reaches the server"
+        );
     }
 
     #[tokio::test]
@@ -551,9 +616,15 @@ mod tests {
             .await;
 
         let url = format!("{}/redirect-to-metadata", server.uri());
-        // Uses the real is_blocked_ip guard here (not allow_loopback) since
-        // the property under test is that the *redirect target*, not the
-        // initial URL, gets rejected.
+        // Uses the relaxed `allow_loopback` predicate here, not the real
+        // `is_blocked_ip`: the initial hop targets the loopback-bound mock
+        // server, which the real guard would reject before the test could
+        // even reach the redirect. `allow_loopback` only carves out
+        // loopback -- it still rejects link-local/private/etc. -- so the
+        // redirect's metadata-endpoint target (169.254.169.254, a
+        // link-local address) is still blocked by it, which is what this
+        // test is actually verifying: that the guard is *re-run* on the
+        // redirect hop's target, not just the initial URL.
         let result = fetch_with_validator(&url, allow_loopback).await;
 
         assert!(
