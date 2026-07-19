@@ -75,18 +75,41 @@ impl RetryPolicy {
 pub struct ResilientProvider<P> {
     inner: P,
     policy: RetryPolicy,
+    /// Optional failover target, tried once (no retry loop of its own)
+    /// after the primary's retries are exhausted. `None` by default, which
+    /// keeps failover off unless a caller explicitly opts in via
+    /// [`Self::with_secondary`] — see the PRD's "Failover and cache
+    /// stability" section: cross-provider failover is cache-destroying, so
+    /// it's a config-driven last resort, not the default.
+    secondary: Option<P>,
 }
 
 impl<P> ResilientProvider<P> {
-    /// Wraps `inner` with the default [`RetryPolicy`].
+    /// Wraps `inner` with the default [`RetryPolicy`]. No secondary
+    /// provider configured — failover is off.
     pub fn new(inner: P) -> Self {
         Self::with_policy(inner, RetryPolicy::default())
     }
 
     /// Wraps `inner` with an explicit [`RetryPolicy`] — primarily for tests
-    /// that need fast, deterministic retry timing.
+    /// that need fast, deterministic retry timing. No secondary provider
+    /// configured — failover is off.
     pub fn with_policy(inner: P, policy: RetryPolicy) -> Self {
-        Self { inner, policy }
+        Self {
+            inner,
+            policy,
+            secondary: None,
+        }
+    }
+
+    /// Configures a secondary provider to fail over to, once, after the
+    /// primary's retries are exhausted. Cross-provider failover is
+    /// cache-destroying (different tokenizer/cache namespace), so this is
+    /// opt-in — without calling this, `ResilientProvider` behaves exactly
+    /// as it did before ticket 26 (returns the primary's error unchanged).
+    pub fn with_secondary(mut self, secondary: P) -> Self {
+        self.secondary = Some(secondary);
+        self
     }
 }
 
@@ -119,13 +142,142 @@ where
             };
 
             if attempt >= self.policy.max_attempts {
-                return Err(error);
+                return self.failover_or_err(messages, tools, error).await;
             }
             if start.elapsed().saturating_add(delay) > self.policy.max_elapsed {
-                return Err(error);
+                return self.failover_or_err(messages, tools, error).await;
             }
 
             tokio::time::sleep(delay).await;
         }
+    }
+}
+
+impl<P> ResilientProvider<P>
+where
+    P: Provider<Error = ProviderError>,
+{
+    /// Called once the primary's retries are exhausted. Without a
+    /// secondary configured, returns `primary_error` unchanged — this is
+    /// what keeps failover off by default (ticket-25 behavior, byte for
+    /// byte). With a secondary configured, emits a telemetry event marking
+    /// the cache invalidation (cross-provider failover always misses the
+    /// primary's prompt cache — see the PRD's "Failover and cache
+    /// stability" section) and makes a single attempt against the
+    /// secondary — no retry loop of its own — returning its result
+    /// (success or error) directly.
+    async fn failover_or_err(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        primary_error: ProviderError,
+    ) -> Result<(Message, Usage), ProviderError> {
+        let Some(secondary) = &self.secondary else {
+            return Err(primary_error);
+        };
+
+        tracing::info!(
+            primary_error = %primary_error,
+            cache_invalidated = true,
+            "provider retries exhausted, failing over to secondary provider"
+        );
+
+        secondary.send(messages, tools).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// A minimal in-module fake `Provider`, scripted with a fixed sequence
+    /// of results, one per call. Deliberately not reusing the acceptance
+    /// test crate's `ScriptedProvider` (that's a separate crate for
+    /// integration-test purposes) — this is a small white-box fake for a
+    /// unit test co-located in this source file.
+    #[derive(Clone)]
+    struct FakeProvider {
+        inner: Arc<FakeProviderState>,
+    }
+
+    struct FakeProviderState {
+        responses: Mutex<VecDeque<Result<(Message, Usage), ProviderError>>>,
+        call_count: AtomicUsize,
+    }
+
+    impl FakeProvider {
+        fn new(responses: Vec<Result<(Message, Usage), ProviderError>>) -> Self {
+            Self {
+                inner: Arc::new(FakeProviderState {
+                    responses: Mutex::new(responses.into_iter().collect()),
+                    call_count: AtomicUsize::new(0),
+                }),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.inner.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Provider for FakeProvider {
+        type Error = ProviderError;
+
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> Result<(Message, Usage), ProviderError> {
+            self.inner.call_count.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeProvider called more times than responses were scripted")
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_disabled_by_default_when_no_secondary_configured() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            max_elapsed: Duration::from_secs(5),
+        };
+
+        let fake = FakeProvider::new(
+            (0..policy.max_attempts)
+                .map(|_| {
+                    Err(ProviderError::UnexpectedStatus {
+                        status: 503,
+                        body: "primary down".to_string(),
+                    })
+                })
+                .collect(),
+        );
+
+        let resilient = ResilientProvider::with_policy(fake.clone(), policy);
+        assert!(
+            resilient.secondary.is_none(),
+            "failover must be off by default when no secondary is configured"
+        );
+
+        let messages = vec![Message::user_text("hello")];
+        let result = resilient.send(&messages, &[]).await;
+
+        match result {
+            Err(ProviderError::UnexpectedStatus { status, .. }) => assert_eq!(status, 503),
+            other => panic!("expected the primary's exhausted-retries error unchanged, got {other:?}"),
+        }
+        assert_eq!(
+            fake.calls(),
+            policy.max_attempts as usize,
+            "no secondary configured means no failover attempt — the fake should be called exactly max_attempts times"
+        );
     }
 }

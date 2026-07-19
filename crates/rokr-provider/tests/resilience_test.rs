@@ -150,3 +150,44 @@ async fn resilient_provider_waits_at_least_the_retry_after_duration_before_retry
         "expected to wait at least the retry-after duration ({retry_after:?}) before retrying, only waited {elapsed:?}"
     );
 }
+
+#[tokio::test]
+async fn resilient_provider_fails_over_to_secondary_after_primary_retries_exhausted() {
+    let policy = fast_test_policy();
+
+    let primary = ScriptedProvider::new(
+        (0..policy.max_attempts)
+            .map(|_| {
+                Err(ProviderError::UnexpectedStatus {
+                    status: 503,
+                    body: "primary down".to_string(),
+                })
+            })
+            .collect(),
+    );
+    let secondary = ScriptedProvider::new(vec![Ok((
+        Message::assistant_text("secondary responded"),
+        Usage::default(),
+    ))]);
+
+    let resilient =
+        ResilientProvider::with_policy(primary.clone(), policy).with_secondary(secondary.clone());
+
+    let messages = vec![Message::user_text("hello")];
+    let result = resilient.send(&messages, &[]).await;
+
+    let (message, _usage) = result.expect(
+        "ResilientProvider should fail over to the secondary once the primary's retries are exhausted",
+    );
+    assert_eq!(message.text(), "secondary responded");
+    assert_eq!(
+        primary.calls(),
+        policy.max_attempts as usize,
+        "primary's retries should be fully exhausted before failover"
+    );
+    assert_eq!(
+        secondary.calls(),
+        1,
+        "secondary should be attempted exactly once — no retry loop on the secondary"
+    );
+}
