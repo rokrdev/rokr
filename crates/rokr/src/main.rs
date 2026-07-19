@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use rokr_core::Provider;
 
+mod subagent;
+
 const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>]";
 
 /// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
@@ -68,8 +70,15 @@ async fn main() -> ExitCode {
                 }
             };
 
+            // Ticket 30 (subagent-tool): named so it can be cloned into
+            // `submit`'s closure below and reused there to load a *named
+            // subagent's* own prompt (`{config_dir}/agents/{name}.md`) via
+            // the same `rokr_config::read_agent_prompt` call this crate
+            // already makes for the top-level agent tier's prompt.
+            let config_dir = rokr_config::default_config_dir();
+
             let mut system_prompt = match rokr_config::read_agent_prompt(
-                &rokr_config::default_config_dir(),
+                &config_dir,
                 agent.prompt_name(),
             ) {
                 Ok(prompt) => prompt,
@@ -175,6 +184,7 @@ async fn main() -> ExitCode {
                 let system_prompt = system_prompt.clone();
                 let repo_map = repo_map.clone();
                 let last_known_usage = last_known_usage.clone();
+                let config_dir = config_dir.clone();
                 async move {
                     let provider = provider?;
                     // Ticket 29 (model-session-switch): clone the current
@@ -223,15 +233,13 @@ async fn main() -> ExitCode {
                         None
                     };
 
-                    let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
-                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
-                        AgentTier::Build => {
-                            vec![&read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch]
-                        }
-                    };
-                    if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
-                        tools.push(websearch);
-                    }
+                    // Ticket 30 (subagent-tool): cloned before
+                    // `request_permission` below moves `permission` into
+                    // its own closure -- the subagent tool's callback needs
+                    // its own clone of the SAME handle so a subagent's
+                    // gated tool calls round-trip through the identical
+                    // channel the parent's own gated tool calls do.
+                    let subagent_permission = permission.clone();
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
@@ -259,6 +267,52 @@ async fn main() -> ExitCode {
                                 .await
                         }
                     };
+
+                    // Ticket 30 (subagent-tool): bridges rokr-core's
+                    // PermissionRequest to the SAME rokr_tui::PermissionHandle
+                    // the parent's own request_permission above uses (PRD
+                    // Phase 4 "Subagents": "Permission inheritance").
+                    // Tagging with the subagent's name happens inside
+                    // `subagent::run_subagent`, not here -- this closure
+                    // only forwards the (already-tagged) request.
+                    let subagent_request_permission: subagent::PermissionCallback =
+                        Box::new(move |request: rokr_core::PermissionRequest| {
+                            let permission = subagent_permission.clone();
+                            Box::pin(async move {
+                                let detail = match request.payload {
+                                    rokr_core::PermissionPayload::Command(command) => {
+                                        rokr_tui::PermissionDetail::Text(command)
+                                    }
+                                    rokr_core::PermissionPayload::Diff { old, new } => {
+                                        rokr_tui::PermissionDetail::Diff { old, new }
+                                    }
+                                };
+                                permission
+                                    .request(rokr_tui::PermissionRequest {
+                                        tool_name: request.tool_name,
+                                        detail,
+                                    })
+                                    .await
+                            })
+                        });
+                    let subagent_tool = subagent::SubagentTool::new(
+                        provider.clone(),
+                        config_dir.clone(),
+                        subagent_request_permission,
+                    );
+
+                    let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
+                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
+                        AgentTier::Build => {
+                            vec![
+                                &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
+                                &subagent_tool,
+                            ]
+                        }
+                    };
+                    if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
+                        tools.push(websearch);
+                    }
 
                     // Expand any `@path` mentions in the raw input BEFORE it
                     // joins the transcript, so resolved file contents (or a
