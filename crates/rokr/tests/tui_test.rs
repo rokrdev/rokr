@@ -681,6 +681,301 @@ async fn second_prompt_includes_prior_turn_in_request_body() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
 
+/// Ticket 21 (manual-compact-command) acceptance test: typing `/compact`
+/// must synchronously call `rokr_core::compact_transcript` (no auto-compact
+/// threshold check — that's the whole point of a manual command) and
+/// actually replace the running transcript, proven by inspecting the
+/// request body of the prompt submitted right after `/compact`.
+///
+/// `compact_transcript` only makes a summarization call when there's a
+/// genuine "prefix" before the most recent user turn (see
+/// `tail_start_index` in rokr-core) — with only one turn in the transcript,
+/// it's a no-op. So this test submits *two* prompts before `/compact`
+/// (rather than one) to give it something real to summarize: the first
+/// turn becomes the summarized prefix, the second turn is the preserved
+/// "tail" that must survive compaction verbatim.
+///
+/// Sequence of real `/chat/completions` requests: 1st = first prompt, 2nd =
+/// second (pre-compact) prompt, 3rd = the compaction call itself, 4th = the
+/// post-compact prompt.
+#[tokio::test]
+async fn typing_compact_command_compacts_transcript_immediately() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let first_reply_text = "FirstReplyBeforeCompactForTesting";
+    let second_reply_text = "SecondReplyBeforeCompactForTesting";
+    let compaction_summary_token = "CompactionSummaryTokenForManualCompactTesting";
+    let post_compact_reply_text = "ThirdReplyAfterCompactForTesting";
+
+    // 1st request: reply to the first pre-compact prompt.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-first",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": first_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // 2nd request: reply to the second pre-compact prompt (this turn is the
+    // "tail" that compaction must preserve verbatim).
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-second",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": second_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // 3rd request: the compaction call's own summarization reply.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-compaction",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": compaction_summary_token },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // 4th+ request(s): catch-all reply to the post-compact prompt.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-post-compact",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": post_compact_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-compact-command");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-compact-command");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"firstpromptunique\r")
+        .expect("failed to write first prompt to pty");
+
+    let first_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain the first mocked assistant response, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"secondpromptbeforecompact\r")
+        .expect("failed to write second prompt to pty");
+
+    let second_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < second_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain the second mocked assistant response, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/compact\r")
+        .expect("failed to write /compact to pty");
+
+    let compact_confirmation_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < compact_confirmation_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.to_lowercase().contains("compact") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.to_lowercase().contains("compact"),
+        "expected pty output to contain a compaction confirmation after /compact, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"thirdpromptunique\r")
+        .expect("failed to write third prompt to pty");
+
+    let third_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < third_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(post_compact_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(post_compact_reply_text),
+        "expected pty output to contain the post-compact mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        received_requests.len() >= 4,
+        "expected at least 4 requests to /chat/completions (2 pre-compact prompts + the \
+         compaction call + the post-compact prompt), got {}: {received_requests:?}",
+        received_requests.len()
+    );
+
+    let post_compact_request_body =
+        String::from_utf8_lossy(&received_requests[3].body).into_owned();
+
+    assert!(
+        post_compact_request_body.contains(compaction_summary_token),
+        "expected the post-compact prompt's request body to contain the compaction summary \
+         token, proving the transcript was replaced with the compacted version, got: \
+         {post_compact_request_body}"
+    );
+    assert!(
+        !post_compact_request_body.contains("firstpromptunique"),
+        "expected the post-compact prompt's request body to NOT contain the first (now \
+         summarized-away) prompt's text, proving compaction actually replaced the transcript \
+         rather than just appending to it, got: {post_compact_request_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
 /// Ticket 17 (cache-breakpoint-activation) acceptance test: submitting two
 /// consecutive prompts must produce two outgoing request bodies whose
 /// static prefix (tool specs + the system segment) is byte-identical

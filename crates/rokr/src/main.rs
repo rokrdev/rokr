@@ -130,6 +130,13 @@ async fn main() -> ExitCode {
             let context_window_size = config.context_window_size;
             let auto_compact_threshold = config.auto_compact_threshold;
 
+            // Ticket 21 (manual-compact-command): cloned here, before
+            // `submit`'s `move` closure below takes ownership of the
+            // original `provider`/`transcript` bindings, so `command` can
+            // independently share the same provider and running transcript.
+            let command_provider = provider.clone();
+            let command_transcript = transcript.clone();
+
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
@@ -251,7 +258,45 @@ async fn main() -> ExitCode {
                 }
             };
 
-            match rokr_tui::run(submit).await {
+            // Ticket 21 (manual-compact-command): rokr-tui only knows
+            // "slash-prefixed input goes to `command`" (see `route_input`);
+            // this closure is where a literal command string like
+            // `/compact` gets meaning. Deliberately a single minimal match
+            // arm, not a registry/parser framework (a later phase extends
+            // this seam).
+            let command = move |input: String| {
+                let provider = command_provider.clone();
+                let transcript = command_transcript.clone();
+                async move {
+                    match input.as_str() {
+                        "/compact" => {
+                            let provider = match provider {
+                                Ok(provider) => provider,
+                                Err(err) => {
+                                    return format!(
+                                        "compaction failed, transcript left intact: {err}"
+                                    )
+                                }
+                            };
+                            let mut transcript = transcript.lock().await;
+                            match rokr_core::compact_transcript(provider.as_ref(), &transcript)
+                                .await
+                            {
+                                Ok(compacted) => {
+                                    *transcript = compacted;
+                                    "Transcript compacted.".to_string()
+                                }
+                                Err(err) => {
+                                    format!("compaction failed, transcript left intact: {err}")
+                                }
+                            }
+                        }
+                        _ => format!("unknown command: {input}"),
+                    }
+                }
+            };
+
+            match rokr_tui::run(submit, command).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) if err.is_not_a_tty() => {
                     // Not an error in a scripting/piping context: config is
