@@ -206,6 +206,7 @@ impl_executable_tool_gated!(rokr_tools::edit::EditTool);
 pub async fn run_tool_loop<P, F, Fut>(
     provider: &P,
     system_prompt: &str,
+    repo_map: Option<&str>,
     transcript: &mut Vec<Message>,
     tools: &[&dyn ExecutableTool],
     request_permission: F,
@@ -228,7 +229,7 @@ where
         let assembled = context::assemble(context::ContextInputs {
             system_prompt: system_prompt.to_string(),
             tools: tool_specs.clone(),
-            repo_map: None,
+            repo_map: repo_map.map(|repo_map| repo_map.to_string()),
             transcript: transcript.clone(),
         });
 
@@ -477,6 +478,7 @@ mod tests {
         let result = run_tool_loop(
             &provider,
             "you are a test agent",
+            None,
             &mut transcript,
             &tools,
             |_request| async { true },
@@ -601,6 +603,7 @@ mod tests {
         let result = run_tool_loop(
             &provider,
             "you are a test agent",
+            None,
             &mut transcript,
             &tools,
             |_request| async { false },
@@ -730,6 +733,7 @@ mod tests {
         let result = run_tool_loop(
             &provider,
             "you are a test agent",
+            None,
             &mut transcript,
             &tools,
             |_request| async { false },

@@ -88,6 +88,17 @@ async fn main() -> ExitCode {
                 }
             }
 
+            // Generated once per session (ticket 18: repo-map-generation),
+            // never per turn — cwd is the natural root, mirroring the
+            // project-context load above. Not a tool, not permission-gated:
+            // orientation infrastructure the agent never chooses to invoke,
+            // so it's computed here alongside the system prompt rather than
+            // wired through the tool/permission machinery. A cwd that can't
+            // be resolved yields no repo map rather than failing startup.
+            let repo_map: Option<String> = std::env::current_dir()
+                .ok()
+                .map(|cwd| rokr_tools::repo_map::generate(&cwd));
+
             // Constructed once at startup (so a missing/invalid env var
             // doesn't crash the TUI — it's reported the first time the
             // user submits a prompt instead) and wired through
@@ -113,6 +124,7 @@ async fn main() -> ExitCode {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
                 let system_prompt = system_prompt.clone();
+                let repo_map = repo_map.clone();
                 async move {
                     let provider = provider?;
 
@@ -168,6 +180,7 @@ async fn main() -> ExitCode {
                     rokr_core::run_tool_loop(
                         provider.as_ref(),
                         &system_prompt,
+                        repo_map.as_deref(),
                         &mut transcript,
                         &tools,
                         request_permission,

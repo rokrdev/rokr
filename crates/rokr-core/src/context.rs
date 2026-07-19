@@ -100,7 +100,16 @@ pub fn assemble(inputs: ContextInputs) -> AssembledContext {
     messages.push(system_message);
 
     if let Some(repo_map) = inputs.repo_map {
-        messages.push(Message::system_text(repo_map));
+        let mut repo_map_message = Message::system_text(repo_map);
+        if let Some(last_block) = repo_map_message.content.pop() {
+            repo_map_message.content.push(with_cache_control(
+                last_block,
+                CacheControl {
+                    kind: CacheControlKind::Extended,
+                },
+            ));
+        }
+        messages.push(repo_map_message);
     }
 
     let transcript_is_empty = inputs.transcript.is_empty();
