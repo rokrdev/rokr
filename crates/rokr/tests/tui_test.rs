@@ -2504,3 +2504,191 @@ async fn repo_map_segment_lists_tracked_file_and_omits_gitignored_file() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+/// Ticket 19 (at-mention-file-injection) acceptance test: an `@<path>` token
+/// typed in the prompt whose path does not resolve to a real file must
+/// still submit successfully — the outgoing request's user message gets a
+/// "file not found" note referencing the path instead of failing the
+/// submission — and no orphan tool-role message is ever introduced by
+/// mention handling (mentions are expanded inline into the user turn, never
+/// as a synthetic tool result).
+#[tokio::test]
+async fn at_mention_for_missing_file_still_submits_with_not_found_note() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Single token (no spaces) for the same reason as the other tests:
+    // ratatui only redraws changed cells, so a literal substring match on
+    // raw pty bytes needs to avoid spaces that might not get rewritten.
+    let canned_response = "ReplyAfterMissingMentionForTesting";
+
+    // The provider always replies with plain text — no tool call — so this
+    // test proves mention handling alone, not the tool loop.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mention-missing",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mention-missing");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mention-missing");
+    // `unique_temp_dir` creates this directory, but the file referenced
+    // inside it is never written, so the mention is guaranteed to be
+    // path-shaped (it has an extension) yet unresolvable.
+    let mention_dir = unique_temp_dir("mention-missing");
+    let missing_file = mention_dir.join("does-not-exist.txt");
+    let missing_file_str = missing_file.to_string_lossy().into_owned();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    let typed_prompt = format!("@{missing_file_str}\r");
+    writer
+        .write_all(typed_prompt.as_bytes())
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, proving submission \
+         succeeded despite the missing mentioned file, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least 1 request to /chat/completions, got 0"
+    );
+
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+
+    assert!(
+        first_request_body.contains(&missing_file_str),
+        "expected the outgoing request body to reference the missing mentioned path, \
+         got: {first_request_body}"
+    );
+    assert!(
+        first_request_body.to_lowercase().contains("not found"),
+        "expected the outgoing request body to contain a 'not found' note for the missing \
+         mentioned file, got: {first_request_body}"
+    );
+    assert!(
+        !first_request_body.contains("\"role\":\"tool\""),
+        "expected no orphan tool-role message to be introduced by mention handling, \
+         got: {first_request_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&mention_dir);
+}

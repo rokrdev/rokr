@@ -174,8 +174,28 @@ async fn main() -> ExitCode {
                         }
                     };
 
+                    // Expand any `@path` mentions in the raw input BEFORE it
+                    // joins the transcript, so resolved file contents (or a
+                    // not-found note) land in the same user-role message
+                    // rather than as a separate synthetic message — at
+                    // least one supported provider rejects an orphan
+                    // tool-role message on the wire, so this deliberately
+                    // reuses the plain user-text path rather than a
+                    // ToolResult block. The resolver is real filesystem IO
+                    // (the only IO `rokr-core`'s pure `mentions` module
+                    // doesn't perform itself), matching `rokr-tools`'
+                    // `read` tool's own io-error-to-failure behavior: any
+                    // read error (missing file, permissions, non-UTF-8,
+                    // ...) is treated as `NotFound`.
+                    let expanded_input = rokr_core::mentions::expand_mentions(&input, |path| {
+                        match std::fs::read_to_string(path) {
+                            Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
+                            Err(_) => rokr_core::mentions::MentionResolution::NotFound,
+                        }
+                    });
+
                     let mut transcript = transcript.lock().await;
-                    accumulate_user_turn(&mut transcript, input);
+                    accumulate_user_turn(&mut transcript, expanded_input);
 
                     rokr_core::run_tool_loop(
                         provider.as_ref(),
