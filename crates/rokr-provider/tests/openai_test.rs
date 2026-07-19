@@ -46,7 +46,7 @@ async fn openai_provider_returns_assistant_message_from_mock_server() {
 
     let provider = OpenAiProvider::new(mock_server.uri(), "gpt-4o-mini", "test-api-key");
 
-    let result = provider
+    let (result, _usage) = provider
         .send(&[Message::user_text("Say hello")], &[])
         .await
         .expect("provider call should succeed against a healthy mock server");
@@ -173,9 +173,10 @@ async fn openai_provider_request_includes_tools_array_when_specs_provided() {
             },
             "required": ["location"]
         }),
+        cache_control: None,
     }];
 
-    let result = provider
+    let (result, _usage) = provider
         .send(
             &[Message::user_text("What's the weather in Sydney?")],
             &tool_specs,
@@ -233,9 +234,10 @@ async fn openai_provider_parses_tool_calls_response_into_tool_use_blocks() {
             },
             "required": ["location"]
         }),
+        cache_control: None,
     }];
 
-    let result = provider
+    let (result, _usage) = provider
         .send(
             &[Message::user_text("What's the weather in Sydney?")],
             &tool_specs,
@@ -246,7 +248,9 @@ async fn openai_provider_parses_tool_calls_response_into_tool_use_blocks() {
     assert_eq!(result.role, Role::Assistant);
     assert_eq!(result.content.len(), 1);
     match &result.content[0] {
-        ContentBlock::ToolUse { id, name, input } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             assert_eq!(id, "call_abc123");
             assert_eq!(name, "get_weather");
             assert_eq!(input, &json!({ "location": "Sydney" }));
@@ -315,6 +319,7 @@ async fn openai_provider_sends_tool_result_as_role_tool_wire_message() {
                 id: "call_abc123".to_string(),
                 name: "get_weather".to_string(),
                 input: json!({ "location": "Sydney" }),
+                cache_control: None,
             }],
         },
         Message {
@@ -323,11 +328,12 @@ async fn openai_provider_sends_tool_result_as_role_tool_wire_message() {
                 tool_use_id: "call_abc123".to_string(),
                 content: "It's sunny in Sydney".to_string(),
                 is_error: false,
+                cache_control: None,
             }],
         },
     ];
 
-    let result = provider
+    let (result, _usage) = provider
         .send(&messages, &[])
         .await
         .expect("provider call should succeed against a healthy mock server");
@@ -382,9 +388,10 @@ async fn openai_provider_preserves_malformed_tool_call_arguments_as_string() {
             },
             "required": ["location"]
         }),
+        cache_control: None,
     }];
 
-    let result = provider
+    let (result, _usage) = provider
         .send(
             &[Message::user_text("What's the weather in Sydney?")],
             &tool_specs,
@@ -394,7 +401,9 @@ async fn openai_provider_preserves_malformed_tool_call_arguments_as_string() {
 
     assert_eq!(result.content.len(), 1);
     match &result.content[0] {
-        ContentBlock::ToolUse { id, name, input } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             assert_eq!(id, "call_bad_json");
             assert_eq!(name, "get_weather");
             assert_eq!(
@@ -463,11 +472,12 @@ async fn message_to_wire_orders_tool_results_before_text() {
                 tool_use_id: "call_xyz".to_string(),
                 content: "tool output".to_string(),
                 is_error: false,
+                cache_control: None,
             },
         ],
     };
 
-    let result = provider
+    let (result, _usage) = provider
         .send(&[mixed_message], &[])
         .await
         .expect("provider call should succeed against a healthy mock server");
@@ -480,6 +490,56 @@ async fn message_to_wire_orders_tool_results_before_text() {
 /// mutex keeps that an enforced invariant rather than an assumed one, so a
 /// future test added to this file can't flakily race this one.
 static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Phase 3 enabler: `Provider::send` now returns the assistant `Message`
+/// paired with a parsed `Usage`, sourced from the wire response's `usage`
+/// object (input/output/cache-read token counts; OpenAI has no cache-write
+/// concept on the wire, so that figure stays `0`).
+#[tokio::test]
+async fn openai_provider_parses_usage_from_response() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!"
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 42,
+                "completion_tokens": 7,
+                "total_tokens": 49,
+                "prompt_tokens_details": {
+                    "cached_tokens": 10
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let provider = OpenAiProvider::new(mock_server.uri(), "gpt-4o-mini", "test-api-key");
+
+    let (message, usage) = provider
+        .send(&[Message::user_text("Say hello")], &[])
+        .await
+        .expect("provider call should succeed against a healthy mock server");
+
+    assert_eq!(message.text(), "Hello!");
+    assert_eq!(usage.input_tokens, 42);
+    assert_eq!(usage.output_tokens, 7);
+    assert_eq!(usage.cache_read_tokens, 10);
+    assert_eq!(usage.cache_write_tokens, 0);
+}
 
 #[test]
 fn openai_provider_from_env_surfaces_missing_env_var() {

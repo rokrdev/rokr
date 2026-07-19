@@ -25,11 +25,15 @@ pub enum Role {
     Assistant,
 }
 
-/// Caching hint kind. Phase 1 only defines `Ephemeral`; more kinds may be
-/// added later without touching `ContentBlock`.
+/// Caching hint kind, distinguishing a breakpoint's TTL. `Ephemeral` is the
+/// short-lived default; `Extended` is the long-lived ("hour-plus") variant
+/// (Phase 3). Modeling TTL as a kind rather than a raw wire duration keeps
+/// this provider-agnostic — each provider adapter maps a kind onto whatever
+/// duration (or no-op) makes sense for its own wire contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheControlKind {
     Ephemeral,
+    Extended,
 }
 
 /// Caching hint attached to a content block. Always `None` until Phase 3;
@@ -61,6 +65,7 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        cache_control: Option<CacheControl>,
     },
     /// The outcome of executing a [`ContentBlock::ToolUse`], keyed back to it
     /// by `tool_use_id`. `content` is the tool's output rendered as text;
@@ -70,6 +75,7 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: String,
         is_error: bool,
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -154,11 +160,13 @@ mod tests {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
                     input: serde_json::json!({ "path": "src/lib.rs" }),
+                    cache_control: None,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: "file contents".to_string(),
                     is_error: false,
+                    cache_control: None,
                 },
             ],
         };
@@ -170,7 +178,9 @@ mod tests {
         assert_eq!(restored.content.len(), 2);
 
         match &restored.content[0] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read_file");
                 assert_eq!(input, &serde_json::json!({ "path": "src/lib.rs" }));
@@ -183,10 +193,65 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 assert_eq!(tool_use_id, "call_1");
                 assert_eq!(content, "file contents");
                 assert!(!is_error);
+            }
+            other => panic!("expected ToolResult block, got {other:?}"),
+        }
+    }
+
+    /// Phase 3 enabler: `CacheControlKind` gains a TTL-distinguishing
+    /// variant (short-lived `Ephemeral` vs. long-lived `Extended`), and
+    /// `ToolUse`/`ToolResult` blocks gain an optional `cache_control` that
+    /// must round-trip through serde like the existing `Text` block one
+    /// already does.
+    #[test]
+    fn cache_control_ttl_kind_and_tool_block_cache_control_round_trip() {
+        let short_lived = CacheControl {
+            kind: CacheControlKind::Ephemeral,
+        };
+        let long_lived = CacheControl {
+            kind: CacheControlKind::Extended,
+        };
+        assert_ne!(
+            short_lived, long_lived,
+            "the two TTL kinds must be distinguishable"
+        );
+
+        let original = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({ "path": "src/lib.rs" }),
+                    cache_control: Some(long_lived.clone()),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "file contents".to_string(),
+                    is_error: false,
+                    cache_control: Some(short_lived.clone()),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize message");
+        let restored: Message = serde_json::from_str(&json).expect("deserialize message");
+
+        match &restored.content[0] {
+            ContentBlock::ToolUse { cache_control, .. } => {
+                assert_eq!(cache_control, &Some(long_lived));
+            }
+            other => panic!("expected ToolUse block, got {other:?}"),
+        }
+
+        match &restored.content[1] {
+            ContentBlock::ToolResult { cache_control, .. } => {
+                assert_eq!(cache_control, &Some(short_lived));
             }
             other => panic!("expected ToolResult block, got {other:?}"),
         }

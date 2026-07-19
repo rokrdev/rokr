@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+pub mod context;
 pub mod message;
 
 pub use message::{CacheControl, CacheControlKind, ContentBlock, Message, Role};
@@ -16,6 +17,13 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Optional trailing cache-breakpoint marker (Phase 3). When set on the
+    /// last `ToolSpec` in a request's tools list, this places a cache
+    /// breakpoint after the whole tools segment, the same way a
+    /// `ContentBlock::Text`'s `cache_control` places one after that block.
+    /// `None` for every tool today; the `cache-breakpoint-activation` ticket
+    /// is what actually populates it during assembly.
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Primitive description of what a gated tool's execution would do, shown to
@@ -97,6 +105,7 @@ macro_rules! impl_executable_tool {
                     name: rokr_tools::Tool::name(self).to_string(),
                     description: rokr_tools::Tool::description(self).to_string(),
                     input_schema: rokr_tools::Tool::input_schema(self),
+                    cache_control: None,
                 }
             }
 
@@ -134,6 +143,7 @@ macro_rules! impl_executable_tool_gated {
                     name: rokr_tools::Tool::name(self).to_string(),
                     description: rokr_tools::Tool::description(self).to_string(),
                     input_schema: rokr_tools::Tool::input_schema(self),
+                    cache_control: None,
                 }
             }
 
@@ -207,15 +217,18 @@ where
     let tool_specs: Vec<ToolSpec> = tools.iter().map(|tool| tool.to_tool_spec()).collect();
 
     loop {
-        let reply = provider.send(&transcript[..], &tool_specs).await?;
+        // Usage isn't threaded any further yet — that's the token-accounting
+        // work a later ticket (auto-compaction) builds on top of this
+        // enabler's `(Message, Usage)` return shape.
+        let (reply, _usage) = provider.send(&transcript[..], &tool_specs).await?;
 
         let tool_uses: Vec<(String, String, serde_json::Value)> = reply
             .content
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input } => {
-                    Some((id.clone(), name.clone(), input.clone()))
-                }
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some((id.clone(), name.clone(), input.clone())),
                 ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
             })
             .collect();
@@ -257,6 +270,7 @@ where
                 tool_use_id: id,
                 content,
                 is_error,
+                cache_control: None,
             });
         }
 
@@ -283,19 +297,43 @@ where
 pub trait Provider {
     type Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
 
-    async fn send(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<Message, Self::Error>;
+    /// Sends `messages`/`tools` to the provider and returns the assistant's
+    /// reply paired with the parsed token [`Usage`] for this call (Phase 3).
+    /// A provider whose wire response doesn't report a given usage figure
+    /// (e.g. no cache-write concept at all) reports `0` for it rather than
+    /// failing — callers should treat `0` as "not reported", not "definitely
+    /// zero".
+    async fn send(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<(Message, Usage), Self::Error>;
+}
+
+/// Provider-reported token accounting for a single [`Provider::send`] call
+/// (Phase 3). Authoritative once available, replacing the rough
+/// character-based estimate token accounting used before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 /// Sends a single user turn to `provider` and returns the assistant's reply.
 /// Phase 1's minimal orchestration: wrap `input` as a user [`Message`], call
 /// the provider with just that one message and no tools, and hand back
-/// whatever assistant `Message` comes back.
+/// whatever assistant `Message` comes back. `Usage` is discarded here (no
+/// caller of this Phase-1 helper threads it anywhere yet); use
+/// `Provider::send` directly if the usage figures are needed.
 pub async fn single_turn<P: Provider>(
     provider: &P,
     input: impl Into<String>,
 ) -> Result<Message, P::Error> {
     let user_message = Message::user_text(input);
-    provider.send(&[user_message], &[]).await
+    let (reply, _usage) = provider.send(&[user_message], &[]).await?;
+    Ok(reply)
 }
 
 #[cfg(test)]
@@ -320,12 +358,12 @@ mod tests {
             &self,
             messages: &[Message],
             tools: &[ToolSpec],
-        ) -> Result<Message, StubError> {
+        ) -> Result<(Message, Usage), StubError> {
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].role, Role::User);
             assert_eq!(messages[0].text(), "hello");
             assert!(tools.is_empty());
-            Ok(Message::assistant_text("hi there"))
+            Ok((Message::assistant_text("hi there"), Usage::default()))
         }
     }
 
@@ -382,9 +420,14 @@ mod tests {
             &self,
             messages: &[Message],
             _tools: &[ToolSpec],
-        ) -> Result<Message, StubError> {
+        ) -> Result<(Message, Usage), StubError> {
             self.calls.lock().unwrap().push(messages.to_vec());
-            self.replies.lock().unwrap().pop_front().ok_or(StubError)
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(StubError)
+                .map(|message| (message, Usage::default()))
         }
     }
 
@@ -396,6 +439,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({"path": "/tmp/whatever.txt"}),
+                cache_control: None,
             }],
         };
         let final_reply = Message::assistant_text("final answer");
@@ -447,6 +491,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             }] => {
                 assert_eq!(tool_use_id, "call_1");
                 assert!(content.contains("/tmp/whatever.txt"));
@@ -506,6 +551,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "fake_gated".to_string(),
                 input: serde_json::json!({}),
+                cache_control: None,
             }],
         };
         let final_reply = Message::assistant_text("final answer after rejection");
@@ -544,6 +590,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             }] => {
                 assert_eq!(tool_use_id, "call_1");
                 assert!(
@@ -629,6 +676,7 @@ mod tests {
                     "path": target_path,
                     "content": "clobbered content"
                 }),
+                cache_control: None,
             }],
         };
         let final_reply = Message::assistant_text("final answer after rejection");
@@ -665,6 +713,7 @@ mod tests {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             }] => {
                 assert_eq!(tool_use_id, "call_1");
                 assert!(
