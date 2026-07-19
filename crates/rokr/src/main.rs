@@ -58,10 +58,13 @@ async fn main() -> ExitCode {
                 }
             };
 
-            if let Err(err) = rokr_config::load_or_init_default() {
-                eprintln!("failed to initialize config: {err}");
-                return ExitCode::FAILURE;
-            }
+            let config = match rokr_config::load_or_init_default() {
+                Ok(config) => config,
+                Err(err) => {
+                    eprintln!("failed to initialize config: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
 
             let mut system_prompt = match rokr_config::read_agent_prompt(
                 &rokr_config::default_config_dir(),
@@ -119,6 +122,13 @@ async fn main() -> ExitCode {
             let transcript: Vec<rokr_core::Message> = Vec::new();
             let transcript: Arc<tokio::sync::Mutex<Vec<rokr_core::Message>>> =
                 Arc::new(tokio::sync::Mutex::new(transcript));
+
+            // Ticket 20 (auto-compaction-threshold): both `Copy`, captured
+            // by value once by the outer `move` closure below and reused
+            // on every invocation, mirroring `agent`'s existing capture
+            // pattern in this same closure.
+            let context_window_size = config.context_window_size;
+            let auto_compact_threshold = config.auto_compact_threshold;
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
@@ -197,7 +207,7 @@ async fn main() -> ExitCode {
                     let mut transcript = transcript.lock().await;
                     accumulate_user_turn(&mut transcript, expanded_input);
 
-                    rokr_core::run_tool_loop(
+                    let (reply, usage) = rokr_core::run_tool_loop(
                         provider.as_ref(),
                         &system_prompt,
                         repo_map.as_deref(),
@@ -206,8 +216,38 @@ async fn main() -> ExitCode {
                         request_permission,
                     )
                     .await
-                    .map(|message| message.text())
-                    .map_err(|err| err.to_string())
+                    .map_err(|err| err.to_string())?;
+
+                    // Auto-compaction (ticket 20): checked once per
+                    // submitted turn using that turn's own final usage
+                    // figure. Runs inside this same async submit future —
+                    // no new thread, nothing here blocks the render loop.
+                    // On failure the transcript is left untouched and a
+                    // notice is prepended to this turn's reply instead of
+                    // losing history.
+                    let notice = if rokr_core::should_compact(
+                        usage,
+                        &transcript,
+                        context_window_size,
+                        auto_compact_threshold,
+                    ) {
+                        match rokr_core::compact_transcript(provider.as_ref(), &transcript).await {
+                            Ok(compacted) => {
+                                *transcript = compacted;
+                                None
+                            }
+                            Err(err) => Some(format!(
+                                "[auto-compaction failed, continuing with full history: {err}]"
+                            )),
+                        }
+                    } else {
+                        None
+                    };
+
+                    Ok(match notice {
+                        Some(notice) => format!("{notice}\n{}", reply.text()),
+                        None => reply.text(),
+                    })
                 }
             };
 

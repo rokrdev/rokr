@@ -204,6 +204,11 @@ impl_executable_tool_gated!(rokr_tools::edit::EditTool);
 /// error — the loop continues rather than aborting. Non-gated tools
 /// (`preview` returns `None`) skip the permission check and execute
 /// directly, exactly as before.
+///
+/// Returns the final reply paired with the provider-reported [`Usage`] of
+/// the call that produced it (Phase 3), so a caller can decide whether that
+/// turn's usage crosses the auto-compaction threshold (see
+/// [`should_compact`]) before submitting the next one.
 pub async fn run_tool_loop<P, F, Fut>(
     provider: &P,
     system_prompt: &str,
@@ -211,7 +216,7 @@ pub async fn run_tool_loop<P, F, Fut>(
     transcript: &mut Vec<Message>,
     tools: &[&dyn ExecutableTool],
     request_permission: F,
-) -> Result<Message, P::Error>
+) -> Result<(Message, Usage), P::Error>
 where
     P: Provider,
     F: Fn(PermissionRequest) -> Fut,
@@ -234,10 +239,7 @@ where
             transcript: transcript.clone(),
         });
 
-        // Usage isn't threaded any further yet — that's the token-accounting
-        // work a later ticket (auto-compaction) builds on top of this
-        // enabler's `(Message, Usage)` return shape.
-        let (reply, _usage) = provider
+        let (reply, usage) = provider
             .send(&assembled.messages[..], &assembled.tools)
             .await?;
 
@@ -254,7 +256,7 @@ where
 
         if tool_uses.is_empty() {
             transcript.push(reply.clone());
-            return Ok(reply);
+            return Ok((reply, usage));
         }
 
         transcript.push(reply);
@@ -338,6 +340,164 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+}
+
+/// The system prompt for the dedicated summarization call [`compact_transcript`]
+/// makes to shrink a long-running transcript. Distinct from the agent's own
+/// system prompt (`main.rs`'s `system_prompt`) — this one instructs the
+/// provider to *summarize*, not to keep acting as the coding agent, and asks
+/// it to preserve exactly what a continuing agent still needs: the task and
+/// decisions made so far, files touched, current state, open TODOs, and any
+/// recent tool results still relevant.
+const COMPACTION_PROMPT: &str = "\
+You are compacting a long-running coding agent's conversation history to \
+free up context window space. Summarize the conversation transcript below \
+into a single, dense passage that preserves everything a continuing agent \
+still needs:
+- the current task and overall goal
+- decisions already made, and why
+- files touched or modified so far
+- the present state of the work (what's done, what's in progress)
+- open follow-ups or TODOs
+- any recent tool results still needed for future steps
+
+Do not restate these instructions or add pleasantries. Output only the \
+summary text.";
+
+/// Decides whether the transcript should be compacted before the next turn
+/// is sent, per the Phase 3 auto-compaction design: primarily driven by the
+/// most recent turn's provider-reported `usage`, falling back to a rough
+/// chars/4 estimate of the whole transcript only when that usage hasn't
+/// been reported at all (`input_tokens == 0 && output_tokens == 0` — see
+/// [`Provider::send`]'s doc comment on `0` meaning "not reported"). Cache
+/// read/write tokens are not counted here: they reflect tokens the provider
+/// served from (or wrote to) its cache, not tokens occupying the live
+/// context window budget this threshold is protecting.
+pub fn should_compact(
+    usage: Usage,
+    transcript: &[Message],
+    context_window_size: u32,
+    auto_compact_threshold: f64,
+) -> bool {
+    let budget = auto_compact_threshold * context_window_size as f64;
+    let estimated_tokens = if usage.input_tokens == 0 && usage.output_tokens == 0 {
+        estimate_tokens_from_chars(transcript)
+    } else {
+        (usage.input_tokens + usage.output_tokens) as f64
+    };
+    estimated_tokens >= budget
+}
+
+/// Rough pre-usage token estimate (chars/4) over every block's text content,
+/// used by [`should_compact`] only until a real usage figure is available.
+fn estimate_tokens_from_chars(transcript: &[Message]) -> f64 {
+    let total_chars: usize = transcript
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .map(|block| match block {
+            ContentBlock::Text { text, .. } => text.len(),
+            ContentBlock::ToolUse { input, .. } => input.to_string().len(),
+            ContentBlock::ToolResult { content, .. } => content.len(),
+        })
+        .sum();
+    total_chars as f64 / 4.0
+}
+
+/// A "genuine user prompt" turn: a `User`-role message carrying at least one
+/// `Text` block. This excludes the `User`-role messages `run_tool_loop`
+/// synthesizes to carry `ToolResult`s back to the provider (those have no
+/// `Text` block), so [`tail_start_index`] can find the boundary of the most
+/// recent real user turn rather than stopping at an intermediate tool-result
+/// turn partway through it.
+fn is_user_prompt_message(message: &Message) -> bool {
+    message.role == Role::User
+        && message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { .. }))
+}
+
+/// Finds where the transcript's "tail" (the part compaction must never touch)
+/// begins: the index of the last genuine user-prompt message (see
+/// [`is_user_prompt_message`]). Everything from that index onward — the
+/// prompt itself, its whole tool-cycle chain, and the final reply — stays
+/// byte-identical; everything before it is what gets folded into a summary.
+/// Falls back to `0` (the whole transcript is "tail", nothing to compact) if
+/// no user-prompt message is found at all.
+fn tail_start_index(transcript: &[Message]) -> usize {
+    transcript
+        .iter()
+        .rposition(is_user_prompt_message)
+        .unwrap_or(0)
+}
+
+/// Flattens the given messages into a single plain-text rendering for the
+/// compaction summarization call, tagging each block with its role (and tool
+/// name / error state, for tool blocks) so the summarizer can tell turns and
+/// speakers apart.
+fn render_transcript_for_summary(messages: &[Message]) -> String {
+    let mut rendered = String::new();
+    for message in messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text, .. } => {
+                    rendered.push_str(&format!("[{:?}] {text}\n", message.role));
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    rendered.push_str(&format!("[{:?} tool_use {name}] {input}\n", message.role));
+                }
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    rendered.push_str(&format!(
+                        "[{:?} tool_result{}] {content}\n",
+                        message.role,
+                        if *is_error { " error" } else { "" }
+                    ));
+                }
+            }
+        }
+    }
+    rendered
+}
+
+/// Compacts `transcript` by replacing everything before the most recent
+/// user-prompt turn with a single summary message, produced by a dedicated
+/// summarization call to `provider` (using [`COMPACTION_PROMPT`], not the
+/// agent's own system prompt). The most recent turn — that user prompt plus
+/// its entire tool-cycle chain and final reply — is copied through
+/// unchanged, so a `ToolUse` is never separated from its `ToolResult`.
+///
+/// If no user-prompt turn is found at all (an edge case — normally the
+/// caller only compacts a transcript that already has at least one), there
+/// is nothing to summarize and `transcript` is returned unchanged. On a
+/// provider failure during the summarization call, this returns `Err`
+/// without touching `transcript` at all — per the Phase 3 design, a failed
+/// compaction must leave the running conversation exactly as it was.
+pub async fn compact_transcript<P: Provider>(
+    provider: &P,
+    transcript: &[Message],
+) -> Result<Vec<Message>, P::Error> {
+    let split_at = tail_start_index(transcript);
+    if split_at == 0 {
+        return Ok(transcript.to_vec());
+    }
+
+    let (prefix, tail) = transcript.split_at(split_at);
+
+    let compaction_request = vec![
+        Message::system_text(COMPACTION_PROMPT),
+        Message::user_text(render_transcript_for_summary(prefix)),
+    ];
+    let (reply, _usage) = provider.send(&compaction_request, &[]).await?;
+
+    let mut compacted = Vec::with_capacity(tail.len() + 1);
+    compacted.push(Message::user_text(format!(
+        "[Earlier conversation summary — compacted to save context]\n\n{}",
+        reply.text()
+    )));
+    compacted.extend_from_slice(tail);
+    Ok(compacted)
 }
 
 /// Sends a single user turn to `provider` and returns the assistant's reply.
@@ -476,7 +636,7 @@ mod tests {
 
         let mut transcript = vec![Message::user_text("read the file")];
 
-        let result = run_tool_loop(
+        let (result, _usage) = run_tool_loop(
             &provider,
             "you are a test agent",
             None,
@@ -601,7 +761,7 @@ mod tests {
 
         let mut transcript = vec![Message::user_text("run the command")];
 
-        let result = run_tool_loop(
+        let (result, _usage) = run_tool_loop(
             &provider,
             "you are a test agent",
             None,
@@ -731,7 +891,7 @@ mod tests {
 
         let mut transcript = vec![Message::user_text("overwrite the file")];
 
-        let result = run_tool_loop(
+        let (result, _usage) = run_tool_loop(
             &provider,
             "you are a test agent",
             None,
@@ -775,5 +935,132 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Ticket 20 (auto-compaction-threshold): compaction must rewrite only
+    /// the "middle" of the transcript (everything before the most recent
+    /// user prompt turn) into a single summary message, while the most
+    /// recent turn — the user prompt plus its whole tool-cycle chain and
+    /// final reply — survives byte-for-byte, never splitting a `ToolUse`
+    /// from its `ToolResult`.
+    #[tokio::test]
+    async fn compact_transcript_preserves_prefix_and_recent_turn_replaces_middle_with_summary() {
+        let first_turn_user = Message::user_text("first turn user text");
+        let first_turn_assistant = Message::assistant_text("first turn assistant text");
+
+        let second_turn_user = Message::user_text("second turn user text");
+        let second_turn_tool_use = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({"path": "/tmp/whatever.txt"}),
+                cache_control: None,
+            }],
+        };
+        let second_turn_tool_result = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "tool result content".to_string(),
+                is_error: false,
+                cache_control: None,
+            }],
+        };
+        let second_turn_assistant_reply = Message::assistant_text("second turn final reply");
+
+        let transcript = vec![
+            first_turn_user.clone(),
+            first_turn_assistant.clone(),
+            second_turn_user.clone(),
+            second_turn_tool_use.clone(),
+            second_turn_tool_result.clone(),
+            second_turn_assistant_reply.clone(),
+        ];
+
+        let summary_text = "CompactionSummaryTokenForTesting";
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                Message::assistant_text(summary_text),
+            ])),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let compacted = compact_transcript(&provider, &transcript)
+            .await
+            .expect("compaction should succeed");
+
+        assert_eq!(
+            compacted.len(),
+            5,
+            "expected summary message + the 4 tail messages, got: {compacted:?}"
+        );
+
+        let summary_message = &compacted[0];
+        assert!(
+            summary_message.text().contains(summary_text),
+            "summary message should contain the scripted summary text, got: {summary_message:?}"
+        );
+        assert!(
+            !summary_message.text().contains("first turn"),
+            "summary message must not contain the first turn's raw text, got: {summary_message:?}"
+        );
+
+        assert_eq!(compacted[1], second_turn_user);
+        assert_eq!(compacted[2], second_turn_tool_use);
+        assert_eq!(compacted[3], second_turn_tool_result);
+        assert_eq!(compacted[4], second_turn_assistant_reply);
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one summarization call should have been made"
+        );
+        let summarization_request_text = calls[0]
+            .iter()
+            .map(|message| message.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            summarization_request_text.contains("first turn"),
+            "summarization call should include the first turn's content, got: \
+             {summarization_request_text}"
+        );
+        assert!(
+            !summarization_request_text.contains("second turn"),
+            "summarization call must not include the second (most-recent) turn's content, got: \
+             {summarization_request_text}"
+        );
+    }
+
+    /// On a provider failure during the compaction call, the transcript must
+    /// be left completely untouched so the session can continue with full
+    /// history rather than losing it.
+    #[tokio::test]
+    async fn compact_transcript_leaves_transcript_intact_on_provider_failure() {
+        let transcript = vec![
+            Message::user_text("first turn user text"),
+            Message::assistant_text("first turn assistant text"),
+            Message::user_text("second turn user text"),
+            Message::assistant_text("second turn assistant text"),
+        ];
+        let transcript_before = transcript.clone();
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let result = compact_transcript(&provider, &transcript).await;
+
+        assert!(
+            result.is_err(),
+            "compaction should fail when the provider errors"
+        );
+        assert_eq!(
+            transcript, transcript_before,
+            "the original transcript must be left untouched on compaction failure"
+        );
     }
 }
