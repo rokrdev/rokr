@@ -178,6 +178,7 @@ macro_rules! impl_executable_tool_gated {
 impl_executable_tool_gated!(rokr_tools::bash::BashTool);
 impl_executable_tool_gated!(rokr_tools::write::WriteTool);
 impl_executable_tool_gated!(rokr_tools::edit::EditTool);
+impl_executable_tool_gated!(rokr_tools::webfetch::WebfetchTool);
 
 /// Runs the agent tool loop (ADR 0004) against the running conversation
 /// `transcript`, and for as long as the reply contains `ToolUse` blocks,

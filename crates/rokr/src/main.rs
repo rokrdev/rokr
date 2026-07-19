@@ -165,13 +165,14 @@ async fn main() -> ExitCode {
                 async move {
                     let provider = provider?;
 
-                    // All seven tools are constructed unconditionally
+                    // All eight tools are constructed unconditionally
                     // (they're cheap zero-sized unit structs); which ones
                     // actually land in `tools` depends on the agent tier.
                     // read/glob/grep/ls auto-approve (ADR 0005: none are
-                    // `PreviewableTool`s); bash, write, and edit are gated
-                    // and round-trip through the permission callback below,
-                    // and only exist in the tool set for the `Build` tier.
+                    // `PreviewableTool`s); bash, write, edit, and webfetch
+                    // are gated and round-trip through the permission
+                    // callback below, and only exist in the tool set for
+                    // the `Build` tier.
                     let read = rokr_tools::read::ReadTool;
                     let glob = rokr_tools::glob::GlobTool;
                     let grep = rokr_tools::grep::GrepTool;
@@ -179,9 +180,12 @@ async fn main() -> ExitCode {
                     let bash = rokr_tools::bash::BashTool;
                     let write = rokr_tools::write::WriteTool;
                     let edit = rokr_tools::edit::EditTool;
+                    let webfetch = rokr_tools::webfetch::WebfetchTool;
                     let tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
                         AgentTier::Plan => vec![&read, &glob, &grep, &ls],
-                        AgentTier::Build => vec![&read, &glob, &grep, &ls, &bash, &write, &edit],
+                        AgentTier::Build => vec![
+                            &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
+                        ],
                     };
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +

@@ -1393,11 +1393,13 @@ name = "rokr-tools"
 version = "0.1.0"
 dependencies = [
  "ignore",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
