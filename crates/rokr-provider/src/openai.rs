@@ -315,9 +315,18 @@ impl Provider for OpenAiProvider {
             .await?;
 
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
         let body = response.text().await?;
 
         if !status.is_success() {
+            if status.as_u16() == 429 {
+                return Err(ProviderError::RateLimited { retry_after });
+            }
             return Err(ProviderError::UnexpectedStatus {
                 status: status.as_u16(),
                 body,

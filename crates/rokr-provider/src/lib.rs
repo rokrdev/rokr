@@ -1,7 +1,10 @@
 //! The `Provider` trait and provider implementations (OpenAI-compatible first, Anthropic later).
 
+use std::time::Duration;
+
 pub mod anthropic;
 pub mod openai;
+pub mod resilience;
 
 /// The `Provider` trait now lives in `rokr-core` (see its doc comment there
 /// for why: `single_turn` needs to be generic over it without rokr-core
@@ -24,6 +27,9 @@ pub enum ProviderError {
     #[error("unexpected response status {status}: {body}")]
     UnexpectedStatus { status: u16, body: String },
 
+    #[error("rate limited{}", retry_after.map(|d| format!(" (retry after {:?})", d)).unwrap_or_default())]
+    RateLimited { retry_after: Option<Duration> },
+
     #[error("failed to deserialize provider response: {0}")]
     Deserialize(#[from] serde_json::Error),
 
@@ -31,8 +37,58 @@ pub enum ProviderError {
     EmptyResponse,
 }
 
+impl ProviderError {
+    /// Classifies this error for a retry policy. See [`RetryHint`].
+    ///
+    /// - Transport-level failures (`Http`) are treated as retryable —
+    ///   connection resets and timeouts surface as `reqwest::Error` and rokr
+    ///   has no way to distinguish "transient network blip" from other
+    ///   `reqwest::Error` causes at this layer, so all of them are retried.
+    /// - `UnexpectedStatus` is retryable for 5xx (server-side, likely
+    ///   transient) and non-retryable for any other 4xx (client error: bad
+    ///   auth, bad request body, etc. — retrying won't help).
+    /// - `RateLimited` honors the server's `retry-after` when present,
+    ///   otherwise falls back to the caller's own backoff policy.
+    /// - `MissingEnvVar`, `Deserialize`, and `EmptyResponse` are all
+    ///   non-retryable: they indicate misconfiguration or a malformed
+    ///   response, not a transient condition a retry would fix.
+    pub fn retry_hint(&self) -> RetryHint {
+        match self {
+            ProviderError::Http(_) => RetryHint::Retryable,
+            ProviderError::UnexpectedStatus { status, .. } => {
+                if (500..600).contains(status) {
+                    RetryHint::Retryable
+                } else {
+                    RetryHint::NonRetryable
+                }
+            }
+            ProviderError::RateLimited { retry_after } => match retry_after {
+                Some(duration) => RetryHint::RetryAfter(*duration),
+                None => RetryHint::Retryable,
+            },
+            ProviderError::MissingEnvVar(_)
+            | ProviderError::Deserialize(_)
+            | ProviderError::EmptyResponse => RetryHint::NonRetryable,
+        }
+    }
+}
+
+/// How a [`ProviderError`] should be treated by a retry policy (see
+/// `ResilientProvider` in this crate — ticket 25).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetryHint {
+    /// Never retry (e.g. auth or validation failures).
+    NonRetryable,
+    /// Safe to retry with the caller's own backoff policy.
+    Retryable,
+    /// Safe to retry, but wait at least this long first (e.g. a 429's
+    /// server-provided `retry-after`).
+    RetryAfter(Duration),
+}
+
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
+pub use resilience::ResilientProvider;
 
 pub const ENV_PROVIDER: &str = "ROKR_PROVIDER";
 
@@ -94,5 +150,45 @@ mod tests {
         std::env::remove_var(anthropic::ENV_BASE_URL);
         std::env::remove_var(anthropic::ENV_MODEL);
         std::env::remove_var(anthropic::ENV_API_KEY);
+    }
+
+    #[test]
+    fn provider_error_classifies_retryable_vs_non_retryable_variants() {
+        let server_error = ProviderError::UnexpectedStatus {
+            status: 503,
+            body: String::new(),
+        };
+        assert_eq!(server_error.retry_hint(), RetryHint::Retryable);
+
+        let timeout_error = ProviderError::Http(
+            reqwest::Client::new()
+                .get("not a valid url")
+                .build()
+                .expect_err("a malformed URL should fail to build a request"),
+        );
+        assert_eq!(timeout_error.retry_hint(), RetryHint::Retryable);
+
+        let auth_error = ProviderError::UnexpectedStatus {
+            status: 401,
+            body: String::new(),
+        };
+        assert_eq!(auth_error.retry_hint(), RetryHint::NonRetryable);
+
+        let validation_error = ProviderError::UnexpectedStatus {
+            status: 422,
+            body: String::new(),
+        };
+        assert_eq!(validation_error.retry_hint(), RetryHint::NonRetryable);
+
+        let rate_limited_with_hint = ProviderError::RateLimited {
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        assert_eq!(
+            rate_limited_with_hint.retry_hint(),
+            RetryHint::RetryAfter(Duration::from_secs(7))
+        );
+
+        let rate_limited_without_hint = ProviderError::RateLimited { retry_after: None };
+        assert_eq!(rate_limited_without_hint.retry_hint(), RetryHint::Retryable);
     }
 }
