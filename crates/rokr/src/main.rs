@@ -5,7 +5,7 @@ use rokr_core::Provider;
 
 mod subagent;
 
-const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>]";
+const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>] [auth login]";
 
 /// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
 /// when no flag is given. `Plan` is read-only: read/glob/grep/ls only, so
@@ -52,6 +52,21 @@ async fn main() -> ExitCode {
         [flag] if flag == "--version" => {
             println!("rokr {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
+        }
+        // Ticket 31 (oauth-pkce-login): runs the PKCE login flow and exits
+        // rather than entering the TUI. Parallel to the `--version` arm
+        // above -- there's no clap/subcommand framework in this binary yet,
+        // so this is a second explicit match arm, same as that one.
+        [a, b] if a == "auth" && b == "login" => {
+            let config_dir = rokr_config::default_config_dir();
+            let token_store = rokr_provider::auth::default_token_store(&config_dir);
+            match rokr_provider::auth::login(token_store.as_ref()).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("login failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         _ => {
             let agent = match parse_agent_tier(&args) {
@@ -132,9 +147,16 @@ async fn main() -> ExitCode {
             // Readers (`submit`, `/compact`) clone the `AnyProvider` out
             // from behind the read lock and drop the guard before any
             // `.await` that uses it.
-            let provider = rokr_provider::AnyProvider::from_env()
-                .map(|any| Arc::new(tokio::sync::RwLock::new(any)))
-                .map_err(|err| err.to_string());
+            // Ticket 31 (oauth-pkce-login): `construct_provider` resolves
+            // `Auth` (config auth block -- always `None` today, no field
+            // for it in `rokr_config::Config` yet -- then a stored
+            // keychain/file OAuth token, then the existing
+            // `ROKR_ANTHROPIC_API_KEY` env var) before falling through to
+            // the unchanged `AnyProvider::from_env()` path when nothing is
+            // stored. This preserves today's behavior exactly for anyone
+            // who has never run `rokr auth login`.
+            let provider = construct_provider(&config_dir)
+                .map(|any| Arc::new(tokio::sync::RwLock::new(any)));
 
             // In-memory only (no persistence, per the PRD): accumulates
             // every turn across submits for the lifetime of the process, so
@@ -487,6 +509,59 @@ async fn main() -> ExitCode {
 /// running history.
 fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
     transcript.push(rokr_core::Message::user_text(input));
+}
+
+/// Resolves `Auth` (ticket 31: config auth block, then a stored
+/// keychain/file OAuth token, then the existing `ROKR_ANTHROPIC_API_KEY`
+/// env var -- see `rokr_provider::auth::resolve_auth`'s doc comment for the
+/// full precedence order) and constructs the active provider from it.
+///
+/// When resolution yields a stored OAuth token, the Anthropic provider is
+/// constructed directly, with the OAuth access token standing in for
+/// `AnthropicProvider::new`'s `api_key` parameter.
+///
+/// KNOWN LIMITATION (ticket 31, explicitly out of scope): the Anthropic
+/// wire adapter does not yet distinguish an OAuth bearer credential from a
+/// plain API key -- both flow through the same constructor parameter today,
+/// which in turn sends the same request header either way. Giving OAuth its
+/// own header treatment (and refreshing an expired token before use -- only
+/// `refresh_token`/`expires_at` are stored today, refresh-on-expiry is not
+/// implemented) is deferred to the "provider factory seam" follow-up ticket
+/// noted in the Phase 4 PRD's Further Notes.
+///
+/// When resolution yields nothing (today's default -- no OAuth token has
+/// ever been stored, and there's no config auth block), this falls through
+/// to the existing, unchanged `AnyProvider::from_env()` path, so behavior
+/// for anyone who has never run `rokr auth login` is unaffected byte-for-
+/// byte.
+fn construct_provider(config_dir: &std::path::Path) -> Result<rokr_provider::AnyProvider, String> {
+    let token_store = rokr_provider::auth::default_token_store(config_dir);
+    let resolved = rokr_provider::auth::resolve_auth(
+        None,
+        token_store.as_ref(),
+        rokr_provider::anthropic::ENV_API_KEY,
+    );
+
+    match resolved {
+        Some(rokr_provider::auth::Auth::OAuth { access_token, .. }) => {
+            let base_url = std::env::var(rokr_provider::anthropic::ENV_BASE_URL).map_err(|_| {
+                format!(
+                    "missing required environment variable: {}",
+                    rokr_provider::anthropic::ENV_BASE_URL
+                )
+            })?;
+            let model = std::env::var(rokr_provider::anthropic::ENV_MODEL).map_err(|_| {
+                format!(
+                    "missing required environment variable: {}",
+                    rokr_provider::anthropic::ENV_MODEL
+                )
+            })?;
+            Ok(rokr_provider::AnyProvider::Anthropic(
+                rokr_provider::AnthropicProvider::new(base_url, model, access_token),
+            ))
+        }
+        _ => rokr_provider::AnyProvider::from_env().map_err(|err| err.to_string()),
+    }
 }
 
 /// Writes `new_provider` into the shared active-provider state under the
