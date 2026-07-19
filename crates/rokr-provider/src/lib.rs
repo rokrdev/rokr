@@ -4,6 +4,7 @@ use std::time::Duration;
 
 pub mod anthropic;
 pub mod auth;
+pub mod factory;
 pub mod openai;
 pub mod resilience;
 
@@ -94,6 +95,8 @@ pub enum RetryHint {
 pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 pub use resilience::ResilientProvider;
+pub use factory::{build_provider, BuiltProvider};
+pub use resilience::RetryPolicy;
 
 pub const ENV_PROVIDER: &str = "ROKR_PROVIDER";
 

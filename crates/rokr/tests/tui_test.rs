@@ -3455,11 +3455,24 @@ async fn auto_compaction_failure_leaves_transcript_intact_and_shows_notice() {
         .mount(&mock_server)
         .await;
 
-    // The compaction call fails outright.
+    // The compaction call fails outright. `build_provider` (ticket 32)
+    // wraps every provider call -- this one included -- in
+    // `ResilientProvider`, which retries a 5xx up to
+    // `RetryPolicy::default().max_attempts` times before giving up. This
+    // mock must stay 500 for all of those attempts: if it were capped at
+    // fewer, the exhausted retries would fall through to the next mounted
+    // mock (the unlimited `third_reply_text` 200 below) and the compaction
+    // call would spuriously "succeed" instead of exhausting retries and
+    // failing, so the failure notice this test asserts on would never be
+    // emitted. Read from `RetryPolicy::default()` itself, not
+    // hardcoded, so this stays correct if the policy's attempt count ever
+    // changes.
+    let compaction_failure_attempts =
+        u64::from(rokr_provider::RetryPolicy::default().max_attempts);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(500))
-        .up_to_n_times(1)
+        .up_to_n_times(compaction_failure_attempts)
         .mount(&mock_server)
         .await;
 

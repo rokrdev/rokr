@@ -29,6 +29,26 @@ impl AgentTier {
     }
 }
 
+/// Ticket 32 (provider-factory-seam): the real send path (`run_tool_loop`,
+/// `compact_transcript`) shares this resilience-wrapped provider. Wrapped in
+/// an `Arc` (not just the `RwLock` alone) because `ResilientProvider<P>` is
+/// deliberately not `Clone` and exposes no accessor to its wrapped inner
+/// value (see `resilience.rs`) — ticket 29's read-clone-drop-guard pattern
+/// (clone the current provider out from behind a read lock and drop the
+/// guard immediately, so `/model` never blocks on an in-flight request's
+/// `.await`, which can legitimately run as long as the retry policy's
+/// `max_elapsed`) needs something cheap to clone regardless of the inner
+/// type, and `Arc::clone` always is.
+type SharedProvider =
+    Arc<tokio::sync::RwLock<Arc<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>>>;
+/// Ticket 32: `subagent::SubagentTool` (ADR 0009, see its doc comment in
+/// `subagent.rs`) hard-requires a concrete, unwrapped `AnyProvider` field —
+/// not a generic `Provider` bound, not `ResilientProvider<AnyProvider>` —
+/// for `Send`-across-a-boxed-future reasons. This is that state, kept in
+/// sync with `SharedProvider` by `set_active_provider` so `/model` never
+/// leaves subagents on the pre-switch backend.
+type SharedSubagentProvider = Arc<tokio::sync::RwLock<rokr_provider::AnyProvider>>;
+
 /// Parses the raw CLI args (already stripped of argv[0]) into an
 /// `AgentTier`. No args at all defaults to `Plan`; `--agent plan` and
 /// `--agent build` select explicitly; anything else is a usage error.
@@ -135,7 +155,8 @@ async fn main() -> ExitCode {
 
             // Constructed once at startup (so a missing/invalid env var
             // doesn't crash the TUI — it's reported the first time the
-            // user submits a prompt instead) and wired through
+            // user submits a prompt instead) via `rokr_provider::build_provider`
+            // (ticket 32: provider-factory-seam) and wired through
             // `rokr_core::run_tool_loop`. `rokr-tui` stays decoupled from
             // `rokr-core`/`rokr-provider`, so this closure is where the
             // message model and provider abstraction meet the TUI.
@@ -144,19 +165,61 @@ async fn main() -> ExitCode {
             // `tokio::sync::RwLock` (never written to `rokr_config::Config`
             // or disk — there is no field for it in the config schema) so
             // `/model <name>` can swap the active provider at runtime.
-            // Readers (`submit`, `/compact`) clone the `AnyProvider` out
-            // from behind the read lock and drop the guard before any
-            // `.await` that uses it.
-            // Ticket 31 (oauth-pkce-login): `construct_provider` resolves
-            // `Auth` (config auth block -- always `None` today, no field
-            // for it in `rokr_config::Config` yet -- then a stored
-            // keychain/file OAuth token, then the existing
-            // `ROKR_ANTHROPIC_API_KEY` env var) before falling through to
-            // the unchanged `AnyProvider::from_env()` path when nothing is
-            // stored. This preserves today's behavior exactly for anyone
-            // who has never run `rokr auth login`.
-            let provider = construct_provider(&config_dir)
-                .map(|any| Arc::new(tokio::sync::RwLock::new(any)));
+            // Readers (`submit`, `/compact`) clone the provider out from
+            // behind the read lock and drop the guard before any `.await`
+            // that uses it.
+            // Ticket 31 (oauth-pkce-login): auth is resolved (config auth
+            // block -- always `None` today, no field for it in
+            // `rokr_config::Config` yet -- then a stored keychain/file
+            // OAuth token, then the existing `ROKR_ANTHROPIC_API_KEY` env
+            // var) before falling through to the unchanged
+            // `AnyProvider::from_env()` path when nothing is stored. This
+            // preserves today's behavior exactly for anyone who has never
+            // run `rokr auth login`.
+            //
+            // Ticket 32 (provider-factory-seam): TWO pieces of shared state
+            // come out of the SAME `build_provider` call (one selection
+            // pass, never run twice) rather than one, because they have
+            // genuinely different requirements. `ResilientProvider<P>` is
+            // deliberately not `Clone` and exposes no accessor to its
+            // wrapped inner value (`resilience.rs`), so ticket 29's
+            // read-clone-drop-guard pattern needs an `Arc` around it
+            // (`Arc::clone` is always cheap, regardless of the inner type)
+            // — this backs the real send path (`run_tool_loop`,
+            // `compact_transcript`). Separately, `subagent::SubagentTool`
+            // (ADR 0009, see `subagent.rs`'s doc comment) hard-requires a
+            // concrete, unwrapped `rokr_provider::AnyProvider` field, not a
+            // generic `Provider` bound and not `ResilientProvider<AnyProvider>`,
+            // for `Send`-across-a-boxed-future reasons — that file is out
+            // of scope for this ticket. So `build_provider` hands back
+            // `selected: AnyProvider` (unwrapped, backs `SubagentTool` and
+            // `/model`'s subagent-facing state) alongside
+            // `resilient: ResilientProvider<AnyProvider>` (backs the real
+            // send path), and `set_active_provider` below keeps both in
+            // sync on every `/model` switch.
+            let token_store = rokr_provider::auth::default_token_store(&config_dir);
+            let resolved_auth = rokr_provider::auth::resolve_auth(
+                None,
+                token_store.as_ref(),
+                rokr_provider::anthropic::ENV_API_KEY,
+            );
+            let built = rokr_provider::build_provider(
+                resolved_auth,
+                rokr_provider::RetryPolicy::default(),
+            );
+
+            let (provider, subagent_provider): (
+                Result<SharedProvider, String>,
+                Result<SharedSubagentProvider, String>,
+            ) = match built {
+                Ok(built) => (
+                    Ok(Arc::new(tokio::sync::RwLock::new(Arc::new(
+                        built.resilient,
+                    )))),
+                    Ok(Arc::new(tokio::sync::RwLock::new(built.selected))),
+                ),
+                Err(err) => (Err(err.clone()), Err(err)),
+            };
 
             // In-memory only (no persistence, per the PRD): accumulates
             // every turn across submits for the lifetime of the process, so
@@ -188,20 +251,26 @@ async fn main() -> ExitCode {
             // Ticket 21 (manual-compact-command): cloned here, before
             // `submit`'s `move` closure below takes ownership of the
             // original `provider`/`transcript` bindings, so `command` can
-            // independently share the same provider lock and running
+            // independently share the same provider locks and running
             // transcript. `command_cwd`/`command_repo_map` (F-001 fix) let
             // the `/compact` handler regenerate the repo map in the same
             // shared state `submit` reads from. Ticket 29
             // (model-session-switch): `command_provider` is also how
             // `/model` writes a newly selected provider into the same
-            // `Arc<RwLock<AnyProvider>>` that `submit` reads.
+            // `SharedProvider` that `submit` reads. Ticket 32
+            // (provider-factory-seam): `command_subagent_provider` is the
+            // matching clone for `SharedSubagentProvider`, kept in sync by
+            // `set_active_provider` so `/model` updates both pieces of
+            // state together.
             let command_provider = provider.clone();
+            let command_subagent_provider = subagent_provider.clone();
             let command_transcript = transcript.clone();
             let command_cwd = cwd.clone();
             let command_repo_map = repo_map.clone();
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
+                let subagent_provider = subagent_provider.clone();
                 let transcript = transcript.clone();
                 let system_prompt = system_prompt.clone();
                 let repo_map = repo_map.clone();
@@ -209,10 +278,20 @@ async fn main() -> ExitCode {
                 let config_dir = config_dir.clone();
                 async move {
                     let provider = provider?;
-                    // Ticket 29 (model-session-switch): clone the current
-                    // `AnyProvider` out from behind the read lock and drop
-                    // the guard immediately — never held across an `.await`.
-                    let provider: rokr_provider::AnyProvider = provider.read().await.clone();
+                    let subagent_provider = subagent_provider?;
+                    // Ticket 29 (model-session-switch), ticket 32
+                    // (provider-factory-seam): clone the current
+                    // resilience-wrapped provider (a cheap `Arc` clone --
+                    // `ResilientProvider` itself isn't `Clone`, see the
+                    // construction site's doc comment above) and the
+                    // current concrete `AnyProvider` (for `SubagentTool`,
+                    // ADR 0009) out from behind their respective read
+                    // locks, dropping both guards immediately — never held
+                    // across an `.await`.
+                    let provider: Arc<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>> =
+                        provider.read().await.clone();
+                    let subagent_provider: rokr_provider::AnyProvider =
+                        subagent_provider.read().await.clone();
 
                     // All eight tools are constructed unconditionally
                     // (they're cheap zero-sized unit structs); which ones
@@ -318,7 +397,7 @@ async fn main() -> ExitCode {
                             })
                         });
                     let subagent_tool = subagent::SubagentTool::new(
-                        provider.clone(),
+                        subagent_provider.clone(),
                         config_dir.clone(),
                         subagent_request_permission,
                     );
@@ -362,7 +441,7 @@ async fn main() -> ExitCode {
                     let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
 
                     let (reply, usage) = rokr_core::run_tool_loop(
-                        &provider,
+                        provider.as_ref(),
                         &system_prompt,
                         repo_map_snapshot.as_deref(),
                         &mut transcript,
@@ -395,7 +474,7 @@ async fn main() -> ExitCode {
                         context_window_size,
                         auto_compact_threshold,
                     ) {
-                        match rokr_core::compact_transcript(&provider, &transcript).await {
+                        match rokr_core::compact_transcript(provider.as_ref(), &transcript).await {
                             Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
                                 *transcript = compacted;
                                 None
@@ -428,24 +507,34 @@ async fn main() -> ExitCode {
             // `AnyProvider::from_name`, which reads that provider's own env
             // vars, mirroring how `AnyProvider::from_env` already dispatches
             // via `ROKR_PROVIDER` at startup, just made selectable at
-            // runtime.
+            // runtime. Ticket 32 (provider-factory-seam): the switch now
+            // writes through `set_active_provider` into BOTH the
+            // resilience-wrapped `SharedProvider` and the concrete
+            // `SharedSubagentProvider`, so a `/model` switch never leaves
+            // `SubagentTool` on the pre-switch backend.
             let command = move |input: String| {
                 let provider = command_provider.clone();
+                let subagent_provider = command_subagent_provider.clone();
                 let transcript = command_transcript.clone();
                 let cwd = command_cwd.clone();
                 let repo_map = command_repo_map.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
-                        return match &provider {
-                            Ok(lock) => match rokr_provider::AnyProvider::from_name(name) {
-                                Ok(new_provider) => {
-                                    set_active_provider(lock, new_provider).await;
-                                    "Active provider switched.".to_string()
+                        return match (&provider, &subagent_provider) {
+                            (Ok(lock), Ok(subagent_lock)) => {
+                                match rokr_provider::AnyProvider::from_name(name) {
+                                    Ok(new_provider) => {
+                                        set_active_provider(lock, subagent_lock, new_provider)
+                                            .await;
+                                        "Active provider switched.".to_string()
+                                    }
+                                    Err(err) => format!("failed to switch provider: {err}"),
                                 }
-                                Err(err) => format!("failed to switch provider: {err}"),
-                            },
-                            Err(err) => format!("cannot switch provider: {err}"),
+                            }
+                            (Err(err), _) | (_, Err(err)) => {
+                                format!("cannot switch provider: {err}")
+                            }
                         };
                     }
 
@@ -460,8 +549,11 @@ async fn main() -> ExitCode {
                                 }
                             };
                             let mut transcript = transcript.lock().await;
-                            match rokr_core::compact_transcript(&provider_snapshot, &transcript)
-                                .await
+                            match rokr_core::compact_transcript(
+                                provider_snapshot.as_ref(),
+                                &transcript,
+                            )
+                            .await
                             {
                                 Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
                                     *transcript = compacted;
@@ -511,69 +603,27 @@ fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String)
     transcript.push(rokr_core::Message::user_text(input));
 }
 
-/// Resolves `Auth` (ticket 31: config auth block, then a stored
-/// keychain/file OAuth token, then the existing `ROKR_ANTHROPIC_API_KEY`
-/// env var -- see `rokr_provider::auth::resolve_auth`'s doc comment for the
-/// full precedence order) and constructs the active provider from it.
-///
-/// When resolution yields a stored OAuth token, the Anthropic provider is
-/// constructed directly, with the OAuth access token standing in for
-/// `AnthropicProvider::new`'s `api_key` parameter.
-///
-/// KNOWN LIMITATION (ticket 31, explicitly out of scope): the Anthropic
-/// wire adapter does not yet distinguish an OAuth bearer credential from a
-/// plain API key -- both flow through the same constructor parameter today,
-/// which in turn sends the same request header either way. Giving OAuth its
-/// own header treatment (and refreshing an expired token before use -- only
-/// `refresh_token`/`expires_at` are stored today, refresh-on-expiry is not
-/// implemented) is deferred to the "provider factory seam" follow-up ticket
-/// noted in the Phase 4 PRD's Further Notes.
-///
-/// When resolution yields nothing (today's default -- no OAuth token has
-/// ever been stored, and there's no config auth block), this falls through
-/// to the existing, unchanged `AnyProvider::from_env()` path, so behavior
-/// for anyone who has never run `rokr auth login` is unaffected byte-for-
-/// byte.
-fn construct_provider(config_dir: &std::path::Path) -> Result<rokr_provider::AnyProvider, String> {
-    let token_store = rokr_provider::auth::default_token_store(config_dir);
-    let resolved = rokr_provider::auth::resolve_auth(
-        None,
-        token_store.as_ref(),
-        rokr_provider::anthropic::ENV_API_KEY,
-    );
-
-    match resolved {
-        Some(rokr_provider::auth::Auth::OAuth { access_token, .. }) => {
-            let base_url = std::env::var(rokr_provider::anthropic::ENV_BASE_URL).map_err(|_| {
-                format!(
-                    "missing required environment variable: {}",
-                    rokr_provider::anthropic::ENV_BASE_URL
-                )
-            })?;
-            let model = std::env::var(rokr_provider::anthropic::ENV_MODEL).map_err(|_| {
-                format!(
-                    "missing required environment variable: {}",
-                    rokr_provider::anthropic::ENV_MODEL
-                )
-            })?;
-            Ok(rokr_provider::AnyProvider::Anthropic(
-                rokr_provider::AnthropicProvider::new(base_url, model, access_token),
-            ))
-        }
-        _ => rokr_provider::AnyProvider::from_env().map_err(|err| err.to_string()),
-    }
-}
-
 /// Writes `new_provider` into the shared active-provider state under the
 /// write lock (ticket 29: `/model`). Kept separate from name resolution
 /// (`AnyProvider::from_name`) so the state-mutation itself is
 /// unit-testable without real provider credentials — see
 /// `model_command_updates_shared_provider_state`.
+///
+/// Ticket 32 (provider-factory-seam): writes BOTH pieces of shared state
+/// together -- a freshly resilience-wrapped provider into `active_provider`,
+/// and the same plain provider into `active_subagent_provider` -- so
+/// `/model` keeps `SubagentTool` in sync with the switch. Without this, a
+/// subagent invoked after a `/model` switch would silently keep using the
+/// pre-switch backend, since it reads `active_subagent_provider`
+/// independently of the resilience-wrapped state `submit` uses.
 async fn set_active_provider(
-    active_provider: &tokio::sync::RwLock<rokr_provider::AnyProvider>,
+    active_provider: &tokio::sync::RwLock<Arc<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>>,
+    active_subagent_provider: &tokio::sync::RwLock<rokr_provider::AnyProvider>,
     new_provider: rokr_provider::AnyProvider,
 ) {
-    *active_provider.write().await = new_provider;
+    *active_provider.write().await =
+        Arc::new(rokr_provider::ResilientProvider::new(new_provider.clone()));
+    *active_subagent_provider.write().await = new_provider;
 }
 
 #[cfg(test)]
@@ -613,7 +663,9 @@ mod tests {
             "gpt-4o-mini",
             "initial-key",
         ));
-        let active_provider = tokio::sync::RwLock::new(initial);
+        let initial_resilient = Arc::new(rokr_provider::ResilientProvider::new(initial.clone()));
+        let active_provider = tokio::sync::RwLock::new(initial_resilient.clone());
+        let active_subagent_provider = tokio::sync::RwLock::new(initial);
 
         let replacement =
             rokr_provider::AnyProvider::Anthropic(rokr_provider::AnthropicProvider::new(
@@ -622,12 +674,28 @@ mod tests {
                 "replacement-key",
             ));
 
-        set_active_provider(&active_provider, replacement).await;
+        set_active_provider(&active_provider, &active_subagent_provider, replacement).await;
 
+        // `ResilientProvider` exposes no way to inspect its wrapped inner
+        // provider from outside `resilience.rs` (deliberately, and out of
+        // scope to change for this ticket) -- so the strongest available
+        // proof that `set_active_provider` actually replaced the
+        // resilience-wrapped state is that a fresh `Arc` was installed
+        // (pointer inequality against the original), not the same one still
+        // sitting there unchanged.
         let guard = active_provider.read().await;
         assert!(
-            matches!(*guard, rokr_provider::AnyProvider::Anthropic(_)),
-            "expected set_active_provider to replace the shared state with the Anthropic variant"
+            !Arc::ptr_eq(&guard, &initial_resilient),
+            "expected set_active_provider to install a fresh resilience-wrapped provider instance, \
+             not leave the original Arc in place"
+        );
+        drop(guard);
+
+        let subagent_guard = active_subagent_provider.read().await;
+        assert!(
+            matches!(*subagent_guard, rokr_provider::AnyProvider::Anthropic(_)),
+            "expected set_active_provider to also replace the subagent-facing state with the \
+             Anthropic variant"
         );
     }
 }

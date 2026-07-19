@@ -246,3 +246,188 @@ async fn auth_login_command_completes_pkce_flow_and_stores_token() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// Ticket 32 (provider-factory-seam) RED: proves the *active* provider
+/// construction path in `main.rs` is (or isn't yet) resilience-wrapped, by
+/// driving the real running `rokr` binary end to end through a genuine PTY
+/// -- exactly as a human would type into the TUI -- rather than unit-testing
+/// `rokr_provider::factory::build_provider` in isolation (that's already
+/// GREEN in `crates/rokr-provider/src/factory.rs`; what's NOT yet proven is
+/// that `main.rs` actually calls it).
+///
+/// A plain piped subprocess can't exercise this: `rokr_tui::run` checks
+/// `io::stdout().is_terminal()` and immediately errors out with "not a tty"
+/// if stdout isn't a real terminal, so the interactive submit path is only
+/// reachable via a real PTY (`portable_pty`).
+///
+/// The mock server deliberately returns a retryable 503 once, then 200: if
+/// the active path wraps the provider in the resilience decorator, the turn
+/// succeeds and the mock records exactly 2 requests; if it doesn't (today's
+/// state -- `main.rs`'s `construct_provider` has no retry wrapping), the
+/// turn fails after the single 503, "Error: ..." is what appears in the
+/// TUI's scrollback instead of the reply, and the mock records only 1
+/// request.
+#[tokio::test]
+async fn startup_uses_factory_constructed_provider_for_submit() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MARKER: &str = "acceptancetestreply4471";
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": MARKER}}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("factory-seam-home");
+    let xdg_config_home = unique_temp_dir("factory-seam-xdg-config-home");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr binary under pty");
+    // Drop our handle to the slave so the master's reader observes EOF once
+    // the child exits, and so we're not holding the slave open ourselves.
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    // Blocking reads happen on a plain thread so the async test body can
+    // poll the accumulated output without blocking the tokio runtime.
+    let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let reader_output = Arc::clone(&output);
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => reader_output.lock().unwrap().extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wait for the TUI to actually render its panes (proving raw mode is
+    // enabled and the event loop is reading stdin) before typing anything --
+    // a fixed sleep here is a race: on a slow/cold start the child may not
+    // yet be reading stdin, so keystrokes sent too early can be dropped or
+    // delivered to the terminal's canonical-mode line buffer instead of the
+    // app. This mirrors tui_test.rs's proven readiness wait.
+    let ready_timeout = std::time::Duration::from_secs(10);
+    let ready_start = std::time::Instant::now();
+    loop {
+        let snapshot = String::from_utf8_lossy(&output.lock().unwrap()).to_string();
+        if snapshot.contains("Header") && snapshot.contains("View") && snapshot.contains("Prompt")
+        {
+            break;
+        }
+        assert!(
+            ready_start.elapsed() < ready_timeout,
+            "TUI did not render its panes within {ready_timeout:?}; output so far: {snapshot:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // crossterm's raw-mode Enter event is conventionally carriage return
+    // (0x0D), not line feed -- send the prompt and `\r` in a single write, as
+    // tui_test.rs's proven working tests do, to avoid any race between two
+    // separate writes.
+    writer
+        .write_all(b"say hello\r")
+        .expect("failed to write prompt text to pty");
+    let _ = writer.flush();
+
+    let timeout = std::time::Duration::from_secs(15);
+    let start = std::time::Instant::now();
+    let mut found = false;
+    let mut last_snapshot = String::new();
+    while start.elapsed() < timeout {
+        last_snapshot = String::from_utf8_lossy(&output.lock().unwrap()).to_string();
+        if last_snapshot.contains(MARKER) {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let requests_so_far = mock_server
+        .received_requests()
+        .await
+        .map(|r| r.len())
+        .unwrap_or(0);
+
+    // Clean up the child/pty/thread unconditionally, before asserting, so a
+    // failing assertion below can never leave the child process or reader
+    // thread hanging around.
+    let _ = writer.write_all(b"q");
+    let _ = writer.flush();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(writer);
+    let _ = reader_thread.join();
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+
+    let tail: String = {
+        let chars: Vec<char> = last_snapshot.chars().collect();
+        let start_idx = chars.len().saturating_sub(500);
+        chars[start_idx..].iter().collect()
+    };
+    assert!(
+        found,
+        "expected marker {MARKER:?} to appear in the TUI's scrollback output within {timeout:?} \
+         (proving the submit path reached the mock and got a reply back), but it never did; \
+         {requests_so_far} request(s) were recorded against the mock server so far; \
+         last ~500 chars of captured output: {tail:?}"
+    );
+
+    assert_eq!(
+        mock_server.received_requests().await.unwrap().len(),
+        2,
+        "expected exactly 2 requests against the mock (1 retried 503 + 1 successful 200), \
+         proving the active provider construction path in main.rs retries a retryable failure \
+         end-to-end through the real running binary -- if this is 1, main.rs is still using \
+         construct_provider (no resilience wrapping) instead of \
+         rokr_provider::factory::build_provider"
+    );
+}
