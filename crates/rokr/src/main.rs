@@ -101,16 +101,18 @@ async fn main() -> ExitCode {
             // In-memory only (no persistence, per the PRD): accumulates
             // every turn across submits for the lifetime of the process, so
             // each new prompt is sent with the full prior conversation
-            // history rather than in isolation. Seeded with the agent
-            // tier's system prompt before any user turn is added.
-            let transcript: Vec<rokr_core::Message> =
-                vec![rokr_core::Message::system_text(system_prompt)];
+            // history rather than in isolation. Stays system-prompt-free —
+            // pure conversation history; `rokr_core::run_tool_loop` prepends
+            // the system segment itself (via `context::assemble()`) on
+            // every outgoing send, so it never needs to live here.
+            let transcript: Vec<rokr_core::Message> = Vec::new();
             let transcript: Arc<tokio::sync::Mutex<Vec<rokr_core::Message>>> =
                 Arc::new(tokio::sync::Mutex::new(transcript));
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
+                let system_prompt = system_prompt.clone();
                 async move {
                     let provider = provider?;
 
@@ -165,6 +167,7 @@ async fn main() -> ExitCode {
 
                     rokr_core::run_tool_loop(
                         provider.as_ref(),
+                        &system_prompt,
                         &mut transcript,
                         &tools,
                         request_permission,

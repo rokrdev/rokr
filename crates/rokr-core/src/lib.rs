@@ -205,6 +205,7 @@ impl_executable_tool_gated!(rokr_tools::edit::EditTool);
 /// directly, exactly as before.
 pub async fn run_tool_loop<P, F, Fut>(
     provider: &P,
+    system_prompt: &str,
     transcript: &mut Vec<Message>,
     tools: &[&dyn ExecutableTool],
     request_permission: F,
@@ -217,10 +218,26 @@ where
     let tool_specs: Vec<ToolSpec> = tools.iter().map(|tool| tool.to_tool_spec()).collect();
 
     loop {
+        // Re-assembled on every send (not just once before the loop): a
+        // single user submission can trigger multiple tool round-trips, and
+        // every one of those wire sends needs the breakpoint-marked static
+        // prefix (tools + system segment), not just the first. `transcript`
+        // itself stays system-prompt-free (pure conversation history) —
+        // `assemble()` only prepends the system segment for this outgoing
+        // call, it never mutates the caller's stored transcript.
+        let assembled = context::assemble(context::ContextInputs {
+            system_prompt: system_prompt.to_string(),
+            tools: tool_specs.clone(),
+            repo_map: None,
+            transcript: transcript.clone(),
+        });
+
         // Usage isn't threaded any further yet — that's the token-accounting
         // work a later ticket (auto-compaction) builds on top of this
         // enabler's `(Message, Usage)` return shape.
-        let (reply, _usage) = provider.send(&transcript[..], &tool_specs).await?;
+        let (reply, _usage) = provider
+            .send(&assembled.messages[..], &assembled.tools)
+            .await?;
 
         let tool_uses: Vec<(String, String, serde_json::Value)> = reply
             .content
@@ -457,9 +474,13 @@ mod tests {
 
         let mut transcript = vec![Message::user_text("read the file")];
 
-        let result = run_tool_loop(&provider, &mut transcript, &tools, |_request| async {
-            true
-        })
+        let result = run_tool_loop(
+            &provider,
+            "you are a test agent",
+            &mut transcript,
+            &tools,
+            |_request| async { true },
+        )
         .await
         .expect("loop should succeed");
 
@@ -475,18 +496,23 @@ mod tests {
         let calls = provider.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "provider should be called once per turn");
 
-        // First call: just the initial user turn.
-        assert_eq!(calls[0].len(), 1);
-        assert_eq!(calls[0][0].role, Role::User);
+        // First call: the leading system message (assembled by
+        // `run_tool_loop`, never stored in the caller's `transcript`), then
+        // the initial user turn.
+        assert_eq!(calls[0].len(), 2);
+        assert_eq!(calls[0][0].role, Role::System);
+        assert_eq!(calls[0][1].role, Role::User);
 
-        // Second call: initial user turn, the assistant's tool-call turn,
-        // and a new turn carrying the tool's result back to the provider.
-        assert_eq!(calls[1].len(), 3);
-        assert_eq!(calls[1][0].role, Role::User);
-        assert_eq!(calls[1][1].role, Role::Assistant);
-        assert_eq!(calls[1][2].role, Role::User);
+        // Second call: leading system message, initial user turn, the
+        // assistant's tool-call turn, and a new turn carrying the tool's
+        // result back to the provider.
+        assert_eq!(calls[1].len(), 4);
+        assert_eq!(calls[1][0].role, Role::System);
+        assert_eq!(calls[1][1].role, Role::User);
+        assert_eq!(calls[1][2].role, Role::Assistant);
+        assert_eq!(calls[1][3].role, Role::User);
 
-        match &calls[1][2].content[..] {
+        match &calls[1][3].content[..] {
             [ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -572,9 +598,13 @@ mod tests {
 
         let mut transcript = vec![Message::user_text("run the command")];
 
-        let result = run_tool_loop(&provider, &mut transcript, &tools, |_request| async {
-            false
-        })
+        let result = run_tool_loop(
+            &provider,
+            "you are a test agent",
+            &mut transcript,
+            &tools,
+            |_request| async { false },
+        )
         .await
         .expect("loop should succeed even when permission is rejected");
 
@@ -585,7 +615,10 @@ mod tests {
         );
 
         let calls = provider.calls.lock().unwrap();
-        match &calls[1][2].content[..] {
+        // Second call: leading system message (index 0), initial user turn,
+        // the assistant's tool-call turn, and the (rejected) tool result
+        // turn at index 3.
+        match &calls[1][3].content[..] {
             [ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -694,9 +727,13 @@ mod tests {
 
         let mut transcript = vec![Message::user_text("overwrite the file")];
 
-        let result = run_tool_loop(&provider, &mut transcript, &tools, |_request| async {
-            false
-        })
+        let result = run_tool_loop(
+            &provider,
+            "you are a test agent",
+            &mut transcript,
+            &tools,
+            |_request| async { false },
+        )
         .await
         .expect("loop should succeed even when permission is rejected");
 
@@ -708,7 +745,10 @@ mod tests {
         );
 
         let calls = provider.calls.lock().unwrap();
-        match &calls[1][2].content[..] {
+        // Second call: leading system message (index 0), initial user turn,
+        // the assistant's tool-call turn, and the (rejected) tool result
+        // turn at index 3.
+        match &calls[1][3].content[..] {
             [ContentBlock::ToolResult {
                 tool_use_id,
                 content,

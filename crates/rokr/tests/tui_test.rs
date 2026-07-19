@@ -681,6 +681,257 @@ async fn second_prompt_includes_prior_turn_in_request_body() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
 
+/// Ticket 17 (cache-breakpoint-activation) acceptance test: submitting two
+/// consecutive prompts must produce two outgoing request bodies whose
+/// static prefix (tool specs + the system segment) is byte-identical
+/// despite the growing transcript, and the OpenAI adapter must never emit
+/// an explicit `cache_control` wire directive (OpenAI-compatible endpoints
+/// do implicit prefix caching; explicit emission is Anthropic-only, a later
+/// phase). Copies `second_prompt_includes_prior_turn_in_request_body`'s
+/// exact PTY/wiremock/env-var harness.
+#[tokio::test]
+async fn second_prompt_static_prefix_bytes_identical_to_first() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let first_reply_text = "FirstReplyTokenForTesting";
+    let second_reply_text = "SecondReplyTokenForTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-first",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": first_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-second",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": second_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-static-prefix");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-static-prefix");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"firstpromptunique\r")
+        .expect("failed to write first prompt to pty");
+
+    let first_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain the first mocked assistant response, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"secondpromptunique\r")
+        .expect("failed to write second prompt to pty");
+
+    let second_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < second_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain the second mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        received_requests.len() >= 2,
+        "expected at least 2 requests to /chat/completions, got {}: {received_requests:?}",
+        received_requests.len()
+    );
+
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    let second_request_body = String::from_utf8_lossy(&received_requests[1].body).into_owned();
+
+    assert!(
+        !first_request_body.contains("cache_control"),
+        "the OpenAI adapter must never emit an explicit cache_control wire directive, \
+         got first request body: {first_request_body}"
+    );
+    assert!(
+        !second_request_body.contains("cache_control"),
+        "the OpenAI adapter must never emit an explicit cache_control wire directive, \
+         got second request body: {second_request_body}"
+    );
+
+    let first_parsed: serde_json::Value =
+        serde_json::from_str(&first_request_body).expect("first request body should be valid JSON");
+    let second_parsed: serde_json::Value = serde_json::from_str(&second_request_body)
+        .expect("second request body should be valid JSON");
+
+    let first_static_prefix = (
+        first_parsed
+            .get("tools")
+            .cloned()
+            .expect("first request body should have a tools array"),
+        first_parsed["messages"]
+            .get(0)
+            .cloned()
+            .expect("first request body should have at least one message"),
+    );
+    let second_static_prefix = (
+        second_parsed
+            .get("tools")
+            .cloned()
+            .expect("second request body should have a tools array"),
+        second_parsed["messages"]
+            .get(0)
+            .cloned()
+            .expect("second request body should have at least one message"),
+    );
+
+    let first_static_prefix_bytes =
+        serde_json::to_vec(&first_static_prefix).expect("serialize first static prefix");
+    let second_static_prefix_bytes =
+        serde_json::to_vec(&second_static_prefix).expect("serialize second static prefix");
+
+    assert_eq!(
+        first_static_prefix_bytes, second_static_prefix_bytes,
+        "the static prefix (tool specs + system segment) must be byte-identical across \
+         requests despite the growing transcript; first: {first_static_prefix:?}, second: \
+         {second_static_prefix:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
 #[tokio::test]
 async fn bash_tool_call_renders_permission_prompt_and_runs_on_accept() {
     use wiremock::matchers::{method, path};
