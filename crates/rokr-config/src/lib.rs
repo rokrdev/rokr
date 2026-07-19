@@ -2,10 +2,31 @@
 
 use std::path::{Path, PathBuf};
 
-/// The on-disk config schema. See docs/adr/0002-config-format-and-versioning.md.
+/// The on-disk config schema. See docs/adr/0002-config-format-and-versioning.md
+/// and docs/adr/0010-config-additive-fields-vs-version-bump.md (additive-
+/// optional fields via `serde(default)`, no version bump, never written back
+/// to an existing file).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub version: u32,
+    /// Token budget used to decide when auto-compaction should trigger.
+    /// Additive-optional (ADR 0010): an existing file missing this field
+    /// gets the runtime default; the field is never written back.
+    #[serde(default = "default_context_window_size")]
+    pub context_window_size: u32,
+    /// Fraction of `context_window_size` that triggers auto-compaction.
+    /// Additive-optional (ADR 0010): an existing file missing this field
+    /// gets the runtime default; the field is never written back.
+    #[serde(default = "default_auto_compact_threshold")]
+    pub auto_compact_threshold: f64,
+}
+
+fn default_context_window_size() -> u32 {
+    200_000
+}
+
+fn default_auto_compact_threshold() -> f64 {
+    0.7
 }
 
 /// Errors returned while loading, validating, or initializing config.
@@ -134,7 +155,11 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
         return Ok(config);
     }
 
-    let config = Config { version: 1 };
+    let config = Config {
+        version: 1,
+        context_window_size: default_context_window_size(),
+        auto_compact_threshold: default_auto_compact_threshold(),
+    };
     let json = serde_json::to_string_pretty(&config).expect("Config serialization is infallible");
     std::fs::write(&file_path, json)?;
     scaffold_agent_prompts(config_dir)?;
@@ -191,6 +216,57 @@ mod tests {
         assert_eq!(
             contents, existing,
             "existing config file must not be modified by load_or_init"
+        );
+    }
+
+    #[test]
+    fn load_or_init_applies_defaults_when_compaction_fields_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        let existing = r#"{"version": 1}"#;
+        std::fs::write(&file_path, existing).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            value.get("auto_compact_threshold").and_then(|v| v.as_f64()),
+            Some(0.7),
+            "expected default auto_compact_threshold of 0.7, got: {value}"
+        );
+        assert_eq!(
+            value.get("context_window_size").and_then(|v| v.as_u64()),
+            Some(200_000),
+            "expected sane default context_window_size, got: {value}"
+        );
+
+        let contents_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            contents_after, existing,
+            "existing config file lacking compaction fields must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn load_or_init_honors_explicit_compaction_settings_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        let existing =
+            r#"{"version": 1, "context_window_size": 50000, "auto_compact_threshold": 0.5}"#;
+        std::fs::write(&file_path, existing).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            value.get("context_window_size").and_then(|v| v.as_u64()),
+            Some(50000),
+            "expected explicit context_window_size to be honored, got: {value}"
+        );
+        assert_eq!(
+            value.get("auto_compact_threshold").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "expected explicit auto_compact_threshold to be honored, got: {value}"
         );
     }
 

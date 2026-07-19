@@ -88,6 +88,35 @@ fn first_run_scaffolds_agent_prompt_files() {
 }
 
 #[test]
+fn existing_v1_config_without_compaction_fields_left_byte_identical_after_run() {
+    let home = unique_temp_dir("home");
+    let xdg_config_home = unique_temp_dir("xdg-config-home");
+
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("rokr.json");
+    let existing = "{\"version\": 1}";
+    std::fs::write(&config_path, existing).unwrap();
+
+    let before = std::fs::read(&config_path).unwrap();
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    cmd.env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .assert()
+        .success();
+
+    let after = std::fs::read(&config_path).unwrap();
+    assert_eq!(
+        before, after,
+        "existing v1 config file lacking compaction fields must be left byte-identical after run"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+#[test]
 fn unknown_flag_exits_nonzero_with_usage_message() {
     let mut cmd = Command::cargo_bin("rokr").unwrap();
     let assert = cmd.arg("--bogus").assert().failure();
