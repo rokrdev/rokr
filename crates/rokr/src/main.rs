@@ -77,30 +77,35 @@ async fn main() -> ExitCode {
                 }
             };
 
+            // Resolved once at startup and reused for both the project-
+            // context load below and repo-map (re)generation (F-001 fix):
+            // repo-map regeneration on `/compact` needs the same root the
+            // initial generation used. A cwd that can't be resolved is
+            // treated the same as no project context / no repo map.
+            let cwd: Option<std::path::PathBuf> = std::env::current_dir().ok();
+
             // One-time, unconditional, side-effect-free read of project-level
             // context (AGENTS.md, falling back to CLAUDE.md) from the
             // current working directory, folded into the system prompt
             // alongside the active agent tier's prompt. Not a tool, not
             // permission-gated — this is how the system prompt is built, not
-            // a model-invoked action. A cwd that can't be resolved is
-            // treated the same as no project context being present.
-            if let Ok(cwd) = std::env::current_dir() {
-                if let Some(project_context) = rokr_config::load_project_context(&cwd) {
+            // a model-invoked action.
+            if let Some(cwd) = cwd.as_deref() {
+                if let Some(project_context) = rokr_config::load_project_context(cwd) {
                     system_prompt.push_str("\n\n");
                     system_prompt.push_str(&project_context);
                 }
             }
 
-            // Generated once per session (ticket 18: repo-map-generation),
-            // never per turn — cwd is the natural root, mirroring the
-            // project-context load above. Not a tool, not permission-gated:
-            // orientation infrastructure the agent never chooses to invoke,
-            // so it's computed here alongside the system prompt rather than
-            // wired through the tool/permission machinery. A cwd that can't
-            // be resolved yields no repo map rather than failing startup.
-            let repo_map: Option<String> = std::env::current_dir()
-                .ok()
-                .map(|cwd| rokr_tools::repo_map::generate(&cwd));
+            // Generated once per session (ticket 18: repo-map-generation)
+            // and held in shared, mutable state (F-001 fix) rather than a
+            // plain `Option<String>` captured immutably by `submit`: the
+            // PRD requires the map to regenerate on `/compact` and never
+            // per turn. `submit` only ever reads the current value; the
+            // `/compact` handler in `command` below is the sole writer.
+            let repo_map: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(
+                cwd.as_deref().map(rokr_tools::repo_map::generate),
+            ));
 
             // Constructed once at startup (so a missing/invalid env var
             // doesn't crash the TUI — it's reported the first time the
@@ -130,18 +135,33 @@ async fn main() -> ExitCode {
             let context_window_size = config.context_window_size;
             let auto_compact_threshold = config.auto_compact_threshold;
 
+            // F-003 fix: the most recent turn's real (non-zero) usage
+            // figure, shared across submits so a turn whose usage goes
+            // unreported (some OpenAI-compatible proxies intermittently
+            // omit it) can fall back to the last real figure instead of
+            // the much cruder chars/4 estimate, which is reserved for the
+            // case no real usage has ever arrived yet this session.
+            let last_known_usage: Arc<std::sync::Mutex<Option<rokr_core::Usage>>> =
+                Arc::new(std::sync::Mutex::new(None));
+
             // Ticket 21 (manual-compact-command): cloned here, before
             // `submit`'s `move` closure below takes ownership of the
             // original `provider`/`transcript` bindings, so `command` can
             // independently share the same provider and running transcript.
+            // `command_cwd`/`command_repo_map` (F-001 fix) let the
+            // `/compact` handler regenerate the repo map in the same
+            // shared state `submit` reads from.
             let command_provider = provider.clone();
             let command_transcript = transcript.clone();
+            let command_cwd = cwd.clone();
+            let command_repo_map = repo_map.clone();
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
                 let system_prompt = system_prompt.clone();
                 let repo_map = repo_map.clone();
+                let last_known_usage = last_known_usage.clone();
                 async move {
                     let provider = provider?;
 
@@ -214,10 +234,12 @@ async fn main() -> ExitCode {
                     let mut transcript = transcript.lock().await;
                     accumulate_user_turn(&mut transcript, expanded_input);
 
+                    let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
+
                     let (reply, usage) = rokr_core::run_tool_loop(
                         provider.as_ref(),
                         &system_prompt,
-                        repo_map.as_deref(),
+                        repo_map_snapshot.as_deref(),
                         &mut transcript,
                         &tools,
                         request_permission,
@@ -232,17 +254,28 @@ async fn main() -> ExitCode {
                     // On failure the transcript is left untouched and a
                     // notice is prepended to this turn's reply instead of
                     // losing history.
+                    let prior_usage = {
+                        let mut guard = last_known_usage.lock().unwrap();
+                        let prior = *guard;
+                        if usage.input_tokens != 0 || usage.output_tokens != 0 {
+                            *guard = Some(usage);
+                        }
+                        prior
+                    };
+
                     let notice = if rokr_core::should_compact(
                         usage,
+                        prior_usage,
                         &transcript,
                         context_window_size,
                         auto_compact_threshold,
                     ) {
                         match rokr_core::compact_transcript(provider.as_ref(), &transcript).await {
-                            Ok(compacted) => {
+                            Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
                                 *transcript = compacted;
                                 None
                             }
+                            Ok(rokr_core::CompactionOutcome::NothingToCompact) => None,
                             Err(err) => Some(format!(
                                 "[auto-compaction failed, continuing with full history: {err}]"
                             )),
@@ -267,6 +300,8 @@ async fn main() -> ExitCode {
             let command = move |input: String| {
                 let provider = command_provider.clone();
                 let transcript = command_transcript.clone();
+                let cwd = command_cwd.clone();
+                let repo_map = command_repo_map.clone();
                 async move {
                     match input.as_str() {
                         "/compact" => {
@@ -282,9 +317,16 @@ async fn main() -> ExitCode {
                             match rokr_core::compact_transcript(provider.as_ref(), &transcript)
                                 .await
                             {
-                                Ok(compacted) => {
+                                Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
                                     *transcript = compacted;
+                                    if let Some(cwd) = cwd.as_deref() {
+                                        let regenerated = rokr_tools::repo_map::generate(cwd);
+                                        *repo_map.lock().unwrap() = Some(regenerated);
+                                    }
                                     "Transcript compacted.".to_string()
+                                }
+                                Ok(rokr_core::CompactionOutcome::NothingToCompact) => {
+                                    "Nothing to compact.".to_string()
                                 }
                                 Err(err) => {
                                     format!("compaction failed, transcript left intact: {err}")

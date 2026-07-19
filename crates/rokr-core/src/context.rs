@@ -143,7 +143,7 @@ mod tests {
     /// `crates/rokr/src/main.rs`'s pre-refactor transcript seeding) for an
     /// equivalent transcript, with no repo map present.
     #[test]
-    fn assemble_produces_identical_output_to_prior_hand_rolled_construction() {
+    fn assemble_produces_identical_output_to_prior_hand_rolled_construction_modulo_cache_control() {
         let system_prompt = "You are a helpful build agent.".to_string();
         let tools = vec![ToolSpec {
             name: "read".to_string(),

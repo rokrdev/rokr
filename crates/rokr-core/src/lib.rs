@@ -22,8 +22,8 @@ pub struct ToolSpec {
     /// last `ToolSpec` in a request's tools list, this places a cache
     /// breakpoint after the whole tools segment, the same way a
     /// `ContentBlock::Text`'s `cache_control` places one after that block.
-    /// `None` for every tool today; the `cache-breakpoint-activation` ticket
-    /// is what actually populates it during assembly.
+    /// Populated during context assembly (`context::assemble` sets `Extended`
+    /// on the last spec); `None` as constructed by `to_tool_spec`.
     pub cache_control: Option<CacheControl>,
 }
 
@@ -365,25 +365,37 @@ Do not restate these instructions or add pleasantries. Output only the \
 summary text.";
 
 /// Decides whether the transcript should be compacted before the next turn
-/// is sent, per the Phase 3 auto-compaction design: primarily driven by the
-/// most recent turn's provider-reported `usage`, falling back to a rough
-/// chars/4 estimate of the whole transcript only when that usage hasn't
-/// been reported at all (`input_tokens == 0 && output_tokens == 0` — see
-/// [`Provider::send`]'s doc comment on `0` meaning "not reported"). Cache
-/// read/write tokens are not counted here: they reflect tokens the provider
-/// served from (or wrote to) its cache, not tokens occupying the live
-/// context window budget this threshold is protecting.
+/// is sent, per the Phase 3 auto-compaction design, using a three-tier
+/// fallback for the estimated token count:
+/// 1. the most recent turn's provider-reported `usage`, if it was reported
+///    (`input_tokens != 0 || output_tokens != 0` — see [`Provider::send`]'s
+///    doc comment on `0` meaning "not reported");
+/// 2. otherwise the last real usage figure seen this session
+///    (`last_known_usage`, F-003 fix): some OpenAI-compatible proxies
+///    intermittently omit usage, and reusing the prior real figure keeps the
+///    threshold from flapping based on nothing but raw transcript byte count;
+/// 3. only if neither a current nor any prior real usage has ever arrived,
+///    the rough chars/4 estimate of the whole transcript.
+///
+/// Cache read/write tokens are not counted here: they reflect tokens the
+/// provider served from (or wrote to) its cache, not tokens occupying the
+/// live context window budget this threshold is protecting.
 pub fn should_compact(
     usage: Usage,
+    last_known_usage: Option<Usage>,
     transcript: &[Message],
     context_window_size: u32,
     auto_compact_threshold: f64,
 ) -> bool {
     let budget = auto_compact_threshold * context_window_size as f64;
-    let estimated_tokens = if usage.input_tokens == 0 && usage.output_tokens == 0 {
-        estimate_tokens_from_chars(transcript)
-    } else {
+    let estimated_tokens = if usage.input_tokens != 0 || usage.output_tokens != 0 {
         (usage.input_tokens + usage.output_tokens) as f64
+    } else if let Some(prior) =
+        last_known_usage.filter(|u| u.input_tokens != 0 || u.output_tokens != 0)
+    {
+        (prior.input_tokens + prior.output_tokens) as f64
+    } else {
+        estimate_tokens_from_chars(transcript)
     };
     estimated_tokens >= budget
 }
@@ -461,6 +473,18 @@ fn render_transcript_for_summary(messages: &[Message]) -> String {
     rendered
 }
 
+/// Outcome of a [`compact_transcript`] call (F-005 fix): distinguishes an
+/// actual compaction from a no-op so callers can report each accurately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionOutcome {
+    /// The transcript was compacted; this is the replacement to store.
+    Compacted(Vec<Message>),
+    /// There was no earlier turn to fold into a summary (the whole
+    /// transcript is already "tail" — see [`tail_start_index`]), so nothing
+    /// was compacted and the caller's transcript is untouched.
+    NothingToCompact,
+}
+
 /// Compacts `transcript` by replacing everything before the most recent
 /// user-prompt turn with a single summary message, produced by a dedicated
 /// summarization call to `provider` (using [`COMPACTION_PROMPT`], not the
@@ -470,17 +494,19 @@ fn render_transcript_for_summary(messages: &[Message]) -> String {
 ///
 /// If no user-prompt turn is found at all (an edge case — normally the
 /// caller only compacts a transcript that already has at least one), there
-/// is nothing to summarize and `transcript` is returned unchanged. On a
+/// is nothing to summarize: this returns `Ok(CompactionOutcome::NothingToCompact)`,
+/// leaving it to the caller to report that distinctly rather than silently
+/// no-op'ing under the same `Ok(...)` shape a real compaction returns. On a
 /// provider failure during the summarization call, this returns `Err`
 /// without touching `transcript` at all — per the Phase 3 design, a failed
 /// compaction must leave the running conversation exactly as it was.
 pub async fn compact_transcript<P: Provider>(
     provider: &P,
     transcript: &[Message],
-) -> Result<Vec<Message>, P::Error> {
+) -> Result<CompactionOutcome, P::Error> {
     let split_at = tail_start_index(transcript);
     if split_at == 0 {
-        return Ok(transcript.to_vec());
+        return Ok(CompactionOutcome::NothingToCompact);
     }
 
     let (prefix, tail) = transcript.split_at(split_at);
@@ -497,7 +523,7 @@ pub async fn compact_transcript<P: Provider>(
         reply.text()
     )));
     compacted.extend_from_slice(tail);
-    Ok(compacted)
+    Ok(CompactionOutcome::Compacted(compacted))
 }
 
 /// Sends a single user turn to `provider` and returns the assistant's reply.
@@ -986,9 +1012,15 @@ mod tests {
             calls: std::sync::Mutex::new(Vec::new()),
         };
 
-        let compacted = compact_transcript(&provider, &transcript)
+        let outcome = compact_transcript(&provider, &transcript)
             .await
             .expect("compaction should succeed");
+        let compacted = match outcome {
+            CompactionOutcome::Compacted(compacted) => compacted,
+            CompactionOutcome::NothingToCompact => {
+                panic!("expected an actual compaction, got NothingToCompact")
+            }
+        };
 
         assert_eq!(
             compacted.len(),
@@ -1031,6 +1063,61 @@ mod tests {
             !summarization_request_text.contains("second turn"),
             "summarization call must not include the second (most-recent) turn's content, got: \
              {summarization_request_text}"
+        );
+    }
+
+    /// F-005 fix: when there is no earlier turn to fold into a summary,
+    /// `compact_transcript` must report that distinctly rather than silently
+    /// no-op'ing under the same `Ok(...)` shape a real compaction returns.
+    #[tokio::test]
+    async fn compact_transcript_reports_nothing_to_compact_when_no_earlier_turn_exists() {
+        let transcript = vec![Message::user_text("the only turn so far")];
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let outcome = compact_transcript(&provider, &transcript)
+            .await
+            .expect("compaction should succeed even when there's nothing to compact");
+
+        assert_eq!(outcome, CompactionOutcome::NothingToCompact);
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            0,
+            "no summarization call should be made when there's nothing to compact"
+        );
+    }
+
+    #[test]
+    fn should_compact_reuses_prior_real_usage_when_current_turn_usage_unreported() {
+        let context_window_size = 200_000;
+        let auto_compact_threshold = 0.7;
+
+        let prior_usage = Usage {
+            input_tokens: 150_000,
+            output_tokens: 5_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let unreported_usage = Usage::default();
+        // A tiny transcript, so the chars/4 fallback alone would stay far below
+        // budget — should_compact must reuse the prior real usage instead.
+        let transcript = vec![Message::user_text("hi")];
+
+        assert!(
+            should_compact(
+                unreported_usage,
+                Some(prior_usage),
+                &transcript,
+                context_window_size,
+                auto_compact_threshold,
+            ),
+            "expected should_compact to reuse the prior real usage figure (above threshold) rather \
+             than fall back to the chars/4 estimate on a small transcript"
         );
     }
 

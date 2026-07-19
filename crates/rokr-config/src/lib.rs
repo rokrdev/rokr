@@ -29,6 +29,23 @@ fn default_auto_compact_threshold() -> f64 {
     0.7
 }
 
+/// Clamps an out-of-range `auto_compact_threshold` (loaded from an existing
+/// config file — the freshly-constructed default is always already valid)
+/// back to the default, since 0 or below would trigger compaction on every
+/// turn and anything above 1 would mean it can never trigger.
+fn sanitized_auto_compact_threshold(threshold: f64) -> f64 {
+    if threshold > 0.0 && threshold <= 1.0 {
+        threshold
+    } else {
+        eprintln!(
+            "warning: auto_compact_threshold {threshold} is out of the valid (0, 1] range; \
+             falling back to the default of {}",
+            default_auto_compact_threshold()
+        );
+        default_auto_compact_threshold()
+    }
+}
+
 /// Errors returned while loading, validating, or initializing config.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -151,6 +168,10 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
                 supported: 1,
             });
         }
+        let config = Config {
+            auto_compact_threshold: sanitized_auto_compact_threshold(config.auto_compact_threshold),
+            ..config
+        };
         scaffold_agent_prompts(config_dir)?;
         return Ok(config);
     }
@@ -267,6 +288,24 @@ mod tests {
             value.get("auto_compact_threshold").and_then(|v| v.as_f64()),
             Some(0.5),
             "expected explicit auto_compact_threshold to be honored, got: {value}"
+        );
+    }
+
+    #[test]
+    fn load_or_init_clamps_out_of_range_auto_compact_threshold_to_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        std::fs::write(
+            &file_path,
+            r#"{"version": 1, "auto_compact_threshold": 5.0}"#,
+        )
+        .unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        assert_eq!(
+            config.auto_compact_threshold, 0.7,
+            "an out-of-range auto_compact_threshold must be clamped to the default"
         );
     }
 

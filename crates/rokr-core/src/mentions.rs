@@ -35,11 +35,14 @@ pub const MAX_MENTION_TURN_BYTES: usize = 256 * 1024;
 /// Expands every `@`-mention in `text`, returning the expanded string.
 ///
 /// An `@` at the start of `text` or preceded by whitespace, followed by a
-/// run of non-whitespace characters, is a mention *candidate*. A candidate
-/// is only "path-shaped" (worth calling `resolve` on) if its token contains
-/// a `/` or a `.` — see the module doc for the judgment call this encodes.
-/// Non-path-shaped candidates (e.g. `@support`) are left as literal text and
-/// `resolve` is never called for them.
+/// run of non-whitespace characters, is a mention *candidate*. `resolve` is
+/// always called for every candidate, so a bare filename like `@Makefile` or
+/// `@Dockerfile` (no `/` or `.`) still resolves to file contents when it
+/// exists (F-004 fix). The "path-shaped" check (token contains a `/` or a
+/// `.`) now only governs how a `NotFound` result is rendered: a path-shaped
+/// candidate that fails to resolve gets a "(file not found: ...)" note, while
+/// a non-path-shaped one (e.g. `@support`) is left as literal text with no
+/// note — see the module doc for the judgment call this encodes.
 ///
 /// Per-file contents are truncated to [`MAX_MENTION_FILE_BYTES`] with a
 /// truncation notice appended. Across the whole call, total injected bytes
@@ -70,33 +73,34 @@ pub fn expand_mentions(text: &str, resolve: impl Fn(&str) -> MentionResolution) 
             output.push('@');
             output.push_str(token);
 
-            // Only path-shaped candidates are worth a resolve attempt — a
-            // token containing '/' or '.' looks like a path (relative,
-            // absolute, or with a file extension); a bare word like
-            // "@support" does not, and must be left as literal text with
-            // `resolve` never invoked (see the module doc for the
-            // reasoning behind this heuristic).
-            if token.contains('/') || token.contains('.') {
-                match resolve(token) {
-                    MentionResolution::Found(contents) => {
-                        if turn_bytes_injected >= MAX_MENTION_TURN_BYTES {
-                            output.push_str(&format!(
-                                " [skipped: per-turn mention budget of {MAX_MENTION_TURN_BYTES} bytes already reached, {token} not injected]"
-                            ));
-                        } else {
-                            let (body, truncated_notice) =
-                                truncate_to_cap(&contents, MAX_MENTION_FILE_BYTES);
-                            turn_bytes_injected += body.len();
-                            output.push_str(&format!("\n[Contents of {token}]\n```\n{body}"));
-                            if let Some(notice) = truncated_notice {
-                                output.push_str(&notice);
-                            }
-                            output.push_str("\n```\n");
+            // `resolve` is called for every candidate (F-004 fix); the
+            // "path-shaped" check (token contains '/' or '.') only governs
+            // how a `NotFound` result renders — a path-shaped miss gets a
+            // "(file not found: ...)" note, a bare word like "@support"
+            // is left as the literal text already pushed above.
+            let is_path_shaped = token.contains('/') || token.contains('.');
+            match resolve(token) {
+                MentionResolution::Found(contents) => {
+                    if turn_bytes_injected >= MAX_MENTION_TURN_BYTES {
+                        output.push_str(&format!(
+                            " [skipped: per-turn mention budget of {MAX_MENTION_TURN_BYTES} bytes already reached, {token} not injected]"
+                        ));
+                    } else {
+                        let (body, truncated_notice) =
+                            truncate_to_cap(&contents, MAX_MENTION_FILE_BYTES);
+                        turn_bytes_injected += body.len();
+                        output.push_str(&format!("\n[Contents of {token}]\n```\n{body}"));
+                        if let Some(notice) = truncated_notice {
+                            output.push_str(&notice);
                         }
+                        output.push_str("\n```\n");
                     }
-                    MentionResolution::NotFound => {
+                }
+                MentionResolution::NotFound => {
+                    if is_path_shaped {
                         output.push_str(&format!(" (file not found: {token})"));
                     }
+                    // else: leave as literal text — already pushed above.
                 }
             }
 
@@ -156,13 +160,25 @@ mod tests {
     fn literal_at_sign_not_resolving_to_a_path_is_left_as_text() {
         let input = "reach out @support for help";
 
-        let output = expand_mentions(input, |_| {
-            panic!("resolver should not be called for non-path-shaped tokens")
-        });
+        let output = expand_mentions(input, |_| MentionResolution::NotFound);
 
         assert_eq!(
             output, input,
-            "a bare @word with no '/' or '.' is not path-shaped and must be left byte-identical"
+            "a bare @word with no '/' or '.' that fails to resolve must be left byte-identical"
+        );
+    }
+
+    #[test]
+    fn bare_filename_mention_without_extension_resolves_when_found() {
+        let output = expand_mentions("please check @Makefile for the build steps", |path| {
+            assert_eq!(path, "Makefile");
+            MentionResolution::Found("build:\n\tcargo build".to_string())
+        });
+
+        assert!(
+            output.contains("build:\n\tcargo build"),
+            "expected a bare filename like @Makefile (no '/' or '.') to resolve to file contents \
+             when found, got: {output:?}"
         );
     }
 
