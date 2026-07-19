@@ -310,6 +310,26 @@ impl Provider for AnthropicProvider {
             })
             .unwrap_or_default();
 
+        // Fraction of total prompt tokens (input + cache-read + cache-write)
+        // served from cache on this call. Observability only (section 1) —
+        // no analytics pipeline consumes this yet (that's Phase 7).
+        let cache_hit_ratio = {
+            let total = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+            if total > 0 {
+                usage.cache_read_tokens as f64 / total as f64
+            } else {
+                0.0
+            }
+        };
+        tracing::info!(
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            cache_read_tokens = usage.cache_read_tokens,
+            cache_write_tokens = usage.cache_write_tokens,
+            cache_hit_ratio,
+            "anthropic provider send completed"
+        );
+
         Ok((
             Message {
                 role: Role::Assistant,
@@ -321,5 +341,143 @@ impl Provider for AnthropicProvider {
             },
             usage,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// Field values pulled off a single captured `tracing` event.
+    #[derive(Debug, Default, Clone)]
+    struct CapturedEvent {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        cache_hit_ratio: Option<f64>,
+    }
+
+    #[derive(Default)]
+    struct EventVisitor(CapturedEvent);
+
+    impl tracing::field::Visit for EventVisitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "input_tokens" => self.0.input_tokens = Some(value),
+                "output_tokens" => self.0.output_tokens = Some(value),
+                "cache_read_tokens" => self.0.cache_read_tokens = Some(value),
+                "cache_write_tokens" => self.0.cache_write_tokens = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            // `u64` fields recorded via `tracing::info!` may surface through
+            // `record_i64` depending on the value's field-type encoding;
+            // mirror the same field routing here.
+            match field.name() {
+                "input_tokens" => self.0.input_tokens = Some(value as u64),
+                "output_tokens" => self.0.output_tokens = Some(value as u64),
+                "cache_read_tokens" => self.0.cache_read_tokens = Some(value as u64),
+                "cache_write_tokens" => self.0.cache_write_tokens = Some(value as u64),
+                _ => {}
+            }
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            if field.name() == "cache_hit_ratio" {
+                self.0.cache_hit_ratio = Some(value);
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// A minimal `tracing_subscriber::Layer` that captures every event's
+    /// field values into a shared `Vec` for assertion, avoiding
+    /// string-matching against formatted log lines.
+    #[derive(Clone, Default)]
+    struct CapturingLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for CapturingLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = EventVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn send_emits_tracing_event_with_usage_and_cache_hit_ratio() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "hi there" }],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 20
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider =
+            AnthropicProvider::new(mock_server.uri(), "claude-3-5-sonnet-20241022", "test-api-key");
+
+        let events: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            events: events.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let messages = vec![Message::user_text("hello")];
+
+        // `set_default` (rather than `with_default`) so the guard can be
+        // held across the `.await` below; safe here because `#[tokio::test]`
+        // defaults to a single-threaded (current-thread) runtime, so the
+        // future is never polled from a different OS thread than the one
+        // that installed the thread-local subscriber.
+        let guard = tracing::subscriber::set_default(subscriber);
+        let result = provider.send(&messages, &[]).await;
+        drop(guard);
+
+        result.expect("mocked send() should succeed");
+
+        let captured = events.lock().unwrap();
+        let event = captured
+            .iter()
+            .find(|event| event.input_tokens.is_some())
+            .expect("send() should emit a tracing event carrying usage fields");
+
+        let expected_input = 100u64;
+        let expected_output = 50u64;
+        let expected_cache_read = 30u64;
+        let expected_cache_write = 20u64;
+        let expected_total = expected_input + expected_cache_read + expected_cache_write;
+        let expected_ratio = expected_cache_read as f64 / expected_total as f64;
+
+        assert_eq!(event.input_tokens, Some(expected_input));
+        assert_eq!(event.output_tokens, Some(expected_output));
+        assert_eq!(event.cache_read_tokens, Some(expected_cache_read));
+        assert_eq!(event.cache_write_tokens, Some(expected_cache_write));
+        assert_eq!(event.cache_hit_ratio, Some(expected_ratio));
     }
 }
