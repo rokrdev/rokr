@@ -113,7 +113,7 @@ async fn main() -> ExitCode {
             // `rokr_core::run_tool_loop`. `rokr-tui` stays decoupled from
             // `rokr-core`/`rokr-provider`, so this closure is where the
             // message model and provider abstraction meet the TUI.
-            let provider = rokr_provider::OpenAiProvider::from_env()
+            let provider = rokr_provider::AnyProvider::from_env()
                 .map(Arc::new)
                 .map_err(|err| err.to_string());
 

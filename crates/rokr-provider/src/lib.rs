@@ -1,5 +1,6 @@
 //! The `Provider` trait and provider implementations (OpenAI-compatible first, Anthropic later).
 
+pub mod anthropic;
 pub mod openai;
 
 /// The `Provider` trait now lives in `rokr-core` (see its doc comment there
@@ -8,7 +9,7 @@ pub mod openai;
 /// existing call sites (`rokr_provider::Provider`) keep working unchanged.
 /// Concrete implementations still live in this crate, one module per
 /// provider (ADR 0003 as refined by 0009).
-pub use rokr_core::{Provider, Usage};
+pub use rokr_core::{Message, Provider, ToolSpec, Usage};
 
 /// Typed provider failures. Never panics: HTTP and deserialization failures
 /// surface here instead.
@@ -30,4 +31,68 @@ pub enum ProviderError {
     EmptyResponse,
 }
 
+pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
+
+pub const ENV_PROVIDER: &str = "ROKR_PROVIDER";
+
+pub enum AnyProvider {
+    OpenAi(OpenAiProvider),
+    Anthropic(AnthropicProvider),
+}
+
+impl AnyProvider {
+    /// Reads `ROKR_PROVIDER`: `"anthropic"` selects the Anthropic adapter;
+    /// anything else (including unset) defaults to OpenAI.
+    pub fn from_env() -> Result<Self, ProviderError> {
+        match std::env::var(ENV_PROVIDER).as_deref() {
+            Ok("anthropic") => Ok(AnyProvider::Anthropic(AnthropicProvider::from_env()?)),
+            _ => Ok(AnyProvider::OpenAi(OpenAiProvider::from_env()?)),
+        }
+    }
+}
+
+impl Provider for AnyProvider {
+    type Error = ProviderError;
+
+    async fn send(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<(Message, Usage), ProviderError> {
+        match self {
+            AnyProvider::OpenAi(provider) => provider.send(messages, tools).await,
+            AnyProvider::Anthropic(provider) => provider.send(messages, tools).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn any_provider_from_env_dispatches_to_anthropic_when_configured() {
+        let _lock = ENV_GUARD.lock().unwrap();
+
+        std::env::set_var(ENV_PROVIDER, "anthropic");
+        std::env::set_var(anthropic::ENV_BASE_URL, "http://localhost:9");
+        std::env::set_var(anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        std::env::set_var(anthropic::ENV_API_KEY, "test-key");
+
+        let provider = AnyProvider::from_env()
+            .expect("from_env should succeed with all required env vars set");
+
+        assert!(
+            matches!(provider, AnyProvider::Anthropic(_)),
+            "ROKR_PROVIDER=anthropic should select the Anthropic adapter, not OpenAI"
+        );
+
+        std::env::remove_var(ENV_PROVIDER);
+        std::env::remove_var(anthropic::ENV_BASE_URL);
+        std::env::remove_var(anthropic::ENV_MODEL);
+        std::env::remove_var(anthropic::ENV_API_KEY);
+    }
+}
