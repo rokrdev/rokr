@@ -30,6 +30,11 @@ Anthropic provider; this phase's payoff is prefix-stability discipline.
   (short vs. long-lived) so multi-hour caching stays expressible without
   being provider-specific. Placement: after tools, after the static system
   segment, and a rolling breakpoint on the conversation tail.
+- **TTL modeling decision confirmed**: the `CacheControlKind::{Ephemeral,
+  Extended}` variant approach (not a compositional numeric `ttl` field) is
+  the recorded Phase 3 decision; a compositional `ttl` field remains
+  addable in Phase 4 if the Anthropic wire mapping ends up needing more
+  granularity than the two-variant enum provides.
 - **Provider adapters translate or ignore breakpoints; usage lands in
   `rokr-provider`**: the OpenAI-compatible adapter is a deliberate no-op on
   cache directives (implicit prefix caching already covers it) — explicit
