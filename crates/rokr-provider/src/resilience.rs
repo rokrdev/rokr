@@ -72,6 +72,7 @@ impl RetryPolicy {
 /// Honors a rate-limited response's server-provided retry-after duration
 /// ([`RetryHint::RetryAfter`]) instead of the computed exponential delay
 /// when present.
+#[derive(Clone)]
 pub struct ResilientProvider<P> {
     inner: P,
     policy: RetryPolicy,
@@ -110,6 +111,14 @@ impl<P> ResilientProvider<P> {
     pub fn with_secondary(mut self, secondary: P) -> Self {
         self.secondary = Some(secondary);
         self
+    }
+
+    /// The currently configured retry policy. F-005: lets a caller (e.g.
+    /// `/model`) read the active policy off the current provider before
+    /// swapping to a new one, so the switch can preserve it instead of
+    /// resetting to `RetryPolicy::default()`.
+    pub fn policy(&self) -> RetryPolicy {
+        self.policy
     }
 }
 
@@ -151,6 +160,15 @@ where
             tokio::time::sleep(delay).await;
         }
     }
+
+    /// F-010: delegates to the wrapped inner provider rather than the
+    /// `Provider` trait's default `false` -- without this override, a
+    /// `ResilientProvider` wrapping a provider that genuinely supports
+    /// native search would still silently report `false`, masking the
+    /// inner provider's real capability.
+    fn native_search_capable(&self) -> bool {
+        self.inner.native_search_capable()
+    }
 }
 
 impl<P> ResilientProvider<P>
@@ -166,6 +184,10 @@ where
     /// stability" section) and makes a single attempt against the
     /// secondary — no retry loop of its own — returning its result
     /// (success or error) directly.
+    ///
+    /// F-007: only reached once the primary's own retries are exhausted —
+    /// a `RetryHint::NonRetryable` error returns directly from `send()`
+    /// above and deliberately never reaches failover at all.
     async fn failover_or_err(
         &self,
         messages: &[Message],
@@ -206,14 +228,28 @@ mod tests {
     struct FakeProviderState {
         responses: Mutex<VecDeque<Result<(Message, Usage), ProviderError>>>,
         call_count: AtomicUsize,
+        /// F-010: lets a test prove `ResilientProvider::native_search_capable`
+        /// genuinely forwards to the wrapped inner provider, rather than
+        /// hardcoding the `Provider` trait's default of `false`. `false` for
+        /// every existing use of `FakeProvider::new`, so this is additive
+        /// and doesn't change any other test's behavior.
+        native_search_capable: bool,
     }
 
     impl FakeProvider {
         fn new(responses: Vec<Result<(Message, Usage), ProviderError>>) -> Self {
+            Self::with_native_search_capable(responses, false)
+        }
+
+        fn with_native_search_capable(
+            responses: Vec<Result<(Message, Usage), ProviderError>>,
+            native_search_capable: bool,
+        ) -> Self {
             Self {
                 inner: Arc::new(FakeProviderState {
                     responses: Mutex::new(responses.into_iter().collect()),
                     call_count: AtomicUsize::new(0),
+                    native_search_capable,
                 }),
             }
         }
@@ -239,6 +275,26 @@ mod tests {
                 .pop_front()
                 .expect("FakeProvider called more times than responses were scripted")
         }
+
+        fn native_search_capable(&self) -> bool {
+            self.inner.native_search_capable
+        }
+    }
+
+    /// F-010: `ResilientProvider` must forward `native_search_capable()`
+    /// from its wrapped inner provider rather than silently reporting the
+    /// `Provider` trait's default `false` regardless of what the inner
+    /// provider actually supports.
+    #[test]
+    fn resilient_provider_forwards_native_search_capable_from_inner_provider() {
+        let fake = FakeProvider::with_native_search_capable(vec![], true);
+        let resilient = ResilientProvider::new(fake);
+
+        assert!(
+            resilient.native_search_capable(),
+            "ResilientProvider::native_search_capable() must delegate to the wrapped inner \
+             provider, not hardcode the trait default of false"
+        );
     }
 
     #[tokio::test]

@@ -35,21 +35,41 @@ pub struct BuiltProvider {
 /// for why auth resolution itself is the caller's job) and wraps it in
 /// [`ResilientProvider`] under `retry_policy`.
 ///
-/// Mirrors `main.rs`'s prior `construct_provider`: a resolved
-/// `Auth::OAuth` credential builds an `AnthropicProvider` directly from the
-/// `ROKR_ANTHROPIC_BASE_URL`/`ROKR_ANTHROPIC_MODEL` env vars and the OAuth
-/// access token (see `AnthropicProvider::new`'s KNOWN LIMITATION note,
-/// carried over unchanged from ticket 31: OAuth and API-key credentials
-/// still flow through the same constructor parameter). Anything else
-/// (`None`, or a resolved `Auth::ApiKey`) falls through to the unchanged
-/// `AnyProvider::from_env()` path, preserving `construct_provider`'s exact
-/// behavior byte-for-byte, quirks included.
+/// `requested_name` (F-005) distinguishes two callers of this same
+/// selection logic:
+/// - `None` — startup: no explicit backend was requested, so selection
+///   falls through to env-driven dispatch. Preserves the prior
+///   `construct_provider`'s exact behavior byte-for-byte, quirks included.
+/// - `Some(name)` — an explicit backend switch (`/model <name>`). Before
+///   this fix, `/model` bypassed this factory entirely and resolved via
+///   `AnyProvider::from_name`, which can only ever build an API-key-backed
+///   provider from env vars — it has no way to build an OAuth-backed one,
+///   so a user authenticated only via a stored OAuth token (no
+///   `ROKR_ANTHROPIC_API_KEY` env var) could never switch to the anthropic
+///   backend via `/model`. Routing `/model` through this same function
+///   fixes that: when `name` selects the anthropic backend AND
+///   `resolved_auth` is a resolved `Auth::OAuth` credential, the OAuth path
+///   below still wins (OAuth-first, matching startup's own preference) —
+///   otherwise `name` resolves via `AnyProvider::from_name`, which reads
+///   that backend's own env vars, exactly like `/model`'s pre-fix
+///   behavior.
+///
+/// In both cases, a resolved `Auth::OAuth` credential builds an
+/// `AnthropicProvider` directly from the `ROKR_ANTHROPIC_BASE_URL`/
+/// `ROKR_ANTHROPIC_MODEL` env vars and the OAuth access token — OAuth is
+/// anthropic-only in this codebase today, so no other backend name can
+/// select the OAuth path.
 pub fn build_provider(
+    requested_name: Option<&str>,
     resolved_auth: Option<Auth>,
     retry_policy: RetryPolicy,
 ) -> Result<BuiltProvider, String> {
-    let selected = match resolved_auth {
-        Some(Auth::OAuth { access_token, .. }) => {
+    let prefers_oauth_anthropic = requested_name
+        .map(|name| name.eq_ignore_ascii_case("anthropic"))
+        .unwrap_or(true);
+
+    let selected = match (prefers_oauth_anthropic, resolved_auth) {
+        (true, Some(Auth::OAuth { access_token, .. })) => {
             let base_url = std::env::var(crate::anthropic::ENV_BASE_URL).map_err(|_| {
                 format!(
                     "missing required environment variable: {}",
@@ -62,9 +82,19 @@ pub fn build_provider(
                     crate::anthropic::ENV_MODEL
                 )
             })?;
-            AnyProvider::Anthropic(AnthropicProvider::new(base_url, model, access_token))
+            // F-006: an OAuth access token must be sent as
+            // `Authorization: Bearer <token>`, not `x-api-key` -- see
+            // `Credential`'s doc comment.
+            AnyProvider::Anthropic(AnthropicProvider::with_credential(
+                base_url,
+                model,
+                crate::anthropic::Credential::Bearer(access_token),
+            ))
         }
-        _ => AnyProvider::from_env().map_err(|err| err.to_string())?,
+        (_, _) => match requested_name {
+            Some(name) => AnyProvider::from_name(name).map_err(|err| err.to_string())?,
+            None => AnyProvider::from_env().map_err(|err| err.to_string())?,
+        },
     };
 
     let resilient = ResilientProvider::with_policy(selected.clone(), retry_policy);
@@ -130,7 +160,7 @@ mod tests {
             expires_at: None,
         });
 
-        let built = build_provider(resolved_auth, fast_policy)
+        let built = build_provider(None, resolved_auth, fast_policy)
             .expect("build_provider should succeed given a resolved OAuth credential and valid env vars");
 
         assert!(

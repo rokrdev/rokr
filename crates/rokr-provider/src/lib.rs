@@ -143,6 +143,17 @@ impl Provider for AnyProvider {
             AnyProvider::Anthropic(provider) => provider.send(messages, tools).await,
         }
     }
+
+    /// F-010: delegates to whichever inner provider is active rather than
+    /// the `Provider` trait's default `false` -- without this override,
+    /// `AnyProvider` would silently mask an inner provider's real native
+    /// search capability behind the trait default, regardless of variant.
+    fn native_search_capable(&self) -> bool {
+        match self {
+            AnyProvider::OpenAi(provider) => provider.native_search_capable(),
+            AnyProvider::Anthropic(provider) => provider.native_search_capable(),
+        }
+    }
 }
 
 #[cfg(test)]

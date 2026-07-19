@@ -42,25 +42,30 @@ pub type PermissionCallback = Box<
 /// own prompt and a read-only tool subset, returning only its final
 /// assistant text.
 ///
-/// Owns a *concrete* `rokr_provider::AnyProvider`, never a `P: Provider`
-/// type parameter on this struct itself. ADR 0009
+/// Owns a *concrete* `rokr_provider::ResilientProvider<rokr_provider::AnyProvider>`,
+/// never a `P: Provider` type parameter on this struct itself. ADR 0009
 /// (`docs/adr/0009-provider-trait-location.md`) warns that a
 /// generic-over-`Provider` future is not automatically provably `Send` when
 /// it crosses an abstract boundary -- and `ExecutableTool::execute_boxed`
 /// is exactly that boundary, since it must hand back a
 /// `Pin<Box<dyn Future<Output = _> + Send>>`. Keeping this field concrete
 /// means the `run_subagent` call inside `execute_boxed` monomorphizes on
-/// `AnyProvider` at a single, known call site -- the same reasoning ADR
-/// 0009 already applies to `rokr_core::single_turn`.
+/// `ResilientProvider<AnyProvider>` at a single, known call site -- the
+/// same reasoning ADR 0009 already applies to `rokr_core::single_turn`.
+///
+/// F-004: wrapped in `ResilientProvider` (not a bare `AnyProvider`) so a
+/// subagent's own provider calls get the same retry/backoff the parent
+/// session's send path gets -- before this fix, a single transient failure
+/// inside a subagent call had no retry at all.
 pub struct SubagentTool {
-    provider: rokr_provider::AnyProvider,
+    provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
     config_dir: PathBuf,
     request_permission: PermissionCallback,
 }
 
 impl SubagentTool {
     pub fn new(
-        provider: rokr_provider::AnyProvider,
+        provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
         config_dir: PathBuf,
         request_permission: PermissionCallback,
     ) -> Self {
@@ -142,10 +147,10 @@ impl rokr_core::ExecutableTool for SubagentTool {
             let ls = rokr_tools::ls::LsTool;
             let tools: [&dyn rokr_core::ExecutableTool; 4] = [&read, &glob, &grep, &ls];
 
-            // Monomorphized on the concrete `AnyProvider` field here --
-            // never a generic `P: Provider` bound at this type's level. See
-            // this type's own doc comment and ADR 0009's AFIT `Send`
-            // warning.
+            // Monomorphized on the concrete `ResilientProvider<AnyProvider>`
+            // field here -- never a generic `P: Provider` bound at this
+            // type's level. See this type's own doc comment and ADR 0009's
+            // AFIT `Send` warning.
             run_subagent(
                 &self.provider,
                 &subagent_prompt,
@@ -213,7 +218,7 @@ async fn run_subagent<P: rokr_core::Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rokr_core::{ContentBlock, Message, Role};
+    use rokr_core::{ContentBlock, ExecutableTool, Message, Role};
 
     #[derive(Debug)]
     struct StubError;
@@ -396,6 +401,90 @@ mod tests {
             !result.contains("some file contents") && !result.contains("call_1"),
             "the subagent's internal tool-use/tool-result turns must not leak into the \
              returned text, got: {result}"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// F-004: `SubagentTool` must retry a transient (retryable) provider
+    /// failure the same way the parent session's own send path does --
+    /// before this fix, `SubagentTool.provider` was a bare, unwrapped
+    /// `AnyProvider` with zero retry/backoff, so a single transient 503
+    /// would fail the whole subagent call outright. Mirrors
+    /// `rokr-provider`'s own `factory.rs` acceptance-test pattern: a mock
+    /// server fails the first two attempts with a retryable 503, then
+    /// succeeds; the provider handed to `SubagentTool` is wrapped in
+    /// `ResilientProvider` with a fast policy, so if `SubagentTool` is
+    /// genuinely resilience-wrapped, `execute_boxed` must still succeed and
+    /// the mock must record all three attempts.
+    #[tokio::test]
+    async fn subagent_tool_retries_transient_failure_via_resilient_provider() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "subagent final answer after retry"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let any_provider = rokr_provider::AnyProvider::Anthropic(rokr_provider::AnthropicProvider::new(
+            mock_server.uri(),
+            "claude-3-5-sonnet-20241022",
+            "test-api-key",
+        ));
+        let fast_policy = rokr_provider::RetryPolicy {
+            max_attempts: 5,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            max_elapsed: std::time::Duration::from_secs(5),
+        };
+        let resilient_provider =
+            rokr_provider::ResilientProvider::with_policy(any_provider, fast_policy);
+
+        let temp_dir = unique_temp_dir("retries-transient-failure");
+        let agents_dir = temp_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("researcher.md"), "you are a test subagent").unwrap();
+
+        let request_permission: PermissionCallback =
+            Box::new(|_request| Box::pin(async { true }));
+
+        // F-004: `SubagentTool::new` must accept the resilience-wrapped
+        // provider directly -- a bare `AnyProvider` field here would mean
+        // this transient failure is never retried at all.
+        let tool = SubagentTool::new(resilient_provider, temp_dir.clone(), request_permission);
+
+        let result = tool
+            .execute_boxed(serde_json::json!({
+                "name": "researcher",
+                "task": "do the thing"
+            }))
+            .await
+            .expect(
+                "subagent call should succeed once the resilience-wrapped provider retries \
+                 past the transient 503s",
+            );
+
+        assert_eq!(result, "subagent final answer after retry");
+
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            3,
+            "expected exactly 3 attempts (2 retried 503s + 1 successful 200), proving \
+             SubagentTool's provider is genuinely resilience-wrapped, not a bare AnyProvider \
+             with no retry/backoff"
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);

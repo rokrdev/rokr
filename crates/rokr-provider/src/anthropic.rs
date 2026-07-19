@@ -196,35 +196,63 @@ pub const ENV_BASE_URL: &str = "ROKR_ANTHROPIC_BASE_URL";
 pub const ENV_MODEL: &str = "ROKR_ANTHROPIC_MODEL";
 pub const ENV_API_KEY: &str = "ROKR_ANTHROPIC_API_KEY";
 
+/// F-006: distinguishes how a credential must be sent on the wire.
+/// Anthropic's OAuth flow requires `Authorization: Bearer <token>`, NOT the
+/// `x-api-key` header the plain API-key path uses -- before this type
+/// existed, both kinds of token flowed through the same bare `String`
+/// field and were always sent as `x-api-key`, which silently broke OAuth
+/// auth against the real Anthropic API.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Credential {
+    /// Sent as the `x-api-key` header (the env-var / `ROKR_ANTHROPIC_API_KEY` path).
+    ApiKey(String),
+    /// Sent as the `Authorization: Bearer <token>` header (the OAuth path).
+    Bearer(String),
+}
+
 /// An Anthropic Messages API provider. Configured with a base URL, model
-/// name, and API key.
+/// name, and credential.
 #[derive(Clone)]
 pub struct AnthropicProvider {
     base_url: String,
     model: String,
-    api_key: String,
+    credential: Credential,
     client: reqwest::Client,
 }
 
 impl AnthropicProvider {
-    /// Construct a provider with explicit config. Primarily for tests that
-    /// point `base_url` at a mock server.
+    /// Construct a provider with an explicit API key. Primarily for tests
+    /// that point `base_url` at a mock server. Equivalent to
+    /// `Self::with_credential(base_url, model, Credential::ApiKey(api_key.into()))`.
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
+        Self::with_credential(base_url, model, Credential::ApiKey(api_key.into()))
+    }
+
+    /// Construct a provider with an explicit [`Credential`] -- the OAuth
+    /// path (F-006) uses this directly with `Credential::Bearer(access_token)`
+    /// so the token is sent as `Authorization: Bearer <token>`, not
+    /// `x-api-key`.
+    pub fn with_credential(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        credential: Credential,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             model: model.into(),
-            api_key: api_key.into(),
+            credential,
             client: reqwest::Client::new(),
         }
     }
 
     /// Construct a provider from `ROKR_ANTHROPIC_BASE_URL`,
     /// `ROKR_ANTHROPIC_MODEL`, and `ROKR_ANTHROPIC_API_KEY`. Returns
-    /// [`ProviderError::MissingEnvVar`] if any is unset.
+    /// [`ProviderError::MissingEnvVar`] if any is unset. Always builds an
+    /// API-key credential -- OAuth tokens never come from this env var.
     pub fn from_env() -> Result<Self, ProviderError> {
         let base_url =
             std::env::var(ENV_BASE_URL).map_err(|_| ProviderError::MissingEnvVar(ENV_BASE_URL))?;
@@ -276,10 +304,17 @@ impl Provider for AnthropicProvider {
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
-        let response = self
-            .client
-            .post(url)
-            .header("x-api-key", &self.api_key)
+        // F-006: the credential kind decides the auth header -- `x-api-key`
+        // for a plain API key, `Authorization: Bearer <token>` for OAuth.
+        // Never both: the wrong header for a given credential kind is
+        // exactly the bug this fixes.
+        let request = self.client.post(url);
+        let request = match &self.credential {
+            Credential::ApiKey(key) => request.header("x-api-key", key),
+            Credential::Bearer(token) => request.header("Authorization", format!("Bearer {token}")),
+        };
+
+        let response = request
             .header("anthropic-version", "2023-06-01")
             .json(&request_body)
             .send()
@@ -365,6 +400,30 @@ mod tests {
 
     use super::*;
 
+    /// Guards a one-time global `tracing` subscriber install, called at the
+    /// top of every test in this module that calls `AnthropicProvider::send`
+    /// (which unconditionally emits a `tracing::info!` on success). Without
+    /// this, whichever such test's `send()` call happens to be the FIRST in
+    /// the whole test binary to hit that callsite decides, via `tracing`'s
+    /// per-callsite interest caching, whether the callsite is "ever
+    /// enabled" for the rest of the process -- and a test that never
+    /// installs a subscriber at all (most of the tests here don't need
+    /// one) can permanently cache that callsite as disabled, which then
+    /// causes `send_emits_tracing_event_with_usage_and_cache_hit_ratio`'s
+    /// own `set_default`-scoped subscriber to silently miss the event when
+    /// it runs later. Installing a real (permissive, unfiltered) global
+    /// default once up front means the callsite's cached interest is
+    /// always "enabled," regardless of test execution order; the
+    /// tracing-capture test's own `set_default` thread-local override still
+    /// takes precedence over this global default when it's active.
+    static INIT_GLOBAL_TRACING: std::sync::Once = std::sync::Once::new();
+
+    fn ensure_global_tracing_subscriber() {
+        INIT_GLOBAL_TRACING.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
     /// Field values pulled off a single captured `tracing` event.
     #[derive(Debug, Default, Clone)]
     struct CapturedEvent {
@@ -427,8 +486,114 @@ mod tests {
         }
     }
 
+    /// F-006: an OAuth access token must be sent as
+    /// `Authorization: Bearer <token>`, and must NOT also send `x-api-key`
+    /// -- Anthropic's OAuth flow requires the Bearer header, not the
+    /// API-key header the env-var/API-key path uses. Before this fix,
+    /// `AnthropicProvider` had no notion of credential kind at all: every
+    /// token, OAuth or not, was passed into the same field and always sent
+    /// as `x-api-key`.
+    #[tokio::test]
+    async fn bearer_credential_sends_authorization_bearer_header_not_x_api_key() {
+        ensure_global_tracing_subscriber();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let provider = AnthropicProvider::with_credential(
+            mock_server.uri(),
+            "claude-3-5-sonnet-20241022",
+            Credential::Bearer("test-oauth-token".to_string()),
+        );
+
+        let messages = vec![Message::user_text("hello")];
+        provider
+            .send(&messages, &[])
+            .await
+            .expect("send should succeed against the mock server");
+
+        let received = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should have recorded the request");
+        assert_eq!(received.len(), 1);
+        let headers = &received[0].headers;
+
+        assert_eq!(
+            headers
+                .get("authorization")
+                .map(|value| value.to_str().unwrap()),
+            Some("Bearer test-oauth-token"),
+            "expected an Authorization: Bearer <token> header for a Bearer credential, got headers: {headers:?}"
+        );
+        assert!(
+            !headers.contains_key("x-api-key"),
+            "a Bearer credential must NOT also send x-api-key, got headers: {headers:?}"
+        );
+    }
+
+    /// Companion to the Bearer test above: the existing API-key path must
+    /// keep sending `x-api-key` and must NOT send `Authorization`.
+    #[tokio::test]
+    async fn api_key_credential_sends_x_api_key_header_not_authorization() {
+        ensure_global_tracing_subscriber();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let provider = AnthropicProvider::new(
+            mock_server.uri(),
+            "claude-3-5-sonnet-20241022",
+            "test-api-key",
+        );
+
+        let messages = vec![Message::user_text("hello")];
+        provider
+            .send(&messages, &[])
+            .await
+            .expect("send should succeed against the mock server");
+
+        let received = mock_server
+            .received_requests()
+            .await
+            .expect("wiremock should have recorded the request");
+        assert_eq!(received.len(), 1);
+        let headers = &received[0].headers;
+
+        assert_eq!(
+            headers.get("x-api-key").map(|value| value.to_str().unwrap()),
+            Some("test-api-key"),
+            "expected an x-api-key header for an ApiKey credential, got headers: {headers:?}"
+        );
+        assert!(
+            !headers.contains_key("authorization"),
+            "an ApiKey credential must NOT also send Authorization, got headers: {headers:?}"
+        );
+    }
+
     #[tokio::test]
     async fn send_emits_tracing_event_with_usage_and_cache_hit_ratio() {
+        ensure_global_tracing_subscriber();
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
