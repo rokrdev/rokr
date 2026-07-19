@@ -8,7 +8,7 @@ pub mod openai;
 /// existing call sites (`rokr_provider::Provider`) keep working unchanged.
 /// Concrete implementations still live in this crate, one module per
 /// provider (ADR 0003 as refined by 0009).
-pub use rokr_core::Provider;
+pub use rokr_core::{Provider, Usage};
 
 /// Typed provider failures. Never panics: HTTP and deserialization failures
 /// surface here instead.

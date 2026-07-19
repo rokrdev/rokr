@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use rokr_core::{ContentBlock, Message, Role, ToolSpec};
+use rokr_core::{ContentBlock, Message, Role, ToolSpec, Usage};
 
 use crate::{Provider, ProviderError};
 
@@ -64,11 +64,31 @@ struct WireFunctionDef {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<WireChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WireChoice {
     message: WireMessage,
+}
+
+/// OpenAI's `usage` object. `prompt_tokens_details.cached_tokens` is how
+/// OpenAI reports implicit prefix-cache hits; there's no wire concept of a
+/// cache *write* count, so [`Usage::cache_write_tokens`] is always `0` for
+/// this provider.
+#[derive(Debug, Deserialize)]
+struct WireUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 fn role_to_wire(role: Role) -> &'static str {
@@ -128,7 +148,18 @@ fn message_to_wire(message: &Message) -> Vec<WireMessage> {
             ContentBlock::Text {
                 text: block_text, ..
             } => text.push_str(block_text),
-            ContentBlock::ToolUse { id, name, input } => {
+            // `cache_control` is ignored here by design: OpenAI-compatible
+            // endpoints already do implicit prefix caching, so this adapter
+            // deliberately never emits an explicit cache directive (see
+            // docs/phase-3-context-caching.md's "Cache-optimization
+            // activation" decision) — explicit emission is reserved for the
+            // Anthropic provider.
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                cache_control: _,
+            } => {
                 tool_calls.push(WireToolCall {
                     id: id.clone(),
                     r#type: "function".to_string(),
@@ -142,6 +173,7 @@ fn message_to_wire(message: &Message) -> Vec<WireMessage> {
                 tool_use_id,
                 content,
                 is_error: _,
+                cache_control: _,
             } => {
                 wire_messages.push(WireMessage {
                     role: "tool".to_string(),
@@ -201,6 +233,7 @@ fn wire_to_message(wire: WireMessage) -> Message {
                 id: tool_call.id,
                 name: tool_call.function.name,
                 input,
+                cache_control: None,
             });
         }
     }
@@ -264,7 +297,7 @@ impl Provider for OpenAiProvider {
         &self,
         messages: &[Message],
         tools: &[ToolSpec],
-    ) -> Result<Message, ProviderError> {
+    ) -> Result<(Message, Usage), ProviderError> {
         let request_body = ChatCompletionRequest {
             model: self.model.clone(),
             messages: messages.iter().flat_map(message_to_wire).collect(),
@@ -292,12 +325,25 @@ impl Provider for OpenAiProvider {
         }
 
         let parsed: ChatCompletionResponse = serde_json::from_str(&body)?;
+        let usage = parsed
+            .usage
+            .map(|wire_usage| Usage {
+                input_tokens: wire_usage.prompt_tokens,
+                output_tokens: wire_usage.completion_tokens,
+                cache_read_tokens: wire_usage
+                    .prompt_tokens_details
+                    .map(|details| details.cached_tokens)
+                    .unwrap_or(0),
+                // OpenAI's wire shape has no cache-write concept at all.
+                cache_write_tokens: 0,
+            })
+            .unwrap_or_default();
         let choice = parsed
             .choices
             .into_iter()
             .next()
             .ok_or(ProviderError::EmptyResponse)?;
 
-        Ok(wire_to_message(choice.message))
+        Ok((wire_to_message(choice.message), usage))
     }
 }
