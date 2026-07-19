@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use rokr_core::Provider;
+
 const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>]";
 
 /// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
@@ -181,12 +183,40 @@ async fn main() -> ExitCode {
                     let write = rokr_tools::write::WriteTool;
                     let edit = rokr_tools::edit::EditTool;
                     let webfetch = rokr_tools::webfetch::WebfetchTool;
-                    let tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
-                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
-                        AgentTier::Build => vec![
-                            &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
-                        ],
+
+                    // Ticket 28 (websearch-tool): `websearch` needs an
+                    // actual `rokr_tools::websearch::NativeSearchCapability`
+                    // object to delegate to — `provider.native_search_capable()`
+                    // alone is just a thin bool signal (see that method's
+                    // doc comment on why `rokr-core` can't hand back more
+                    // than that). No adapter in this codebase constructs a
+                    // real capability object yet (`rokr-provider` doesn't
+                    // depend on `rokr-tools`, and bridging a real
+                    // Anthropic-backed capability through here is out of
+                    // scope for this ticket), so `native_search_capability`
+                    // is provably `None` today. The `native_search_capable()`
+                    // query below is still real, not hardcoded, so a
+                    // follow-up ticket that supplies a genuine capability
+                    // object lights `websearch` up without touching this
+                    // gating logic again.
+                    let native_search_capability: Option<
+                        Arc<dyn rokr_tools::websearch::NativeSearchCapability>,
+                    > = None;
+                    let websearch = if provider.native_search_capable() {
+                        rokr_tools::websearch::for_capability(native_search_capability)
+                    } else {
+                        None
                     };
+
+                    let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
+                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
+                        AgentTier::Build => {
+                            vec![&read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch]
+                        }
+                    };
+                    if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
+                        tools.push(websearch);
+                    }
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
