@@ -13,6 +13,7 @@ pub mod glob;
 pub mod grep;
 pub mod ls;
 pub mod read;
+pub mod repo_map;
 pub mod write;
 
 /// Errors returned while executing or previewing a [`Tool`].

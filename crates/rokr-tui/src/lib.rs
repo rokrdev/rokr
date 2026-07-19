@@ -253,20 +253,28 @@ fn install_panic_hook() {
 /// stdout isn't a terminal, rather than corrupting non-interactive output.
 ///
 /// `submit` is called with the prompt text and a [`PermissionHandle`]
-/// whenever the user presses Enter on a non-empty prompt; it is
-/// deliberately generic (rather than depending on `rokr-core`/
-/// `rokr-provider` types) so this crate stays decoupled from the message
-/// model and provider abstraction — the caller (typically `rokr`'s
+/// whenever the user presses Enter on a non-empty prompt that does not
+/// start with `/`; it is deliberately generic (rather than depending on
+/// `rokr-core`/`rokr-provider` types) so this crate stays decoupled from the
+/// message model and provider abstraction — the caller (typically `rokr`'s
 /// `main.rs`) wires those in, bridging its own permission-request type to
 /// [`PermissionRequest`] via the handle. The call runs on a spawned tokio
 /// task so the blocking crossterm event loop never stalls waiting on it;
 /// [`AppState::pending`] reflects the in-flight state in the meantime, and
 /// [`AppState::permission_request`] reflects a gated tool call awaiting the
 /// user's decision mid-`submit`.
-pub async fn run<F, Fut>(submit: F) -> Result<(), TuiError>
+///
+/// `command` is called instead of `submit` (see [`route_input`]) whenever
+/// the prompt text starts with `/`; it has no `PermissionHandle` since
+/// rokr-tui doesn't know what any given command means — `main.rs` interprets
+/// literal command strings like `/compact`. Its resolved `String` is
+/// displayed the same way a `submit` reply is.
+pub async fn run<F, Fut, C, Fut2>(submit: F, command: C) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
+    C: Fn(String) -> Fut2 + Send + Sync + 'static,
+    Fut2: Future<Output = String> + Send + 'static,
 {
     if !io::stdout().is_terminal() {
         return Err(TuiError::NotATty);
@@ -274,15 +282,21 @@ where
 
     let handle = tokio::runtime::Handle::current();
 
-    tokio::task::spawn_blocking(move || run_blocking(handle, submit))
+    tokio::task::spawn_blocking(move || run_blocking(handle, submit, command))
         .await
         .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
-fn run_blocking<F, Fut>(handle: tokio::runtime::Handle, submit: F) -> Result<(), TuiError>
+fn run_blocking<F, Fut, C, Fut2>(
+    handle: tokio::runtime::Handle,
+    submit: F,
+    command: C,
+) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
+    C: Fn(String) -> Fut2 + Send + Sync + 'static,
+    Fut2: Future<Output = String> + Send + 'static,
 {
     install_panic_hook();
     let _guard = TerminalGuard::enter()?;
@@ -291,18 +305,21 @@ where
     let mut terminal = Terminal::new(backend)?;
     let mut state = AppState::default();
 
-    event_loop(&mut terminal, &mut state, &handle, &submit)
+    event_loop(&mut terminal, &mut state, &handle, &submit, &command)
 }
 
-fn event_loop<F, Fut>(
+fn event_loop<F, Fut, C, Fut2>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
     handle: &tokio::runtime::Handle,
     submit: &F,
+    command: &C,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
+    C: Fn(String) -> Fut2 + Send + Sync + 'static,
+    Fut2: Future<Output = String> + Send + 'static,
 {
     // Carries the outcome of a spawned `submit` call back into the blocking
     // event loop without blocking it: each iteration does a non-blocking
@@ -399,15 +416,27 @@ where
                             state.pending = true;
                             dirty = true;
 
-                            let permission = PermissionHandle {
-                                tx: perm_tx.clone(),
-                            };
-                            let submit_fut = submit(input, permission);
-                            let tx = tx.clone();
-                            handle.spawn(async move {
-                                let outcome = submit_fut.await;
-                                let _ = tx.send(outcome);
-                            });
+                            match route_input(input) {
+                                InputRoute::Submit(input) => {
+                                    let permission = PermissionHandle {
+                                        tx: perm_tx.clone(),
+                                    };
+                                    let submit_fut = submit(input, permission);
+                                    let tx = tx.clone();
+                                    handle.spawn(async move {
+                                        let outcome = submit_fut.await;
+                                        let _ = tx.send(outcome);
+                                    });
+                                }
+                                InputRoute::Command(input) => {
+                                    let command_fut = command(input);
+                                    let tx = tx.clone();
+                                    handle.spawn(async move {
+                                        let outcome = command_fut.await;
+                                        let _ = tx.send(Ok(outcome));
+                                    });
+                                }
+                            }
                         }
                         KeyCode::Char(c) => {
                             state.prompt_input.push(c);
@@ -465,6 +494,28 @@ fn handle_permission_key(code: KeyCode, modifiers: KeyModifiers) -> PermissionKe
         KeyCode::Char('y') => PermissionKeyAction::Allow,
         KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => PermissionKeyAction::Deny,
         _ => PermissionKeyAction::Ignore,
+    }
+}
+
+/// How a line of submitted prompt input should be routed on Enter:
+/// slash-prefixed input goes to the `command` callback (rokr-tui stays
+/// unaware of what any specific command means — `main.rs` interprets
+/// `/compact` etc.), everything else goes through the normal `submit` path
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputRoute {
+    Command(String),
+    Submit(String),
+}
+
+/// Classifies `input` for [`InputRoute`]. Extracted as a pure function so
+/// it's unit-testable without driving a live `Terminal`/event loop, mirroring
+/// `should_quit`/`handle_permission_key`.
+fn route_input(input: String) -> InputRoute {
+    if input.starts_with('/') {
+        InputRoute::Command(input)
+    } else {
+        InputRoute::Submit(input)
     }
 }
 
@@ -656,6 +707,14 @@ mod tests {
         assert_eq!(
             handle_permission_key(KeyCode::Char('x'), KeyModifiers::NONE),
             PermissionKeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn input_starting_with_slash_is_routed_to_command_handler_not_normal_submit() {
+        assert_eq!(
+            route_input("/compact".to_string()),
+            InputRoute::Command("/compact".to_string())
         );
     }
 }
