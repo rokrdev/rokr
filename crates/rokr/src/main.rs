@@ -1399,8 +1399,8 @@ async fn handle_resume_command(
 /// been submitted yet (`turn_index == 0`), this is an error, not a
 /// mutation.
 ///
-/// PRD decision 4: restores every captured pre-image at turn indices >= the
-/// target, in reverse-chronological order, via
+/// PRD decision 4: restores every captured pre-image at turn indices
+/// strictly greater than the target turn, in reverse-chronological order, via
 /// `CheckpointStore::rollback_to`; appends a `Rollback` record; then
 /// truncates the running in-memory transcript to the target turn's
 /// boundary by re-reading and re-folding the session's own log (now
@@ -1467,6 +1467,17 @@ async fn handle_rollback_command(
         return "cannot roll back: no session is currently active".to_string();
     };
     let session_id = active_handle.session_id().to_string();
+
+    // F-012 (re-review, phase-5): flush the active writer BEFORE reading the
+    // last compaction boundary below. `append_compaction`/`append_rollback`
+    // are fire-and-forget onto an async mpsc writer task, so a `Compaction`
+    // record enqueued earlier in THIS session (a `/compact` the user just ran,
+    // or an auto-compaction from the turn that just completed) may still be
+    // sitting unflushed in the channel when `last_compaction_replaced_through`
+    // reads the file. Without this flush the guard's disk read can miss that
+    // record and let `/rollback` proceed into territory a soon-to-land
+    // Compaction was about to summarize away -- defeating the guard entirely.
+    active_handle.flush().await;
 
     // RULING 3 (architect ruling, phase-5): rolling back INTO or BEFORE
     // compacted territory is a hard refusal -- the summarized-away turns
@@ -2382,6 +2393,107 @@ mod tests {
         assert_eq!(
             log_before, log_after,
             "a refused rollback must append no Rollback record (log byte-identical)"
+        );
+    }
+
+    /// F-012 (re-review, phase-5-session-management): the compaction-boundary
+    /// guard must also refuse when the last `Compaction` record is still
+    /// sitting UNFLUSHED in the writer channel -- e.g. a `/compact` or an
+    /// auto-compaction from the just-completed turn whose `append_compaction`
+    /// has been enqueued (fire-and-forget) but not yet drained to disk when
+    /// `/rollback` runs in the same session. Unlike
+    /// `rollback_command_refuses_target_at_or_before_last_compaction_without_mutating`,
+    /// which flushes the compaction to disk BEFORE invoking the handler (so the
+    /// guard's disk read trivially sees it), this test flushes ONLY the turns
+    /// and leaves the final `append_compaction` enqueued-but-unflushed. Unless
+    /// the handler flushes the active writer BEFORE reading
+    /// `last_compaction_replaced_through`, the guard's disk read misses the
+    /// queued record and the rollback wrongly proceeds into summarized
+    /// territory -- so this test fails against the pre-fix ordering.
+    #[tokio::test]
+    async fn rollback_command_refuses_when_compaction_enqueued_but_not_yet_flushed() {
+        let dir = unique_temp_dir("rollback-compaction-unflushed");
+        let store = rokr_session::SessionStore::open(&dir);
+        let handle = store.create_session().expect("create_session should succeed");
+        let session_id = handle.session_id().to_string();
+        handle.append_header(
+            2,
+            session_id.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/guard".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        // Three turns (indices 0,1,2), then a compaction summarizing through
+        // turn 1 (retaining tail turn 2).
+        for i in 0..3usize {
+            handle.append_turn(
+                vec![Message::user_text(format!("turn {i}"))],
+                UsageRecord {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                format!("2026-07-20T00:00:0{i}Z"),
+            );
+        }
+        // Flush ONLY the turns to disk; then enqueue the Compaction record but
+        // deliberately do NOT flush it -- it stays fire-and-forget in the
+        // writer channel, exactly the state a just-run /compact or an
+        // auto-compaction from the turn that just completed leaves behind when
+        // /rollback is invoked in the same session before the writer drains.
+        handle.flush().await;
+        handle.append_compaction("summary through turn 1".to_string(), 1);
+
+        let transcript = tokio::sync::Mutex::new(vec![Message::user_text("live transcript")]);
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(handle)));
+        let last_known_usage = std::sync::Mutex::new(None);
+        let turn_index = std::sync::Mutex::new(3usize);
+
+        const EXPECTED: &str =
+            "cannot roll back past the last compaction — earlier turns were summarized";
+
+        for target in ["1", "0"] {
+            let reply = handle_rollback_command(
+                &dir,
+                &store,
+                &transcript,
+                &session_handle,
+                &last_known_usage,
+                &turn_index,
+                target,
+            )
+            .await;
+            assert_eq!(
+                reply, EXPECTED,
+                "expected the exact refusal message for target {target:?} even though the \
+                 Compaction record was still unflushed when the guard ran"
+            );
+        }
+
+        // No mutation: transcript and turn_index untouched. Once the writer is
+        // fully drained, the log must carry the Compaction record (the guard's
+        // own flush made it durable) but NO Rollback record -- a refused
+        // rollback appends nothing.
+        assert_eq!(
+            transcript.lock().await.as_slice(),
+            &[Message::user_text("live transcript")],
+            "a refused rollback must not mutate the transcript"
+        );
+        assert_eq!(*turn_index.lock().unwrap(), 3, "turn_index must be untouched");
+        session_handle.read().await.as_ref().unwrap().flush().await;
+        let log_after =
+            std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
+                .expect("session.jsonl should exist");
+        assert!(
+            log_after.contains(r#""type":"Compaction""#),
+            "the Compaction record must be durable after the guard flushes it"
+        );
+        assert!(
+            !log_after.contains(r#""type":"Rollback""#),
+            "a refused rollback must append no Rollback record"
         );
     }
 
