@@ -240,6 +240,16 @@ impl SessionHandle {
         });
     }
 
+    /// Enqueues a `Rollback` record. Intended to be called once per
+    /// `/rollback [turn]` command (ticket 39, rollback-command), AFTER
+    /// `CheckpointStore::rollback_to` has already restored pre-images on
+    /// disk -- the log stays append-only (this never rewrites an earlier
+    /// line); `fold`'s existing `Rollback` handling (ticket 33) is what
+    /// makes a later resume/jump replay the truncated transcript correctly.
+    pub fn append_rollback(&self, target: usize) {
+        self.enqueue(SessionRecord::Rollback { target });
+    }
+
     fn enqueue(&self, record: SessionRecord) {
         // The writer task's receiver only disappears when the task itself
         // is gone (e.g. process shutdown mid-write) -- a dropped send here
@@ -536,15 +546,39 @@ impl SessionStore {
 /// point in `crates/rokr/src/main.rs`).
 pub struct CheckpointStore {
     snapshots_dir: PathBuf,
+    /// Ticket 39 (rollback-command): `snapshot_id`'s sanitized-path
+    /// component is lossy (every non-alphanumeric char, including path
+    /// separators, collapses to `_`), so the real path can't be recovered
+    /// from `snapshot_id` alone -- this append-only manifest (one JSON line
+    /// per newly-captured snapshot) is where the real path survives, so
+    /// `rollback_to` can look it up. Deliberately lives OUTSIDE
+    /// `snapshots_dir` (a sibling of `session.jsonl`, not inside
+    /// `snapshots/`) so it doesn't disturb ticket 38's existing "exactly
+    /// one file under snapshots/ after one capture" test assertions.
+    manifest_path: PathBuf,
+}
+
+/// One line of `CheckpointStore`'s path manifest (ticket 39,
+/// rollback-command) -- correlates a `snapshot_id` (as also embedded in a
+/// `Checkpoint` record) with the real, un-sanitized path it was captured
+/// from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotPathEntry {
+    snapshot_id: String,
+    path: String,
 }
 
 impl CheckpointStore {
     /// `data_dir` is the same already-resolved central data directory
     /// [`SessionStore::open`] takes; snapshots for `session_id` live under
-    /// `data_dir/sessions/<session_id>/snapshots/`.
+    /// `data_dir/sessions/<session_id>/snapshots/`, and the path manifest
+    /// (ticket 39) lives alongside them at
+    /// `data_dir/sessions/<session_id>/snapshot_paths.jsonl`.
     pub fn open(data_dir: impl Into<PathBuf>, session_id: &str) -> Self {
+        let session_dir = data_dir.into().join("sessions").join(session_id);
         Self {
-            snapshots_dir: data_dir.into().join("sessions").join(session_id).join("snapshots"),
+            snapshots_dir: session_dir.join("snapshots"),
+            manifest_path: session_dir.join("snapshot_paths.jsonl"),
         }
     }
 
@@ -582,6 +616,11 @@ impl CheckpointStore {
     /// ever coexisting for the same snapshot_id (e.g. a brand-new-file
     /// write followed by a second write to the same now-existing path
     /// within the same turn).
+    ///
+    /// Ticket 39 (rollback-command): also appends a `SnapshotPathEntry` line
+    /// to this session's path manifest on the SAME first-write-wins
+    /// condition (never for a no-op repeat call), so `rollback_to` can later
+    /// recover the real path this snapshot_id was captured from.
     pub fn snapshot(
         &self,
         turn_index: usize,
@@ -598,6 +637,20 @@ impl CheckpointStore {
             return Ok((snapshot_id, false));
         }
 
+        {
+            use std::io::Write;
+            let manifest_line = serde_json::to_string(&SnapshotPathEntry {
+                snapshot_id: snapshot_id.clone(),
+                path: path.to_string(),
+            })
+            .expect("serializing SnapshotPathEntry never fails");
+            let mut manifest_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.manifest_path)?;
+            writeln!(manifest_file, "{manifest_line}")?;
+        }
+
         match old_content {
             Some(content) => {
                 std::fs::write(content_path, content)?;
@@ -608,6 +661,66 @@ impl CheckpointStore {
         }
 
         Ok((snapshot_id, true))
+    }
+
+    /// Ticket 39 (rollback-command), PRD decision 4: restores every
+    /// captured pre-image at turn indices >= `target_turn`, in
+    /// reverse-chronological order (highest turn_index first), so that for
+    /// a path snapshotted at multiple qualifying turns the FINAL restored
+    /// content on disk is the EARLIEST one (closest to `target_turn`) --
+    /// the state the path was in right before `target_turn`'s own mutation
+    /// ran. A snapshot captured with no pre-image (a `.absent` marker -- a
+    /// brand-new file at capture time) deletes the path instead of writing
+    /// content (a missing path at delete time is not an error -- it may
+    /// already be gone). Returns the distinct, sorted set of paths actually
+    /// touched. `Ok(Vec::new())` if this session has no path manifest yet
+    /// (no write/edit tool call was ever checkpointed).
+    pub fn rollback_to(&self, target_turn: usize) -> std::io::Result<Vec<String>> {
+        let contents = match std::fs::read_to_string(&self.manifest_path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        let mut entries: Vec<(usize, SnapshotPathEntry)> = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<SnapshotPathEntry>(line).ok())
+            .filter_map(|entry| {
+                Self::parse_turn_index(&entry.snapshot_id).map(|turn_index| (turn_index, entry))
+            })
+            .filter(|(turn_index, _)| *turn_index >= target_turn)
+            .collect();
+
+        // Reverse-chronological: highest turn_index restored first, so a
+        // lower turn_index restore for the SAME path (applied later in this
+        // loop) overwrites it and is the final state left on disk -- the
+        // pre-image closest to target_turn.
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut touched = std::collections::BTreeSet::new();
+        for (_, entry) in &entries {
+            let content_path = self.snapshots_dir.join(&entry.snapshot_id);
+            let absent_marker_path =
+                self.snapshots_dir.join(format!("{}.absent", entry.snapshot_id));
+
+            if absent_marker_path.exists() {
+                match std::fs::remove_file(&entry.path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+            } else {
+                let content = std::fs::read_to_string(&content_path)?;
+                if let Some(parent) = std::path::Path::new(&entry.path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&entry.path, content)?;
+            }
+            touched.insert(entry.path.clone());
+        }
+
+        Ok(touched.into_iter().collect())
     }
 
     /// Deterministically derives a filesystem-safe snapshot id from
@@ -623,6 +736,18 @@ impl CheckpointStore {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         format!("t{turn_index}-{sanitized_path}")
+    }
+
+    /// Ticket 39 (rollback-command): parses the leading `turn_index` back
+    /// out of a `t{turn_index}-...` snapshot_id. The sanitized path suffix
+    /// never contains a literal `-` (sanitization maps every
+    /// non-alphanumeric character, including `-`, to `_`), so the FIRST `-`
+    /// after the `t` prefix is always exactly the turn_index/path
+    /// separator.
+    fn parse_turn_index(snapshot_id: &str) -> Option<usize> {
+        let rest = snapshot_id.strip_prefix('t')?;
+        let (digits, _) = rest.split_once('-')?;
+        digits.parse().ok()
     }
 }
 
@@ -1576,6 +1701,83 @@ mod tests {
         assert!(
             !snapshots_dir.join(&first_snapshot).exists(),
             "no content file must coexist with the absent marker for the same snapshot_id"
+        );
+    }
+
+    /// Ticket 39 (rollback-command): `CheckpointStore::rollback_to(target)`
+    /// restores every captured pre-image at turn indices >= `target`, in
+    /// reverse-chronological order, so that for a path snapshotted at
+    /// multiple qualifying turns the FINAL on-disk content is the EARLIEST
+    /// one (closest to `target`) -- proves this against four real files on
+    /// disk: one snapshotted at three turns spanning the target (must land
+    /// on the closest-to-target content), one snapshotted only at a turn
+    /// before the target (must be left untouched), one snapshotted at a
+    /// turn at-or-after the target with an ABSENT pre-image (must be
+    /// deleted), and one snapshotted only at a turn before the target as a
+    /// second untouched control. Also asserts the returned touched-paths
+    /// set is exactly the two paths actually restored.
+    #[test]
+    fn rollback_to_restores_pre_images_at_or_after_target_turn_in_reverse_order() {
+        let dir = unique_temp_dir("rollback-to");
+        let store = CheckpointStore::open(&dir, "sess-rollback-1");
+
+        let path_a = dir.join("a.txt").to_string_lossy().into_owned();
+        let path_b = dir.join("b.txt").to_string_lossy().into_owned();
+        let path_c = dir.join("c.txt").to_string_lossy().into_owned();
+        let path_d = dir.join("d.txt").to_string_lossy().into_owned();
+
+        // path_a: mutated at turns 0, 2, and 4 -- target is 2, so only the
+        // turn-2 and turn-4 pre-images qualify, and the turn-2 one (closest
+        // to target) must be the one that survives on disk.
+        store.snapshot(0, &path_a, Some("a-pre-turn0")).unwrap();
+        store.snapshot(2, &path_a, Some("a-pre-turn2")).unwrap();
+        store.snapshot(4, &path_a, Some("a-pre-turn4")).unwrap();
+        std::fs::write(&path_a, "a-current-post-turn4").unwrap();
+
+        // path_b: mutated only at turn 1, which is BEFORE target -- must be
+        // left completely untouched by rollback_to(2).
+        store.snapshot(1, &path_b, Some("b-pre-turn1")).unwrap();
+        std::fs::write(&path_b, "b-current-post-turn1").unwrap();
+
+        // path_c: a brand-new file created at turn 3 (>= target) -- its
+        // pre-image is "absent", so rollback must DELETE it.
+        store.snapshot(3, &path_c, None).unwrap();
+        std::fs::write(&path_c, "c-current-post-turn3").unwrap();
+
+        // path_d: mutated only at turn 0, BEFORE target -- second untouched
+        // control, proving the "before target" exclusion isn't a fluke of
+        // path_b alone.
+        store.snapshot(0, &path_d, Some("d-pre-turn0")).unwrap();
+        std::fs::write(&path_d, "d-current-post-turn0").unwrap();
+
+        let mut touched = store.rollback_to(2).expect("rollback_to should succeed");
+        touched.sort();
+
+        assert_eq!(
+            std::fs::read_to_string(&path_a).unwrap(),
+            "a-pre-turn2",
+            "expected path_a to land on its turn-2 pre-image (closest to target), not turn-4's"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path_b).unwrap(),
+            "b-current-post-turn1",
+            "expected path_b (only touched before target) to be left untouched"
+        );
+        assert!(
+            !std::path::Path::new(&path_c).exists(),
+            "expected path_c (absent pre-image at or after target) to be deleted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path_d).unwrap(),
+            "d-current-post-turn0",
+            "expected path_d (only touched before target) to be left untouched"
+        );
+
+        let mut expected_touched = vec![path_a.clone(), path_c.clone()];
+        expected_touched.sort();
+        assert_eq!(
+            touched, expected_touched,
+            "expected rollback_to to report exactly the paths it actually restored"
         );
     }
 

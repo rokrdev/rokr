@@ -3381,6 +3381,510 @@ async fn write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_reco
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// Ticket 39 (rollback-command) acceptance test: `/rollback [turn]` restores
+/// every file snapshot captured at or after the target turn index to its
+/// pre-image content (verified against the real filesystem), truncates the
+/// running transcript to that turn's boundary (verified by inspecting the
+/// NEXT turn's actual outgoing request body via
+/// `mock_server.received_requests()`, mirroring
+/// `auto_compaction_triggers_once_usage_crosses_threshold_and_preserves_recent_turn`'s
+/// exact technique for proving transcript content), and appends a
+/// `SessionRecord::Rollback` record to `session.jsonl`. Three turns are
+/// scripted: turn 0 and turn 1 each perform an ACCEPTED `write` tool call
+/// against the same real temp file (mirroring
+/// `write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_record`'s
+/// exact write/diff/accept PTY sequence), and turn 2 is a plain
+/// tool-call-free chat turn. `/rollback 1` should then restore the file to
+/// turn 1's pre-image (the state right before turn 1's write ran, i.e.
+/// turn 0's post-write content) and truncate the transcript back to
+/// turn_index <= 1, discarding turn 2. A fourth turn is submitted
+/// afterward to inspect what actually goes out on the wire.
+#[tokio::test]
+async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let temp_dir = unique_temp_dir("rollback-command-target");
+    let target_file = temp_dir.join("rollback-target.txt");
+    let initial_content = "rollbackpreimagebeforeanywrite";
+    let turn0_content = "rollbackcontentafterturnzero";
+    let turn1_content = "rollbackcontentafterturnone";
+    std::fs::write(&target_file, initial_content).unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    let turn0_reply_text = "FinalReplyTurnZeroForRollbackTest";
+    let turn1_reply_text = "FinalReplyTurnOneForRollbackTest";
+    let turn2_reply_text = "FinalReplyTurnTwoForRollbackTest";
+    let turn3_reply_text = "FinalReplyTurnThreeForRollbackTest";
+
+    // Turn 0: the model writes turn0_content over the initial file content.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rollback-turn0-toolcall",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_turn0",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": turn0_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rollback-turn0-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn0_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Turn 1: the model writes turn1_content over turn0_content.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rollback-turn1-toolcall",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_turn1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": turn1_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rollback-turn1-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn1_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Turn 2: a plain, tool-call-free chat turn -- this is the turn
+    // `/rollback 1` must discard from the transcript.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rollback-turn2",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn2_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Turn 3 (post-rollback): catch-all, uncapped.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-rollback-turn3",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn3_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-rollback-command");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-rollback-command");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-rollback-command");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Turn 0: write, wait for the diff, accept.
+    writer
+        .write_all(b"turnzerowriteprompt\r")
+        .expect("failed to write turn0 prompt to pty");
+    let turn0_diff_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn0_diff_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("-rollbackpreimagebeforeanywrite")
+            && output.contains("+rollbackcontentafterturnzero")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("-rollbackpreimagebeforeanywrite"),
+        "expected pty output to contain turn 0's diff, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write turn0 accept keypress to pty");
+
+    let turn0_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn0_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn0_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn0_reply_text),
+        "expected pty output to contain turn 0's final reply, got: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn0_content,
+        "expected the file to have been written with turn 0's content after accepting"
+    );
+
+    // Turn 1: write again, wait for the diff, accept.
+    writer
+        .write_all(b"turnonewriteprompt\r")
+        .expect("failed to write turn1 prompt to pty");
+    let turn1_diff_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_diff_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("-rollbackcontentafterturnzero")
+            && output.contains("+rollbackcontentafterturnone")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("-rollbackcontentafterturnzero"),
+        "expected pty output to contain turn 1's diff, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write turn1 accept keypress to pty");
+
+    let turn1_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn1_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn1_reply_text),
+        "expected pty output to contain turn 1's final reply, got: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn1_content,
+        "expected the file to have been written with turn 1's content after accepting"
+    );
+
+    // Turn 2: a plain chat turn with no tool call -- this is the turn
+    // rollback must discard.
+    writer
+        .write_all(b"turntwochatprompt\r")
+        .expect("failed to write turn2 prompt to pty");
+    let turn2_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn2_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn2_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn2_reply_text),
+        "expected pty output to contain turn 2's final reply, got: {output:?}"
+    );
+
+    // Roll back to turn 1: should restore the file to turn 1's pre-image
+    // (turn 0's post-write content) and truncate the transcript to discard
+    // turn 2.
+    writer
+        .write_all(b"/rollback 1\r")
+        .expect("failed to write /rollback command to pty");
+    let rollback_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < rollback_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Rolled") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Rolled"),
+        "expected pty output to contain a rollback confirmation, got: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn0_content,
+        "expected the file to be restored to turn 1's pre-image (turn 0's post-write content) \
+         after rolling back to turn 1"
+    );
+
+    // Turn 3 (post-rollback): submitted so its OUTGOING request body can be
+    // inspected for whether turn 2 was actually discarded from the running
+    // transcript.
+    writer
+        .write_all(b"turnthreechatprompt\r")
+        .expect("failed to write turn3 prompt to pty");
+    let turn3_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn3_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn3_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn3_reply_text),
+        "expected pty output to contain turn 3's final reply, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    // (1) Filesystem proof.
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn0_content,
+        "expected the file's final on-disk content (after process exit) to still be turn 1's \
+         pre-image"
+    );
+
+    // (2) session.jsonl proof: exactly one Rollback { target: 1 } record.
+    let sessions_dir = xdg_data_home.join("rokr").join("sessions");
+    let session_dir_entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&sessions_dir)
+        .unwrap_or_else(|err| {
+            panic!("expected sessions directory to exist at {sessions_dir:?}, got error: {err:?}")
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert_eq!(
+        session_dir_entries.len(),
+        1,
+        "expected exactly one ULID-named session directory under {sessions_dir:?}, got: {:?}",
+        session_dir_entries
+            .iter()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    );
+    let session_dir = session_dir_entries[0].path();
+    let session_jsonl_contents = std::fs::read_to_string(session_dir.join("session.jsonl"))
+        .expect("failed to read session.jsonl contents");
+    let rollback_records: Vec<rokr_session::SessionRecord> = session_jsonl_contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+        .filter(|record| matches!(record, rokr_session::SessionRecord::Rollback { .. }))
+        .collect();
+    assert_eq!(
+        rollback_records.len(),
+        1,
+        "expected exactly one Rollback record in session.jsonl, got: {rollback_records:?}"
+    );
+    match &rollback_records[0] {
+        rokr_session::SessionRecord::Rollback { target } => {
+            assert_eq!(*target, 1, "expected the Rollback record's target to be 1");
+        }
+        other => panic!("expected a Rollback record, got: {other:?}"),
+    }
+
+    // (3) Transcript-truncation proof: turn 3's actual outgoing request
+    // body must still contain turns 0 and 1's prompts, but must NOT contain
+    // turn 2's prompt.
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+    assert!(
+        received_requests.len() >= 6,
+        "expected at least 6 requests to /chat/completions (2 for turn0, 2 for turn1, 1 for \
+         turn2, 1 for turn3), got {}: {received_requests:?}",
+        received_requests.len()
+    );
+    let turn3_body =
+        String::from_utf8_lossy(&received_requests[received_requests.len() - 1].body)
+            .into_owned();
+    assert!(
+        turn3_body.contains("turnzerowriteprompt"),
+        "expected turn 3's request body to still contain turn 0's prompt (kept by rollback to \
+         target 1), got: {turn3_body}"
+    );
+    assert!(
+        turn3_body.contains("turnonewriteprompt"),
+        "expected turn 3's request body to still contain turn 1's prompt (kept by rollback to \
+         target 1), got: {turn3_body}"
+    );
+    assert!(
+        !turn3_body.contains("turntwochatprompt"),
+        "expected turn 3's request body to have turn 2's prompt discarded by rollback to \
+         target 1, got: {turn3_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 /// Ticket 38 (checkpoint-pre-images) deny-path regression test: a DENIED
 /// write tool call must produce NO snapshot file and NO Checkpoint record --
 /// mirrors `bash_tool_call_skips_execution_on_reject`'s reject-keypress

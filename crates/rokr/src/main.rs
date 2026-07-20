@@ -421,6 +421,11 @@ async fn main() -> ExitCode {
             let command_cwd = cwd.clone();
             let command_repo_map = repo_map.clone();
             let command_store = store.clone();
+            // Ticket 39 (rollback-command): `/rollback`'s handler in
+            // `command` below needs its own clone of `data_dir` to build a
+            // `CheckpointStore` for whichever session is currently active,
+            // mirroring `submit`'s own `data_dir` clone.
+            let command_data_dir = data_dir.clone();
             // Ticket 38 (checkpoint-pre-images): `/resume <id> --yes` in
             // `command` below repoints the active session writer, and must
             // re-seed `turn_index` to the TARGET session's real prior `Turn`
@@ -792,6 +797,7 @@ async fn main() -> ExitCode {
                 let session_handle = command_session_handle.clone();
                 let last_known_usage = command_last_known_usage.clone();
                 let turn_index = command_turn_index.clone();
+                let data_dir = command_data_dir.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
@@ -814,6 +820,29 @@ async fn main() -> ExitCode {
                     // delegates to, same shape as `/model <name>` above.
                     if let Some(arg) = input.strip_prefix("/resume ") {
                         return handle_resume_command(
+                            &store,
+                            &transcript,
+                            &session_handle,
+                            &last_known_usage,
+                            &turn_index,
+                            arg,
+                        )
+                        .await;
+                    }
+
+                    // Ticket 39 (rollback-command): `/rollback` (bare, uses
+                    // a sensible default target) and `/rollback <turn>`
+                    // both start with this prefix -- everything after it
+                    // (trimmed) is the target turn argument, delegated to
+                    // `handle_rollback_command`, mirroring the `/resume `
+                    // seam immediately above. Matched via `==`/`starts_with`
+                    // rather than `strip_prefix("/rollback ")` (unlike
+                    // `/resume`) specifically so the BARE `/rollback` (no
+                    // trailing space, no argument) is also routed here.
+                    if input == "/rollback" || input.starts_with("/rollback ") {
+                        let arg = input.strip_prefix("/rollback").unwrap_or("").trim();
+                        return handle_rollback_command(
+                            &data_dir,
                             &store,
                             &transcript,
                             &session_handle,
@@ -1165,6 +1194,107 @@ async fn handle_resume_command(
     *session_handle.write().await = Some(new_handle);
 
     format!("Resumed {target_id}; continuing from its context")
+}
+
+/// Ticket 39 (rollback-command): the decision + mutation logic behind
+/// `/rollback [turn]`. Mirrors `handle_resume_command`'s shape -- kept as
+/// its own testable async fn so its branches can be exercised directly
+/// against a real `SessionStore`/`CheckpointStore` and real temp-dir
+/// fixtures without a full PTY round-trip for every case.
+///
+/// `arg` is everything after `/rollback` trimmed (may be empty for the bare
+/// `/rollback` command). An empty `arg` defaults to `turn_index - 1` -- the
+/// most recently submitted turn ("undo the last turn"); if no turns have
+/// been submitted yet (`turn_index == 0`), this is an error, not a
+/// mutation.
+///
+/// PRD decision 4: restores every captured pre-image at turn indices >= the
+/// target, in reverse-chronological order, via
+/// `CheckpointStore::rollback_to`; appends a `Rollback` record; then
+/// truncates the running in-memory transcript to the target turn's
+/// boundary by re-reading and re-folding the session's own log (now
+/// including the just-appended `Rollback` record) via
+/// `store.resume_session` -- the SAME mechanism `handle_resume_command`'s
+/// `--yes` path already uses to swap in a session's folded transcript,
+/// reused here rather than reimplemented, since `fold`'s `Rollback`
+/// handling (ticket 33) already IS "truncate the working output to
+/// turn_index <= target". `last_known_usage` is restored from that same
+/// re-fold, consistent with the truncated transcript.
+///
+/// `turn_index` itself is deliberately left untouched -- per `fold`'s own
+/// doc comment, a `Rollback` record does not rewind `next_turn_index`, so a
+/// later genuinely-new turn keeps incrementing from where it left off
+/// (matching `resume_session`'s replay of a post-rollback log, which
+/// assigns the next NEW `Turn` record the next sequential index regardless
+/// of the intervening `Rollback` record).
+///
+/// Validates `arg` before any mutation: a non-numeric target, or a target
+/// that isn't a real prior turn (`>= turn_index`, the count of turns
+/// submitted so far), returns an error string and touches nothing. Also a
+/// no-op (returns an error string, no mutation) if no session is currently
+/// active, matching `capture_checkpoint_if_granted_diff`'s degraded-startup
+/// handling elsewhere in this file.
+async fn handle_rollback_command(
+    data_dir: &std::path::Path,
+    store: &rokr_session::SessionStore,
+    transcript: &tokio::sync::Mutex<Vec<rokr_core::Message>>,
+    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
+    last_known_usage: &std::sync::Mutex<Option<rokr_core::Usage>>,
+    turn_index: &std::sync::Mutex<usize>,
+    arg: &str,
+) -> String {
+    let current_turn_index = *turn_index.lock().unwrap();
+
+    let trimmed = arg.trim();
+    let target: usize = if trimmed.is_empty() {
+        match current_turn_index.checked_sub(1) {
+            Some(target) => target,
+            None => return "no turns to roll back".to_string(),
+        }
+    } else {
+        match trimmed.parse::<usize>() {
+            Ok(target) => target,
+            Err(_) => return format!("invalid turn: {trimmed:?}"),
+        }
+    };
+
+    if target >= current_turn_index {
+        return format!(
+            "turn {target} is out of range (only turns 0..{current_turn_index} exist)"
+        );
+    }
+
+    let session_handle_guard = session_handle.read().await;
+    let Some(active_handle) = session_handle_guard.as_ref() else {
+        return "cannot roll back: no session is currently active".to_string();
+    };
+    let session_id = active_handle.session_id().to_string();
+
+    let checkpoint_store = rokr_session::CheckpointStore::open(data_dir, &session_id);
+    let touched = match checkpoint_store.rollback_to(target) {
+        Ok(touched) => touched,
+        Err(err) => return format!("rollback failed, no changes applied: {err}"),
+    };
+
+    active_handle.append_rollback(target);
+    active_handle.flush().await;
+
+    let (messages, _meta, resume_state) = match store.resume_session(&session_id) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            return format!(
+                "rollback restored {} file(s) but failed to re-fold the transcript: {err}",
+                touched.len()
+            )
+        }
+    };
+    *transcript.lock().await = messages;
+    *last_known_usage.lock().unwrap() = resume_state.last_known_usage;
+
+    format!(
+        "Rolled back to turn {target}; restored {} file(s).",
+        touched.len()
+    )
 }
 
 /// Resolves the central data directory for session persistence:
