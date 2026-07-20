@@ -339,6 +339,14 @@ async fn main() -> ExitCode {
                 },
             };
 
+            // Ticket 36 (session-index-list-jump): wrapped behind a
+            // `tokio::sync::RwLock` so `/resume <id> --yes` can repoint the
+            // active session writer mid-session, mirroring how
+            // `SharedProvider`/`/model` already swap the active provider
+            // behind a lock.
+            let session_handle: Arc<tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>> =
+                Arc::new(tokio::sync::RwLock::new(session_handle));
+
             // In-memory only (no persistence beyond the session log, per
             // the PRD): accumulates every turn across submits for the
             // lifetime of the process, so each new prompt is sent with the
@@ -384,6 +392,14 @@ async fn main() -> ExitCode {
             let command_transcript = transcript.clone();
             let command_cwd = cwd.clone();
             let command_repo_map = repo_map.clone();
+            let command_store = store.clone();
+            // Ticket 36 (session-index-list-jump): `/resume <id>`'s handler
+            // in `command` below needs its own clones of the swappable
+            // `session_handle` lock and `last_known_usage`, so it can read
+            // the currently-active session id, and (on `--yes`) repoint the
+            // writer and restore the folded usage figure.
+            let command_session_handle = session_handle.clone();
+            let command_last_known_usage = last_known_usage.clone();
             // F-005: `/model`'s handler in `command` below needs its own
             // clone of `config_dir` (to resolve auth for the requested
             // backend) -- cloned here, before `submit`'s `move` closure
@@ -578,12 +594,15 @@ async fn main() -> ExitCode {
                     // acceptance test asserts -- the persisted log should
                     // show exactly what the user typed, not the expanded
                     // form that actually goes out on the wire.
-                    if let Some(session_handle) = &session_handle {
-                        session_handle.append_turn(
-                            rokr_core::Message::user_text(input.clone()),
-                            rokr_session::UsageRecord::from(usage),
-                            now_timestamp(),
-                        );
+                    {
+                        let session_handle_guard = session_handle.read().await;
+                        if let Some(session_handle) = session_handle_guard.as_ref() {
+                            session_handle.append_turn(
+                                rokr_core::Message::user_text(input.clone()),
+                                rokr_session::UsageRecord::from(usage),
+                                now_timestamp(),
+                            );
+                        }
                     }
 
                     // Auto-compaction (ticket 20): checked once per
@@ -630,6 +649,10 @@ async fn main() -> ExitCode {
                 }
             };
 
+            // Ticket 36 (session-index-list-jump): `/sessions` is added to
+            // this same match the same way ticket 29 added `/model <name>`
+            // above -- a new arm reading through `command_store`, no new
+            // dispatch mechanism.
             // Ticket 21 (manual-compact-command): rokr-tui only knows
             // "slash-prefixed input goes to `command`" (see `route_input`);
             // this closure is where a literal command string like
@@ -654,6 +677,9 @@ async fn main() -> ExitCode {
                 let transcript = command_transcript.clone();
                 let cwd = command_cwd.clone();
                 let repo_map = command_repo_map.clone();
+                let store = command_store.clone();
+                let session_handle = command_session_handle.clone();
+                let last_known_usage = command_last_known_usage.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
@@ -668,7 +694,46 @@ async fn main() -> ExitCode {
                         };
                     }
 
+                    // Ticket 36 (session-index-list-jump): `/resume <id>`
+                    // (warn-first) and `/resume <id> --yes` (confirm-and-
+                    // swap) both start with this prefix -- everything after
+                    // it (including a trailing `--yes`) is handled by
+                    // `handle_resume_command`, which this closure just
+                    // delegates to, same shape as `/model <name>` above.
+                    if let Some(arg) = input.strip_prefix("/resume ") {
+                        return handle_resume_command(
+                            &store,
+                            &transcript,
+                            &session_handle,
+                            &last_known_usage,
+                            arg,
+                        )
+                        .await;
+                    }
+
                     match input.as_str() {
+                        "/sessions" => match store.list_sessions() {
+                            Ok(entries) if entries.is_empty() => {
+                                "No prior sessions found.".to_string()
+                            }
+                            Ok(entries) => entries
+                                .iter()
+                                .map(|entry| {
+                                    format!(
+                                        "{} | {} | \"{}\" | turns={} | model={} | created={} | updated={}",
+                                        entry.session_id,
+                                        entry.project_path,
+                                        entry.title,
+                                        entry.turn_count,
+                                        entry.last_model,
+                                        entry.created_at,
+                                        entry.updated_at,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            Err(err) => format!("failed to list sessions: {err}"),
+                        },
                         "/compact" => {
                             let provider_snapshot = match &provider {
                                 Ok(lock) => lock.read().await.clone(),
@@ -773,6 +838,81 @@ fn resolve_resumed_session(
     Ok((messages, resume_state.last_known_usage, session_handle))
 }
 
+/// Ticket 36 (session-index-list-jump): the decision + mutation logic
+/// behind the in-session `/resume <id>` (warn-first) and `/resume <id>
+/// --yes` (confirm-and-swap) jump commands. Kept as its own testable async
+/// fn (mirroring `set_active_provider`'s existing pattern in this same test
+/// module) so its branches can be exercised directly against a real
+/// `SessionStore` and real temp-dir fixtures without a full PTY round-trip
+/// for every case.
+///
+/// Per the architect's scope-amendment ruling (recorded on the ticket): the
+/// swap warning is re-grounded to "target session id != current session
+/// id" rather than "a tool loop is in-flight" -- `rokr-tui`'s `command`
+/// closure has no visibility into `AppState::pending`/the prompt buffer,
+/// and extending that crate boundary was ruled out of scope. `state.pending`'s
+/// existing keystroke-drop behavior (see `rokr-tui::event_loop`) already
+/// makes `/resume` and a live tool loop mutually exclusive for free -- see
+/// the regression-guard test in `tui_test.rs`.
+///
+/// `arg` is everything after `/resume ` (e.g. `"01ABC... --yes"` or just
+/// `"01ABC..."`); this fn splits off a trailing `--yes` itself.
+async fn handle_resume_command(
+    store: &rokr_session::SessionStore,
+    transcript: &tokio::sync::Mutex<Vec<rokr_core::Message>>,
+    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
+    last_known_usage: &std::sync::Mutex<Option<rokr_core::Usage>>,
+    arg: &str,
+) -> String {
+    let (target_id, confirmed) = match arg.trim().strip_suffix("--yes") {
+        Some(id) => (id.trim(), true),
+        None => (arg.trim(), false),
+    };
+
+    let target_entry = match store.list_sessions() {
+        Ok(entries) => entries.into_iter().find(|entry| entry.session_id == target_id),
+        Err(err) => return format!("failed to look up session {target_id}: {err}"),
+    };
+    let target_entry = match target_entry {
+        Some(entry) => entry,
+        None => return format!("no such session {target_id}"),
+    };
+
+    let current_id = session_handle
+        .read()
+        .await
+        .as_ref()
+        .map(|handle| handle.session_id().to_string());
+    if current_id.as_deref() == Some(target_id) {
+        return format!("already on session {target_id}");
+    }
+
+    if !confirmed {
+        return format!(
+            "Switching to {target_id} ({}, {} turns) replaces your current context. \
+             Run '/resume {target_id} --yes' to confirm.",
+            target_entry.title, target_entry.turn_count
+        );
+    }
+
+    let (messages, _meta, resume_state) = match store.resume_session(target_id) {
+        Ok(resolved) => resolved,
+        Err(err) => return format!("failed to resume session {target_id}: {err}"),
+    };
+    let new_handle = match store.open_session(target_id.to_string()) {
+        Ok(handle) => Arc::new(handle),
+        Err(err) => {
+            return format!("failed to reopen session {target_id} for continued appends: {err}")
+        }
+    };
+
+    *transcript.lock().await = messages;
+    *last_known_usage.lock().unwrap() = resume_state.last_known_usage;
+    *session_handle.write().await = Some(new_handle);
+
+    format!("Resumed {target_id}; continuing from its context")
+}
+
 /// Resolves the central data directory for session persistence:
 /// `$XDG_DATA_HOME/rokr` if `XDG_DATA_HOME` is set and non-empty,
 /// otherwise `$HOME/.local/share/rokr`. Mirrors
@@ -850,6 +990,7 @@ async fn set_active_provider(
 mod tests {
     use super::*;
     use rokr_core::{Message, Provider, Role};
+    use rokr_session::UsageRecord;
 
     /// Serializes tests below that mutate process-global env vars
     /// (`ROKR_ANTHROPIC_*`, `ROKR_AUTH_FORCE_FILE_STORE`), mirroring the
@@ -1026,6 +1167,321 @@ mod tests {
         guard.send(&messages, &[]).await.expect(
             "the switched-to provider should be the OAuth-backed Anthropic backend hitting the \
              mock server",
+        );
+    }
+
+    /// Ticket 36 scope-amendment: `/resume <id>` reports "no such session"
+    /// for an id absent from the index, and "already on session" for the
+    /// currently active session's own id -- neither mutates the transcript.
+    #[tokio::test]
+    async fn resume_command_reports_no_such_session_and_already_on_current_without_mutating_transcript(
+    ) {
+        let dir = unique_temp_dir("resume-command-lookup");
+        let store = rokr_session::SessionStore::open(&dir);
+
+        let current_handle = store
+            .create_session()
+            .expect("create_session should succeed for the current session");
+        current_handle.append_header(
+            1,
+            current_handle.session_id().to_string(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/current".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        current_handle.flush().await;
+        let current_session_id = current_handle.session_id().to_string();
+
+        let transcript = tokio::sync::Mutex::new(vec![Message::user_text("existing turn")]);
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(current_handle)));
+        let last_known_usage = std::sync::Mutex::new(None);
+
+        let not_found_reply =
+            handle_resume_command(&store, &transcript, &session_handle, &last_known_usage, "nonexistent-session-id")
+                .await;
+        assert_eq!(not_found_reply, "no such session nonexistent-session-id");
+        assert_eq!(
+            transcript.lock().await.as_slice(),
+            &[Message::user_text("existing turn")],
+            "a not-found lookup must not mutate the transcript"
+        );
+
+        let already_on_reply = handle_resume_command(
+            &store,
+            &transcript,
+            &session_handle,
+            &last_known_usage,
+            &current_session_id,
+        )
+        .await;
+        assert_eq!(already_on_reply, format!("already on session {current_session_id}"));
+        assert_eq!(
+            transcript.lock().await.as_slice(),
+            &[Message::user_text("existing turn")],
+            "resuming the currently active session must not mutate the transcript"
+        );
+    }
+
+    /// Ticket 36 scope-amendment: `/resume <id>` (no `--yes`) against a
+    /// DIFFERENT existing session returns the warning naming the exact
+    /// confirm command, and does not mutate the transcript.
+    #[tokio::test]
+    async fn resume_command_without_confirm_flag_returns_warning_without_mutating_transcript() {
+        let dir = unique_temp_dir("resume-command-warn");
+        let store = rokr_session::SessionStore::open(&dir);
+
+        let current_handle = store
+            .create_session()
+            .expect("create_session should succeed for the current session");
+        current_handle.append_header(
+            1,
+            current_handle.session_id().to_string(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/current".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        current_handle.flush().await;
+        let current_session_id_before = current_handle.session_id().to_string();
+
+        let target_handle = store
+            .create_session()
+            .expect("create_session should succeed for the target session");
+        let target_session_id = target_handle.session_id().to_string();
+        target_handle.append_header(
+            1,
+            target_session_id.clone(),
+            "2026-07-20T01:00:00Z".to_string(),
+            "/projects/target".to_string(),
+            "plan".to_string(),
+            "openai".to_string(),
+            "gpt-test".to_string(),
+        );
+        target_handle.append_turn(
+            Message::user_text("target session first prompt"),
+            UsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            "2026-07-20T01:00:01Z".to_string(),
+        );
+        target_handle.flush().await;
+
+        let transcript = tokio::sync::Mutex::new(vec![Message::user_text("existing turn")]);
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(current_handle)));
+        let last_known_usage = std::sync::Mutex::new(None);
+
+        let reply = handle_resume_command(
+            &store,
+            &transcript,
+            &session_handle,
+            &last_known_usage,
+            &target_session_id,
+        )
+        .await;
+
+        assert!(
+            reply.contains(&format!("/resume {target_session_id} --yes")),
+            "expected warning to echo the exact confirm command, got: {reply:?}"
+        );
+        assert!(
+            reply.contains("target session first prompt"),
+            "expected warning to include the target session's title, got: {reply:?}"
+        );
+        assert!(
+            reply.contains('1'),
+            "expected warning to include the target session's turn count, got: {reply:?}"
+        );
+        assert_eq!(
+            transcript.lock().await.as_slice(),
+            &[Message::user_text("existing turn")],
+            "an unconfirmed warning must not mutate the transcript"
+        );
+        assert_eq!(
+            session_handle
+                .read()
+                .await
+                .as_ref()
+                .map(|h| h.session_id().to_string()),
+            Some(current_session_id_before),
+            "an unconfirmed warning must not repoint the active session handle"
+        );
+    }
+
+    /// Ticket 36 scope-amendment: `/resume <id> --yes` against a different
+    /// existing session replaces the running transcript with that
+    /// session's FOLDED output (including collapsing a `Compaction` record
+    /// -- proving real `fold()` is used, not a reimplementation), restores
+    /// `last_known_usage`, and repoints the active session writer so a
+    /// subsequently appended turn lands in the TARGET session's
+    /// `session.jsonl`, not the origin's.
+    #[tokio::test]
+    async fn resume_command_with_confirm_flag_swaps_transcript_restores_usage_and_repoints_writer()
+    {
+        let dir = unique_temp_dir("resume-command-confirm");
+        let store = rokr_session::SessionStore::open(&dir);
+
+        let current_handle = store
+            .create_session()
+            .expect("create_session should succeed for the current session");
+        let current_session_id = current_handle.session_id().to_string();
+        current_handle.append_header(
+            1,
+            current_session_id.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/current".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        current_handle.flush().await;
+
+        let target_handle = store
+            .create_session()
+            .expect("create_session should succeed for the target session");
+        let target_session_id = target_handle.session_id().to_string();
+        target_handle.append_header(
+            1,
+            target_session_id.clone(),
+            "2026-07-20T01:00:00Z".to_string(),
+            "/projects/target".to_string(),
+            "plan".to_string(),
+            "openai".to_string(),
+            "gpt-test".to_string(),
+        );
+        target_handle.append_turn(
+            Message::user_text("target turn zero"),
+            UsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            "2026-07-20T01:00:01Z".to_string(),
+        );
+        target_handle.append_turn(
+            Message::assistant_text("target turn one"),
+            UsageRecord {
+                input_tokens: 2,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            "2026-07-20T01:00:02Z".to_string(),
+        );
+        target_handle.flush().await;
+
+        // A Compaction record: proves `handle_resume_command` delegates to
+        // the real `fold()` (which collapses records up to and including
+        // `replaced_through`) rather than just replaying raw Turn records.
+        // `SessionHandle::enqueue` is private and this task is scoped to
+        // `main.rs` only (no touching `rokr-session`), so the record is
+        // hand-appended directly to the on-disk log instead, mirroring
+        // `tui_test.rs`'s existing fixture-building convention.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("sessions").join(&target_session_id).join("session.jsonl"))
+                .expect("target session.jsonl should be appendable");
+            let line = serde_json::to_string(&rokr_session::SessionRecord::Compaction {
+                summary: "target session compacted summary".to_string(),
+                replaced_through: 1,
+            })
+            .unwrap();
+            writeln!(file, "{line}").expect("hand-appending the compaction record should succeed");
+        }
+
+        target_handle.append_turn(
+            Message::user_text("target turn two after compaction"),
+            UsageRecord {
+                input_tokens: 3,
+                output_tokens: 3,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            "2026-07-20T01:00:03Z".to_string(),
+        );
+        target_handle.flush().await;
+
+        let transcript = tokio::sync::Mutex::new(vec![Message::user_text("origin session turn")]);
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(current_handle)));
+        let last_known_usage = std::sync::Mutex::new(None);
+
+        let reply = handle_resume_command(
+            &store,
+            &transcript,
+            &session_handle,
+            &last_known_usage,
+            &format!("{target_session_id} --yes"),
+        )
+        .await;
+        assert_eq!(reply, format!("Resumed {target_session_id}; continuing from its context"));
+
+        let (expected_messages, expected_last_usage) = {
+            let (messages, _meta, resume_state) = store
+                .resume_session(&target_session_id)
+                .expect("resume_session should succeed for assembling the expected fixture");
+            (messages, resume_state.last_known_usage)
+        };
+        assert_eq!(transcript.lock().await.as_slice(), expected_messages.as_slice());
+        assert!(
+            transcript
+                .lock()
+                .await
+                .iter()
+                .any(|m| m.text().contains("target session compacted summary")),
+            "expected the swapped-in transcript to contain the compaction summary message"
+        );
+        assert_eq!(*last_known_usage.lock().unwrap(), expected_last_usage);
+
+        let repointed_session_id = session_handle
+            .read()
+            .await
+            .as_ref()
+            .map(|handle| handle.session_id().to_string());
+        assert_eq!(repointed_session_id, Some(target_session_id.clone()));
+
+        // Writer-repoint proof: append a NEW turn through the repointed
+        // handle and confirm it lands in the TARGET session's
+        // session.jsonl, not the origin's.
+        {
+            let guard = session_handle.read().await;
+            let handle = guard.as_ref().expect("session_handle should be repointed to target");
+            handle.append_turn(
+                Message::user_text("post-jump new turn"),
+                UsageRecord {
+                    input_tokens: 4,
+                    output_tokens: 4,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                "2026-07-20T01:00:04Z".to_string(),
+            );
+            handle.flush().await;
+        }
+
+        let target_contents = std::fs::read_to_string(
+            dir.join("sessions").join(&target_session_id).join("session.jsonl"),
+        )
+        .expect("target session.jsonl should exist");
+        assert!(
+            target_contents.contains("post-jump new turn"),
+            "expected the post-jump turn to be appended to the TARGET session's log, got: {target_contents:?}"
+        );
+
+        let origin_contents = std::fs::read_to_string(
+            dir.join("sessions").join(&current_session_id).join("session.jsonl"),
+        )
+        .expect("origin session.jsonl should still exist");
+        assert!(
+            !origin_contents.contains("post-jump new turn"),
+            "the post-jump turn must NOT appear in the ORIGIN session's log, got: {origin_contents:?}"
         );
     }
 }

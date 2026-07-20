@@ -136,6 +136,33 @@ pub struct ResumeState {
     pub last_known_usage: Option<rokr_core::Usage>,
 }
 
+/// One denormalized metadata snapshot about a session, read from and
+/// appended to the shared `sessions/index.jsonl` file (PRD decision 2: a
+/// single index file is what `list_sessions`/`/sessions` read -- never
+/// rebuilt by scanning every session directory). A session's own
+/// `session.jsonl` log remains the sole source of truth for what `fold`
+/// replays; this is purely a read-optimized view over it, appended
+/// incrementally as sessions are created and updated rather than recomputed
+/// from scratch on every list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIndexEntry {
+    pub session_id: String,
+    pub project_path: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// The first user prompt, truncated. Empty until at least one `Turn`
+    /// has been appended.
+    pub title: String,
+    /// Total number of `Turn` records appended so far (raw count, not the
+    /// folded/post-compaction transcript length).
+    pub turn_count: usize,
+    /// The model recorded on the session's `Header` record.
+    /// `SessionRecord::Turn` carries no per-turn model field today, so this
+    /// does not reflect a mid-session `/model` switch -- a known
+    /// limitation, out of this ticket's scope.
+    pub last_model: String,
+}
+
 use std::path::PathBuf;
 
 /// Commands sent over a session's single ordered writer channel (PRD
@@ -226,6 +253,7 @@ impl SessionHandle {
 
 /// Owns the on-disk root under which every session directory lives
 /// (`<data_dir>/sessions/<ulid>/`).
+#[derive(Clone)]
 pub struct SessionStore {
     data_dir: PathBuf,
 }
@@ -250,13 +278,36 @@ impl SessionStore {
         let session_dir = self.data_dir.join("sessions").join(&session_id);
         std::fs::create_dir_all(&session_dir)?;
 
+        let session_file_path = session_dir.join("session.jsonl");
+        // Ticket 36 (session-index-list-jump): seeded from whatever this
+        // session's log already contains BEFORE opening it for append --
+        // empty for a brand-new session, but for a resumed session (no
+        // Header re-written, see `open_session`'s doc comment) this is how
+        // the in-memory running index state inside `run_writer` picks up
+        // the correct baseline turn_count/title/model rather than
+        // resetting to zero and drifting from the true log contents.
+        let initial_index_state = compute_initial_index_state(&session_file_path, &session_id);
+
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(session_dir.join("session.jsonl"))?;
+            .open(&session_file_path)?;
+
+        // Ticket 36: a single shared file across every session in this
+        // store (PRD decision 2) -- each session's own writer task appends
+        // its own index snapshots to it. Concurrent appends from more than
+        // one session's writer task are safe here: every write is one
+        // complete JSON line + newline, well under the POSIX atomic
+        // O_APPEND write size, so interleaved lines from different
+        // sessions can never corrupt each other mid-line.
+        let index_file_path = self.data_dir.join("sessions").join("index.jsonl");
+        let index_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&index_file_path)?;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(run_writer(file, rx));
+        tokio::spawn(run_writer(file, index_file, initial_index_state, rx));
 
         Ok(SessionHandle { session_id, tx })
     }
@@ -370,20 +421,150 @@ impl SessionStore {
 
         Ok(session_ids.into_iter().next_back())
     }
+
+    /// Reads `sessions/index.jsonl` (PRD decision 2: the sole source
+    /// `/sessions` and jump-by-id consult -- never a scan of every session
+    /// directory), keeping only the most recent snapshot per `session_id`
+    /// since it's an append-only log of snapshots and a later line for the
+    /// same id always supersedes an earlier one. Returned sorted by
+    /// `session_id` (ULIDs sort chronologically, so this also sorts by
+    /// creation order). `Ok(Vec::new())` if the index doesn't exist yet.
+    pub fn list_sessions(&self) -> std::io::Result<Vec<SessionIndexEntry>> {
+        let index_path = self.data_dir.join("sessions").join("index.jsonl");
+        let contents = match std::fs::read_to_string(&index_path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        let mut by_id: std::collections::BTreeMap<String, SessionIndexEntry> =
+            std::collections::BTreeMap::new();
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            if let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(line) {
+                by_id.insert(entry.session_id.clone(), entry);
+            }
+        }
+
+        Ok(by_id.into_values().collect())
+    }
+}
+
+/// In-memory running state `run_writer` (ticket 36) keeps for the shared
+/// index, updated on every `Header`/`Turn` write and re-serialized as a
+/// [`SessionIndexEntry`] snapshot appended to `sessions/index.jsonl`.
+#[derive(Debug, Clone)]
+struct IndexState {
+    session_id: String,
+    project_path: String,
+    created_at: String,
+    updated_at: String,
+    title: Option<String>,
+    turn_count: usize,
+    last_model: String,
+}
+
+impl IndexState {
+    fn to_entry(&self) -> SessionIndexEntry {
+        SessionIndexEntry {
+            session_id: self.session_id.clone(),
+            project_path: self.project_path.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+            title: self.title.clone().unwrap_or_default(),
+            turn_count: self.turn_count,
+            last_model: self.last_model.clone(),
+        }
+    }
+}
+
+/// How long a title (the first user prompt) is allowed to get before
+/// `/sessions`' listing truncates it -- picked to keep a one-line-per-
+/// session listing readable, not from any PRD-specified figure.
+const TITLE_MAX_CHARS: usize = 60;
+
+fn truncate_title(text: &str) -> String {
+    if text.chars().count() > TITLE_MAX_CHARS {
+        let truncated: String = text.chars().take(TITLE_MAX_CHARS).collect();
+        format!("{truncated}...")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Scans `session_file_path`'s existing contents (if any) into the baseline
+/// [`IndexState`] a freshly-spawned `run_writer` should start from -- empty
+/// for a brand-new session (the file doesn't exist yet), or the true
+/// accumulated state for a resumed session, so a newly appended `Turn`
+/// continues incrementing `turn_count` from the correct number rather than
+/// resetting to zero and drifting from what `session.jsonl` actually
+/// contains.
+fn compute_initial_index_state(
+    session_file_path: &std::path::Path,
+    session_id: &str,
+) -> IndexState {
+    let mut state = IndexState {
+        session_id: session_id.to_string(),
+        project_path: String::new(),
+        created_at: String::new(),
+        updated_at: String::new(),
+        title: None,
+        turn_count: 0,
+        last_model: String::new(),
+    };
+
+    let contents = match std::fs::read_to_string(session_file_path) {
+        Ok(contents) => contents,
+        Err(_) => return state,
+    };
+
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        if let Ok(record) = serde_json::from_str::<SessionRecord>(line) {
+            match record {
+                SessionRecord::Header {
+                    project_path,
+                    created_at,
+                    model,
+                    ..
+                } => {
+                    state.project_path = project_path;
+                    state.updated_at = created_at.clone();
+                    state.created_at = created_at;
+                    state.last_model = model;
+                }
+                SessionRecord::Turn {
+                    message, timestamp, ..
+                } => {
+                    state.turn_count += 1;
+                    if state.title.is_none() {
+                        state.title = Some(truncate_title(&message.text()));
+                    }
+                    state.updated_at = timestamp;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    state
 }
 
 /// The single dedicated writer task (PRD decision 1: "One ordered writer
 /// per store"). Owns `file` for its entire lifetime; every `Append` is
 /// serialized to one JSON line and written in the order it was enqueued,
 /// so a parent's and a subagent's turns interleave correctly without any
-/// file lock.
+/// file lock. Ticket 36: also owns `index_file`, the shared cross-session
+/// index -- every `Header`/`Turn` append additionally refreshes the
+/// in-memory `index_state` and appends a snapshot line to it.
 async fn run_writer(
     file: std::fs::File,
+    index_file: std::fs::File,
+    mut index_state: IndexState,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<WriterCommand>,
 ) {
     use tokio::io::AsyncWriteExt;
 
     let mut file = tokio::fs::File::from_std(file);
+    let mut index_file = tokio::fs::File::from_std(index_file);
     while let Some(command) = rx.recv().await {
         match command {
             WriterCommand::Append(record) => {
@@ -391,9 +572,48 @@ async fn run_writer(
                     line.push('\n');
                     let _ = file.write_all(line.as_bytes()).await;
                 }
+
+                // A Compaction/Rollback/Checkpoint record leaves the index
+                // untouched -- none of them changes project_path/created_at/
+                // model, and this ticket doesn't ask the index's turn_count
+                // to track the folded (post-compaction/rollback) transcript
+                // length, only the raw count of Turn records appended.
+                let index_changed = match &record {
+                    SessionRecord::Header {
+                        project_path,
+                        created_at,
+                        model,
+                        ..
+                    } => {
+                        index_state.project_path = project_path.clone();
+                        index_state.created_at = created_at.clone();
+                        index_state.updated_at = created_at.clone();
+                        index_state.last_model = model.clone();
+                        true
+                    }
+                    SessionRecord::Turn {
+                        message, timestamp, ..
+                    } => {
+                        index_state.turn_count += 1;
+                        if index_state.title.is_none() {
+                            index_state.title = Some(truncate_title(&message.text()));
+                        }
+                        index_state.updated_at = timestamp.clone();
+                        true
+                    }
+                    _ => false,
+                };
+
+                if index_changed {
+                    if let Ok(mut line) = serde_json::to_string(&index_state.to_entry()) {
+                        line.push('\n');
+                        let _ = index_file.write_all(line.as_bytes()).await;
+                    }
+                }
             }
             WriterCommand::Flush(ack) => {
                 let _ = file.flush().await;
+                let _ = index_file.flush().await;
                 let _ = ack.send(());
             }
         }
@@ -803,5 +1023,90 @@ mod tests {
             }
             _ => unreachable!("header is constructed as Header above"),
         }
+    }
+
+    /// Ticket 36 (session-index-list-jump): after creating two sessions
+    /// (each with a Header and one or more Turns), `list_sessions` returns
+    /// one entry per session whose fields match what was actually appended
+    /// -- proving the index and the underlying logs never drift apart
+    /// (PRD's "Index consistency" testing decision).
+    #[tokio::test]
+    async fn list_sessions_reads_index_metadata_matching_created_sessions() {
+        let dir = unique_temp_dir("list-sessions");
+        let store = SessionStore::open(&dir);
+
+        let handle_a = store
+            .create_session()
+            .expect("create_session should succeed for session a");
+        let session_id_a = handle_a.session_id().to_string();
+        handle_a.append_header(
+            1,
+            session_id_a.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/alpha".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        handle_a.append_turn(
+            Message::user_text("first prompt in session alpha"),
+            usage(1),
+            "2026-07-20T00:00:01Z".to_string(),
+        );
+        handle_a.append_turn(
+            Message::assistant_text("reply in session alpha"),
+            usage(2),
+            "2026-07-20T00:00:02Z".to_string(),
+        );
+        handle_a.flush().await;
+
+        let handle_b = store
+            .create_session()
+            .expect("create_session should succeed for session b");
+        let session_id_b = handle_b.session_id().to_string();
+        handle_b.append_header(
+            1,
+            session_id_b.clone(),
+            "2026-07-20T01:00:00Z".to_string(),
+            "/projects/beta".to_string(),
+            "plan".to_string(),
+            "openai".to_string(),
+            "gpt-test".to_string(),
+        );
+        handle_b.append_turn(
+            Message::user_text("first prompt in session beta"),
+            usage(3),
+            "2026-07-20T01:00:01Z".to_string(),
+        );
+        handle_b.flush().await;
+
+        let entries = store
+            .list_sessions()
+            .expect("list_sessions should succeed against a populated index");
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected one index entry per created session, got: {entries:?}"
+        );
+
+        let entry_a = entries
+            .iter()
+            .find(|entry| entry.session_id == session_id_a)
+            .expect("session a's index entry should be present");
+        assert_eq!(entry_a.project_path, "/projects/alpha");
+        assert_eq!(entry_a.created_at, "2026-07-20T00:00:00Z");
+        assert_eq!(entry_a.title, "first prompt in session alpha");
+        assert_eq!(entry_a.turn_count, 2);
+        assert_eq!(entry_a.last_model, "claude-test");
+
+        let entry_b = entries
+            .iter()
+            .find(|entry| entry.session_id == session_id_b)
+            .expect("session b's index entry should be present");
+        assert_eq!(entry_b.project_path, "/projects/beta");
+        assert_eq!(entry_b.created_at, "2026-07-20T01:00:00Z");
+        assert_eq!(entry_b.title, "first prompt in session beta");
+        assert_eq!(entry_b.turn_count, 1);
+        assert_eq!(entry_b.last_model, "gpt-test");
     }
 }
