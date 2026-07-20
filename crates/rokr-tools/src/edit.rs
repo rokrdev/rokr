@@ -86,7 +86,11 @@ impl PreviewableTool for EditTool {
         let input: EditInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let (old, new) = Self::diff_snippet(&input.path, &input.old_str, &input.new_str)?;
-        Ok(Preview::Diff { old, new })
+        Ok(Preview::Diff {
+            path: input.path,
+            old,
+            new,
+        })
     }
 }
 
@@ -119,6 +123,7 @@ mod tests {
         assert_eq!(
             preview,
             Preview::Diff {
+                path: file_path.to_string_lossy().into_owned(),
                 old: "world".to_string(),
                 new: "rokr".to_string()
             }

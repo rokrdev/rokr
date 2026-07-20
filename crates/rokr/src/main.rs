@@ -286,12 +286,20 @@ async fn main() -> ExitCode {
             // can't be read. Wrapped in `Arc` (rather than requiring
             // `SessionHandle: Clone`) so it can be cloned into `submit`'s
             // closure below without touching rokr-session's type.
-            let store = rokr_session::SessionStore::open(default_data_dir());
+            // Ticket 38 (checkpoint-pre-images): kept as its own binding
+            // (rather than re-derived from `store`, which exposes no
+            // accessor for its own root) so `submit`'s closure below can
+            // build a `CheckpointStore` for whichever session is currently
+            // active without threading a second lookup through
+            // `SessionStore`.
+            let data_dir = default_data_dir();
+            let store = rokr_session::SessionStore::open(&data_dir);
 
-            let (initial_transcript, initial_last_known_usage, session_handle): (
+            let (initial_transcript, initial_last_known_usage, session_handle, initial_turn_index): (
                 Vec<rokr_core::Message>,
                 Option<rokr_core::Usage>,
                 Option<Arc<rokr_session::SessionHandle>>,
+                usize,
             ) = match resume_mode {
                 ResumeMode::None => {
                     let session_handle = match store.create_session() {
@@ -314,7 +322,11 @@ async fn main() -> ExitCode {
                             None
                         }
                     };
-                    (Vec::new(), None, session_handle)
+                    // A brand-new session has zero prior Turn records, so
+                    // ticket 38's turn_index counter (which must equal the
+                    // count of prior Turn records, per `fold`'s
+                    // `next_turn_index` semantics) starts at 0.
+                    (Vec::new(), None, session_handle, 0)
                 }
                 ResumeMode::Continue => {
                     let session_id = match store.most_recent_session_id() {
@@ -378,6 +390,22 @@ async fn main() -> ExitCode {
             let last_known_usage: Arc<std::sync::Mutex<Option<rokr_core::Usage>>> =
                 Arc::new(std::sync::Mutex::new(initial_last_known_usage));
 
+            // Ticket 38 (checkpoint-pre-images): mirrors `last_known_usage`'s
+            // exact `Arc<std::sync::Mutex<>>` shape immediately above. Its
+            // value equals the count of prior `Turn` records (0-based, per
+            // `fold`'s `next_turn_index` semantics) -- the index the NEXT
+            // submitted turn's own `Turn` record will occupy once appended.
+            // `submit`'s tool loop reads the CURRENT value for every
+            // snapshot taken during that turn's `run_tool_loop` call, and
+            // increments it by exactly one right after that turn's
+            // `append_turn` call (never before, so every gated tool call
+            // within one in-flight turn shares the same pre-increment
+            // index). Seeded from a resumed session's real prior `Turn`
+            // count (see `resolve_resumed_session`'s doc comment) when
+            // applicable, otherwise 0 as for a brand-new session.
+            let turn_index: Arc<std::sync::Mutex<usize>> =
+                Arc::new(std::sync::Mutex::new(initial_turn_index));
+
             // Ticket 21 (manual-compact-command): cloned here, before
             // `submit`'s `move` closure below takes ownership of the
             // original `provider`/`transcript` bindings, so `command` can
@@ -393,6 +421,13 @@ async fn main() -> ExitCode {
             let command_cwd = cwd.clone();
             let command_repo_map = repo_map.clone();
             let command_store = store.clone();
+            // Ticket 38 (checkpoint-pre-images): `/resume <id> --yes` in
+            // `command` below repoints the active session writer, and must
+            // re-seed `turn_index` to the TARGET session's real prior `Turn`
+            // count the same way startup resume-seeding does -- otherwise a
+            // turn submitted after an in-session jump would capture
+            // checkpoints keyed by the WRONG session's turn numbering.
+            let command_turn_index = turn_index.clone();
             // Ticket 36 (session-index-list-jump): `/resume <id>`'s handler
             // in `command` below needs its own clones of the swappable
             // `session_handle` lock and `last_known_usage`, so it can read
@@ -415,6 +450,8 @@ async fn main() -> ExitCode {
                 let last_known_usage = last_known_usage.clone();
                 let config_dir = config_dir.clone();
                 let session_handle = session_handle.clone();
+                let turn_index = turn_index.clone();
+                let data_dir = data_dir.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -476,6 +513,23 @@ async fn main() -> ExitCode {
                     // channel the parent's own gated tool calls do.
                     let subagent_permission = permission.clone();
 
+                    // Ticket 38 (checkpoint-pre-images): both
+                    // `request_permission` below and the mirrored
+                    // `subagent_request_permission` need their OWN owned
+                    // clones of `session_handle`/`turn_index`/`data_dir` to
+                    // `move` into themselves, since `session_handle` and
+                    // `turn_index` are still read again later in this same
+                    // `submit` body (append_turn / the increment above's
+                    // sibling call site) -- cloning here, not moving the
+                    // originals, mirrors `subagent_permission`'s existing
+                    // pattern immediately above.
+                    let request_permission_session_handle = session_handle.clone();
+                    let request_permission_turn_index = turn_index.clone();
+                    let request_permission_data_dir = data_dir.clone();
+                    let subagent_request_permission_session_handle = session_handle.clone();
+                    let subagent_request_permission_turn_index = turn_index.clone();
+                    let subagent_request_permission_data_dir = data_dir.clone();
+
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
                     // `PermissionRequest` (tool name + a display string),
@@ -483,23 +537,47 @@ async fn main() -> ExitCode {
                     // `permission`. This is the seam rokr-tui's `run` doc
                     // comment calls out: rokr-tui stays decoupled from
                     // rokr-core's specific types, so main.rs bridges them.
+                    // Ticket 38 (checkpoint-pre-images): on GRANT, also
+                    // captures a pre-image snapshot for a `Diff` payload
+                    // (write/edit) and appends a correlating `Checkpoint`
+                    // record -- see `capture_checkpoint_if_granted_diff`'s
+                    // doc comment. `PermissionPayload::Command` (bash)
+                    // snapshots nothing, falling out structurally from the
+                    // match below rather than a runtime special-case.
                     let request_permission = move |request: rokr_core::PermissionRequest| {
                         let permission = permission.clone();
+                        let session_handle = request_permission_session_handle.clone();
+                        let turn_index = request_permission_turn_index.clone();
+                        let data_dir = request_permission_data_dir.clone();
                         async move {
-                            let detail = match request.payload {
+                            let (detail, diff_path_and_old) = match request.payload {
                                 rokr_core::PermissionPayload::Command(command) => {
-                                    rokr_tui::PermissionDetail::Text(command)
+                                    (rokr_tui::PermissionDetail::Text(command), None)
                                 }
-                                rokr_core::PermissionPayload::Diff { old, new } => {
-                                    rokr_tui::PermissionDetail::Diff { old, new }
-                                }
+                                rokr_core::PermissionPayload::Diff { path, old, new } => (
+                                    rokr_tui::PermissionDetail::Diff {
+                                        old: old.clone(),
+                                        new,
+                                    },
+                                    Some((path, old)),
+                                ),
                             };
-                            permission
+                            let granted = permission
                                 .request(rokr_tui::PermissionRequest {
                                     tool_name: request.tool_name,
                                     detail,
                                 })
-                                .await
+                                .await;
+                            if granted {
+                                capture_checkpoint_if_granted_diff(
+                                    diff_path_and_old,
+                                    &data_dir,
+                                    &session_handle,
+                                    &turn_index,
+                                )
+                                .await;
+                            }
+                            granted
                         }
                     };
 
@@ -509,25 +587,47 @@ async fn main() -> ExitCode {
                     // Phase 4 "Subagents": "Permission inheritance").
                     // Tagging with the subagent's name happens inside
                     // `subagent::run_subagent`, not here -- this closure
-                    // only forwards the (already-tagged) request.
+                    // only forwards the (already-tagged) request. Ticket 38
+                    // (checkpoint-pre-images): wired the SAME way as
+                    // `request_permission` above -- a subagent's gated tool
+                    // calls happen within the same parent turn, so they
+                    // share the SAME `turn_index` (not a subagent-local
+                    // counter).
                     let subagent_request_permission: subagent::PermissionCallback =
                         Box::new(move |request: rokr_core::PermissionRequest| {
                             let permission = subagent_permission.clone();
+                            let session_handle = subagent_request_permission_session_handle.clone();
+                            let turn_index = subagent_request_permission_turn_index.clone();
+                            let data_dir = subagent_request_permission_data_dir.clone();
                             Box::pin(async move {
-                                let detail = match request.payload {
+                                let (detail, diff_path_and_old) = match request.payload {
                                     rokr_core::PermissionPayload::Command(command) => {
-                                        rokr_tui::PermissionDetail::Text(command)
+                                        (rokr_tui::PermissionDetail::Text(command), None)
                                     }
-                                    rokr_core::PermissionPayload::Diff { old, new } => {
-                                        rokr_tui::PermissionDetail::Diff { old, new }
-                                    }
+                                    rokr_core::PermissionPayload::Diff { path, old, new } => (
+                                        rokr_tui::PermissionDetail::Diff {
+                                            old: old.clone(),
+                                            new,
+                                        },
+                                        Some((path, old)),
+                                    ),
                                 };
-                                permission
+                                let granted = permission
                                     .request(rokr_tui::PermissionRequest {
                                         tool_name: request.tool_name,
                                         detail,
                                     })
-                                    .await
+                                    .await;
+                                if granted {
+                                    capture_checkpoint_if_granted_diff(
+                                        diff_path_and_old,
+                                        &data_dir,
+                                        &session_handle,
+                                        &turn_index,
+                                    )
+                                    .await;
+                                }
+                                granted
                             })
                         });
                     // F-003/F-004: the SAME single provider snapshot the
@@ -605,6 +705,17 @@ async fn main() -> ExitCode {
                         }
                     }
 
+                    // Ticket 38 (checkpoint-pre-images): incremented AFTER
+                    // this turn's own `Turn` record has been appended above
+                    // (or would have been, if persistence is degraded) --
+                    // every gated tool call's snapshot taken during THIS
+                    // turn's `run_tool_loop` call above used the
+                    // pre-increment value, which is exactly the index this
+                    // turn's own `Turn` record occupies once appended (see
+                    // `turn_index`'s own doc comment, and `fold`'s
+                    // `next_turn_index` semantics in rokr-session).
+                    *turn_index.lock().unwrap() += 1;
+
                     // Auto-compaction (ticket 20): checked once per
                     // submitted turn using that turn's own final usage
                     // figure. Runs inside this same async submit future —
@@ -680,6 +791,7 @@ async fn main() -> ExitCode {
                 let store = command_store.clone();
                 let session_handle = command_session_handle.clone();
                 let last_known_usage = command_last_known_usage.clone();
+                let turn_index = command_turn_index.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
@@ -706,6 +818,7 @@ async fn main() -> ExitCode {
                             &transcript,
                             &session_handle,
                             &last_known_usage,
+                            &turn_index,
                             arg,
                         )
                         .await;
@@ -817,6 +930,89 @@ fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String)
     transcript.push(rokr_core::Message::user_text(input));
 }
 
+/// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management
+/// decision 4: on a GRANTED write/edit permission decision, captures the
+/// file's pre-image under `sessions/<id>/snapshots/` (reusing the `old`
+/// content already computed for the permission-preview diff -- no new file
+/// read) and appends a correlating `Checkpoint` record. Called from BOTH
+/// `submit`'s own `request_permission` closure and the mirrored
+/// `subagent_request_permission` closure in `crates/rokr/src/main.rs`,
+/// after `permission.request(...)`'s decision comes back `true` -- a DENY
+/// must produce no snapshot and no `Checkpoint` record, which this
+/// signature enforces structurally: callers only invoke it once already
+/// inside their own `if granted` branch.
+///
+/// `diff_path_and_old` is `Some((path, old))` for a `PermissionPayload::Diff`
+/// (write/edit) and `None` for `PermissionPayload::Command` (bash) --
+/// bash-driven mutations are explicitly out of scope for checkpointing
+/// (documented gap, not oversight), so this is a no-op for that case,
+/// falling out of the match in the caller rather than a runtime
+/// special-case here.
+///
+/// No-ops (logging a warning, never panicking) if no session is currently
+/// active (persistence degraded at startup) -- checkpointing is best-effort
+/// alongside session persistence, not a separate hard requirement.
+///
+/// First-write-wins de-duplication (ticket 38 scope-amendment, F-001 per
+/// argus review): a turn's tool loop can mutate the SAME path more than
+/// once (e.g. `write` then `edit`) -- `CheckpointStore::snapshot`'s
+/// `newly_written` return only reports `true` for the first capture of a
+/// given `(turn_index, path)` key, and a `Checkpoint` record is appended
+/// ONLY when it's `true`. This avoids appending a second `Checkpoint`
+/// record with a duplicate `snapshot_id` for a later mutation whose `old`
+/// is already post-first-mutation content, not the real turn-start
+/// pre-image.
+///
+/// Known limitation (see this ticket's `## Scope Amendment`):
+/// `PermissionPayload::Diff`'s `old: String` field collapses "file did not
+/// exist" and "file existed but was empty" into the same empty string, with
+/// no separate boolean carried through (the architect's ruling fixed
+/// `Preview::Diff`/`PermissionPayload::Diff`'s shape to exactly `{ path,
+/// old, new }`, and adding a second field for this was judged out of scope
+/// for this ticket). So an empty `old` is treated here as "absent"
+/// (`None`), which is lossy for the rare case of a genuinely-empty
+/// pre-existing file -- `CheckpointStore::snapshot` itself DOES support the
+/// real distinction (`Option<&str>`), this call site just cannot supply it
+/// today.
+async fn capture_checkpoint_if_granted_diff(
+    diff_path_and_old: Option<(String, String)>,
+    data_dir: &std::path::Path,
+    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
+    turn_index: &std::sync::Mutex<usize>,
+) {
+    let Some((path, old)) = diff_path_and_old else {
+        return;
+    };
+
+    let session_handle_guard = session_handle.read().await;
+    let Some(session_handle) = session_handle_guard.as_ref() else {
+        // F-002 (argus review): matches this fn's own doc comment ("no-ops,
+        // logging a warning") -- persistence being degraded at startup is
+        // the same class of condition `create_session`'s own failure path
+        // (near the top of `main`) already logs via `eprintln!` rather than
+        // silently swallowing.
+        eprintln!(
+            "skipping pre-image checkpoint snapshot for {path}: no session is currently active"
+        );
+        return;
+    };
+
+    let current_turn_index = *turn_index.lock().unwrap();
+    let checkpoint_store = rokr_session::CheckpointStore::open(data_dir, session_handle.session_id());
+    let old_content: Option<&str> = if old.is_empty() { None } else { Some(old.as_str()) };
+
+    match checkpoint_store.snapshot(current_turn_index, &path, old_content) {
+        Ok((snapshot_id, newly_written)) => {
+            if newly_written {
+                session_handle.append_checkpoint(current_turn_index, snapshot_id);
+            }
+        }
+        Err(err) => {
+            eprintln!("failed to capture pre-image checkpoint snapshot for {path}: {err}");
+        }
+    }
+}
+
 /// Ticket 35 (resume-session): resolves a concrete `session_id` (already
 /// looked up from `--continue` if needed) into the seed values `main`'s
 /// `_` arm needs -- the folded prior transcript, the restored
@@ -829,6 +1025,20 @@ fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String)
 /// gracefully, same as `create_session` failing at plain startup) are
 /// handled here so both `ResumeMode::Id` and `ResumeMode::Continue` share
 /// the identical resolution logic.
+///
+/// Ticket 38 (checkpoint-pre-images): also seeds a starting `turn_index`
+/// (the 4th tuple element) for the resumed session. Per `fold`'s doc
+/// comment (`rokr-session`), a `Rollback` record does not rewind
+/// `next_turn_index` -- later genuinely-new turns keep incrementing from
+/// where the raw `Turn` count left off -- so the correct seed is the
+/// session's raw `Turn` record count, read via `store.list_sessions()`'s
+/// matching `SessionIndexEntry.turn_count` (the same field
+/// `handle_resume_command` already reads for its confirmation message).
+/// Falls back to 0 (with a `turn_count` of 0 being indistinguishable from
+/// "not found in the index yet") if the index lookup fails or has no
+/// matching entry -- a degraded-but-safe fallback consistent with this
+/// function's existing pattern of degrading gracefully on `open_session`
+/// failure rather than hard-erroring.
 #[allow(clippy::type_complexity)]
 fn resolve_resumed_session(
     store: &rokr_session::SessionStore,
@@ -838,6 +1048,7 @@ fn resolve_resumed_session(
         Vec<rokr_core::Message>,
         Option<rokr_core::Usage>,
         Option<Arc<rokr_session::SessionHandle>>,
+        usize,
     ),
     ExitCode,
 > {
@@ -845,6 +1056,17 @@ fn resolve_resumed_session(
         eprintln!("failed to resume session {session_id}: {err}");
         ExitCode::FAILURE
     })?;
+
+    let initial_turn_index = store
+        .list_sessions()
+        .ok()
+        .and_then(|entries| {
+            entries
+                .into_iter()
+                .find(|entry| entry.session_id == session_id)
+        })
+        .map(|entry| entry.turn_count)
+        .unwrap_or(0);
 
     let session_handle = match store.open_session(session_id) {
         Ok(handle) => Some(Arc::new(handle)),
@@ -854,7 +1076,12 @@ fn resolve_resumed_session(
         }
     };
 
-    Ok((messages, resume_state.last_known_usage, session_handle))
+    Ok((
+        messages,
+        resume_state.last_known_usage,
+        session_handle,
+        initial_turn_index,
+    ))
 }
 
 /// Ticket 36 (session-index-list-jump): the decision + mutation logic
@@ -881,6 +1108,7 @@ async fn handle_resume_command(
     transcript: &tokio::sync::Mutex<Vec<rokr_core::Message>>,
     session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
     last_known_usage: &std::sync::Mutex<Option<rokr_core::Usage>>,
+    turn_index: &std::sync::Mutex<usize>,
     arg: &str,
 ) -> String {
     let (target_id, confirmed) = match arg.trim().strip_suffix("--yes") {
@@ -927,6 +1155,13 @@ async fn handle_resume_command(
 
     *transcript.lock().await = messages;
     *last_known_usage.lock().unwrap() = resume_state.last_known_usage;
+    // Ticket 38 (checkpoint-pre-images): re-seed `turn_index` to the
+    // TARGET session's real prior `Turn` count -- `target_entry` was
+    // already fetched above for the confirmation message, so this reuses
+    // it rather than a second `list_sessions()` lookup. Without this, a
+    // turn submitted after this jump would capture checkpoints keyed by
+    // the WRONG (origin) session's turn numbering.
+    *turn_index.lock().unwrap() = target_entry.turn_count;
     *session_handle.write().await = Some(new_handle);
 
     format!("Resumed {target_id}; continuing from its context")
@@ -1216,10 +1451,17 @@ mod tests {
         let transcript = tokio::sync::Mutex::new(vec![Message::user_text("existing turn")]);
         let session_handle = tokio::sync::RwLock::new(Some(Arc::new(current_handle)));
         let last_known_usage = std::sync::Mutex::new(None);
+        let turn_index = std::sync::Mutex::new(0usize);
 
-        let not_found_reply =
-            handle_resume_command(&store, &transcript, &session_handle, &last_known_usage, "nonexistent-session-id")
-                .await;
+        let not_found_reply = handle_resume_command(
+            &store,
+            &transcript,
+            &session_handle,
+            &last_known_usage,
+            &turn_index,
+            "nonexistent-session-id",
+        )
+        .await;
         assert_eq!(not_found_reply, "no such session nonexistent-session-id");
         assert_eq!(
             transcript.lock().await.as_slice(),
@@ -1232,6 +1474,7 @@ mod tests {
             &transcript,
             &session_handle,
             &last_known_usage,
+            &turn_index,
             &current_session_id,
         )
         .await;
@@ -1294,12 +1537,14 @@ mod tests {
         let transcript = tokio::sync::Mutex::new(vec![Message::user_text("existing turn")]);
         let session_handle = tokio::sync::RwLock::new(Some(Arc::new(current_handle)));
         let last_known_usage = std::sync::Mutex::new(None);
+        let turn_index = std::sync::Mutex::new(0usize);
 
         let reply = handle_resume_command(
             &store,
             &transcript,
             &session_handle,
             &last_known_usage,
+            &turn_index,
             &target_session_id,
         )
         .await;
@@ -1431,16 +1676,27 @@ mod tests {
         let transcript = tokio::sync::Mutex::new(vec![Message::user_text("origin session turn")]);
         let session_handle = tokio::sync::RwLock::new(Some(Arc::new(current_handle)));
         let last_known_usage = std::sync::Mutex::new(None);
+        // Seeded to an origin-session-shaped value (not 0) so the assertion
+        // below actually proves re-seeding happened, rather than trivially
+        // matching a coincidental starting value of 0.
+        let turn_index = std::sync::Mutex::new(99usize);
 
         let reply = handle_resume_command(
             &store,
             &transcript,
             &session_handle,
             &last_known_usage,
+            &turn_index,
             &format!("{target_session_id} --yes"),
         )
         .await;
         assert_eq!(reply, format!("Resumed {target_session_id}; continuing from its context"));
+        assert_eq!(
+            *turn_index.lock().unwrap(),
+            3,
+            "expected turn_index to be re-seeded to the target session's real raw Turn count \
+             (ticket 38: checkpoint-pre-images)"
+        );
 
         let (expected_messages, expected_last_usage) = {
             let (messages, _meta, resume_state) = store
@@ -1501,6 +1757,89 @@ mod tests {
         assert!(
             !origin_contents.contains("post-jump new turn"),
             "the post-jump turn must NOT appear in the ORIGIN session's log, got: {origin_contents:?}"
+        );
+    }
+
+    /// Ticket 38 scope-amendment (F-001, argus review): a turn's tool loop
+    /// doing `write` then `edit` on the SAME path within the SAME turn must
+    /// only produce ONE `Checkpoint` record, not two with a duplicate
+    /// `snapshot_id` -- `CheckpointStore::snapshot`'s first-write-wins
+    /// semantics mean the second `capture_checkpoint_if_granted_diff` call
+    /// for the same `(turn_index, path)` key writes no new snapshot, so it
+    /// must also skip appending a second `Checkpoint` record for it. Calls
+    /// `capture_checkpoint_if_granted_diff` directly (mirroring this test
+    /// module's existing pattern of exercising other `main.rs` helper fns,
+    /// e.g. `handle_resume_command`/`set_active_provider`, without a full
+    /// PTY round-trip) twice for the same path within turn_index 0, then
+    /// reads `session.jsonl` and counts `Checkpoint` records.
+    #[tokio::test]
+    async fn capture_checkpoint_if_granted_diff_does_not_append_duplicate_checkpoint_for_repeated_path_in_same_turn(
+    ) {
+        let dir = unique_temp_dir("checkpoint-capture-duplicate");
+        let store = rokr_session::SessionStore::open(&dir);
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
+        let session_id = handle.session_id().to_string();
+        handle.append_header(
+            1,
+            session_id.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/checkpoint-dup".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        handle.flush().await;
+
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(handle)));
+        let turn_index = std::sync::Mutex::new(0usize);
+        let target_path = "/some/project/write-then-edit-target.txt".to_string();
+
+        // First mutation of this turn: a `write` whose pre-image is
+        // "original".
+        capture_checkpoint_if_granted_diff(
+            Some((target_path.clone(), "original".to_string())),
+            &dir,
+            &session_handle,
+            &turn_index,
+        )
+        .await;
+        // Second mutation of the SAME path within the SAME turn: an `edit`
+        // whose "old" is already the post-write content -- must be a no-op,
+        // not a second Checkpoint record.
+        capture_checkpoint_if_granted_diff(
+            Some((target_path.clone(), "intermediate-post-write-content".to_string())),
+            &dir,
+            &session_handle,
+            &turn_index,
+        )
+        .await;
+
+        {
+            let guard = session_handle.read().await;
+            guard
+                .as_ref()
+                .expect("session_handle should still be Some")
+                .flush()
+                .await;
+        }
+
+        let session_jsonl_contents =
+            std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
+                .expect("session.jsonl should exist");
+        let checkpoint_records: Vec<rokr_session::SessionRecord> = session_jsonl_contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+            .filter(|record| matches!(record, rokr_session::SessionRecord::Checkpoint { .. }))
+            .collect();
+
+        assert_eq!(
+            checkpoint_records.len(),
+            1,
+            "expected exactly one Checkpoint record for two mutations of the same path within \
+             the same turn, got: {checkpoint_records:?}"
         );
     }
 }

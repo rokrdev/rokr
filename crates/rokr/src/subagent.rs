@@ -320,8 +320,8 @@ mod tests {
                     rokr_tools::Preview::Command(command) => {
                         rokr_core::PermissionPayload::Command(command)
                     }
-                    rokr_tools::Preview::Diff { old, new } => {
-                        rokr_core::PermissionPayload::Diff { old, new }
+                    rokr_tools::Preview::Diff { path, old, new } => {
+                        rokr_core::PermissionPayload::Diff { path, old, new }
                     }
                 }),
             )

@@ -73,6 +73,12 @@ pub trait PreviewableTool: Tool {
 pub enum Preview {
     /// The literal shell command that `execute` would run.
     Command(String),
-    /// The before (`old`) and after (`new`) text `execute` would produce.
-    Diff { old: String, new: String },
+    /// The target file's path, plus the before (`old`) and after (`new`)
+    /// text `execute` would produce. `path` (ticket 38,
+    /// checkpoint-pre-images) lets a permission-decision callback key a
+    /// pre-image snapshot by `(turn_index, path)` without re-deriving the
+    /// path from the raw tool-call JSON, which isn't otherwise available at
+    /// that point in the call chain (see `rokr_core::PermissionPayload::Diff`,
+    /// which mirrors this shape one-for-one).
+    Diff { path: String, old: String, new: String },
 }

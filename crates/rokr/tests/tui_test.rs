@@ -3059,6 +3059,578 @@ async fn write_tool_call_renders_diff_and_writes_file_on_accept() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// Ticket 38 (checkpoint-pre-images) acceptance test: a Build-tier session's
+/// ACCEPTED write tool call captures the file's pre-image under
+/// `sessions/<id>/snapshots/`, keyed by `(turn_index, path)`, and appends a
+/// correlating `SessionRecord::Checkpoint` record to `session.jsonl`.
+/// Mirrors `write_tool_call_renders_diff_and_writes_file_on_accept`'s exact
+/// PTY harness (wiremock two-step tool-call/final-reply mock, `y` to accept)
+/// plus `submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl`'s
+/// `XDG_DATA_HOME` + session-directory-discovery convention, since this test
+/// needs to inspect the persisted log AND the new snapshots directory.
+#[tokio::test]
+async fn write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_record() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterWriteCheckpointForTesting";
+
+    let temp_dir = unique_temp_dir("write-checkpoint-target");
+    let target_file = temp_dir.join("checkpoint-target.txt");
+    let old_content = "preimagecontentbeforewrite";
+    let new_content = "postimagecontentafterwrite";
+    std::fs::write(&target_file, old_content).unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    // First call: the model asks to invoke the `write` tool against the real
+    // temp file, replacing its content.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-write-checkpoint",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": new_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Second call: the loop feeds the tool result back, and the model
+    // replies with a final, tool-call-free text answer.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-write-checkpoint-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-write-checkpoint");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-write-checkpoint");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-write-checkpoint");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"writecheckpointfile\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the permission prompt to render the diff before granting
+    // anything.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("write")
+            && output.contains("-preimagecontentbeforewrite")
+            && output.contains("+postimagecontentafterwrite")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("-preimagecontentbeforewrite"),
+        "expected pty output to contain the old-content diff line, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the write \
+         tool call, got: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        new_content,
+        "expected the file to have been written with the new content after accepting"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    // Locate the (single) ULID-named session directory, mirroring
+    // `submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl`'s
+    // discovery convention.
+    let sessions_dir = xdg_data_home.join("rokr").join("sessions");
+    let session_dir_entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&sessions_dir)
+        .unwrap_or_else(|err| {
+            panic!("expected sessions directory to exist at {sessions_dir:?}, got error: {err:?}")
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert_eq!(
+        session_dir_entries.len(),
+        1,
+        "expected exactly one ULID-named session directory under {sessions_dir:?}, got: {:?}",
+        session_dir_entries
+            .iter()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    );
+    let session_dir = session_dir_entries[0].path();
+
+    // (1) A snapshot file exists under sessions/<id>/snapshots/ whose
+    // content matches the fixture's old_content -- keyed by
+    // (turn_index, path), not just "a file exists somewhere": this is the
+    // first (and only) submitted turn, so its turn_index is 0 (fold's
+    // next_turn_index semantics: 0 prior Turn records at the time this
+    // turn's tool loop ran).
+    let snapshots_dir = session_dir.join("snapshots");
+    let snapshot_entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&snapshots_dir)
+        .unwrap_or_else(|err| {
+            panic!("expected snapshots directory to exist at {snapshots_dir:?}, got error: {err:?}")
+        })
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(
+        snapshot_entries.len(),
+        1,
+        "expected exactly one snapshot file under {snapshots_dir:?}, got: {:?}",
+        snapshot_entries
+            .iter()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    );
+    let snapshot_file_name = snapshot_entries[0].file_name().to_string_lossy().into_owned();
+    assert!(
+        snapshot_file_name.starts_with("t0-"),
+        "expected the snapshot id to be keyed by turn_index 0 (this session's first turn), \
+         got filename: {snapshot_file_name:?}"
+    );
+    let snapshot_contents = std::fs::read_to_string(snapshot_entries[0].path())
+        .expect("snapshot file should be readable");
+    assert_eq!(
+        snapshot_contents, old_content,
+        "expected the snapshot's content to exactly match the pre-image (the old side of the \
+         permission-preview diff)"
+    );
+
+    // (2) A `SessionRecord::Checkpoint { turn_index, snapshot_id }` record
+    // appears in session.jsonl, its turn_index is 0 (this write's turn),
+    // and its snapshot_id matches the snapshot file found in (1).
+    let session_jsonl_path = session_dir.join("session.jsonl");
+    let session_jsonl_contents = std::fs::read_to_string(&session_jsonl_path)
+        .expect("failed to read session.jsonl contents");
+    let checkpoint_records: Vec<rokr_session::SessionRecord> = session_jsonl_contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+        .filter(|record| matches!(record, rokr_session::SessionRecord::Checkpoint { .. }))
+        .collect();
+    assert_eq!(
+        checkpoint_records.len(),
+        1,
+        "expected exactly one Checkpoint record in session.jsonl, got: {checkpoint_records:?}"
+    );
+    match &checkpoint_records[0] {
+        rokr_session::SessionRecord::Checkpoint {
+            turn_index,
+            snapshot_id,
+        } => {
+            assert_eq!(
+                *turn_index, 0,
+                "expected the Checkpoint record's turn_index to be 0 for this session's first \
+                 (write) turn"
+            );
+            assert_eq!(
+                snapshot_id, &snapshot_file_name,
+                "expected the Checkpoint record's snapshot_id to correspond to the snapshot \
+                 file found under sessions/<id>/snapshots/"
+            );
+        }
+        other => panic!("expected a Checkpoint record, got: {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// Ticket 38 (checkpoint-pre-images) deny-path regression test: a DENIED
+/// write tool call must produce NO snapshot file and NO Checkpoint record --
+/// mirrors `bash_tool_call_skips_execution_on_reject`'s reject-keypress
+/// convention (`n` instead of `y`), extended to also assert the new
+/// snapshot/Checkpoint side effects are absent, not just that the file
+/// itself is untouched.
+#[tokio::test]
+async fn write_tool_call_skips_checkpoint_snapshot_and_record_on_reject() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterWriteCheckpointRejectForTesting";
+
+    let temp_dir = unique_temp_dir("write-checkpoint-reject-target");
+    let target_file = temp_dir.join("checkpoint-reject-target.txt");
+    let old_content = "preimagecontentbeforereject";
+    let new_content = "postimagecontentafterreject";
+    std::fs::write(&target_file, old_content).unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-write-checkpoint-reject",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": new_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-write-checkpoint-reject-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-write-checkpoint-reject");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-write-checkpoint-reject");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-write-checkpoint-reject");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"writecheckpointrejectfile\r")
+        .expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("write") && output.contains("-preimagecontentbeforereject") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("-preimagecontentbeforereject"),
+        "expected pty output to contain the old-content diff line, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"n")
+        .expect("failed to write reject keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after rejecting the write \
+         tool call (the loop must continue, not crash), got: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        old_content,
+        "the file must not have been written after permission was rejected"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let sessions_dir = xdg_data_home.join("rokr").join("sessions");
+    let session_dir_entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&sessions_dir)
+        .unwrap_or_else(|err| {
+            panic!("expected sessions directory to exist at {sessions_dir:?}, got error: {err:?}")
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert_eq!(
+        session_dir_entries.len(),
+        1,
+        "expected exactly one ULID-named session directory under {sessions_dir:?}"
+    );
+    let session_dir = session_dir_entries[0].path();
+
+    let snapshots_dir = session_dir.join("snapshots");
+    assert!(
+        !snapshots_dir.exists(),
+        "a denied write must not create a snapshots directory at all, got: {snapshots_dir:?}"
+    );
+
+    let session_jsonl_contents =
+        std::fs::read_to_string(session_dir.join("session.jsonl")).unwrap_or_default();
+    let checkpoint_records: Vec<rokr_session::SessionRecord> = session_jsonl_contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+        .filter(|record| matches!(record, rokr_session::SessionRecord::Checkpoint { .. }))
+        .collect();
+    assert!(
+        checkpoint_records.is_empty(),
+        "a denied write must not append a Checkpoint record, got: {checkpoint_records:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 /// Extends `write_tool_call_renders_diff_and_writes_file_on_accept` to a
 /// second gated tool: unlike `write`'s whole-file diff, `edit`'s diff-review
 /// must render only the targeted replacement region, not the whole file. Does

@@ -229,6 +229,17 @@ impl SessionHandle {
         });
     }
 
+    /// Enqueues a `Checkpoint` record. Intended to be called once per
+    /// captured pre-image snapshot (ticket 38, checkpoint-pre-images),
+    /// correlating `turn_index` with the `snapshot_id` a
+    /// [`CheckpointStore::snapshot`] call just returned.
+    pub fn append_checkpoint(&self, turn_index: usize, snapshot_id: String) {
+        self.enqueue(SessionRecord::Checkpoint {
+            turn_index,
+            snapshot_id,
+        });
+    }
+
     fn enqueue(&self, record: SessionRecord) {
         // The writer task's receiver only disappears when the task itself
         // is gone (e.g. process shutdown mid-write) -- a dropped send here
@@ -510,6 +521,108 @@ impl SessionStore {
         }
 
         Ok(matches)
+    }
+}
+
+/// Copy-on-write pre-image capture for a single session's write/edit tool
+/// calls (ticket 38, checkpoint-pre-images; PRD phase-5-session-management
+/// decision 4). Deliberately NOT a shadow git repo -- at the moment a
+/// write/edit tool call is about to execute, the prior file content (the
+/// `old` side of the permission-preview diff, already computed for that
+/// prompt and reused here rather than re-read) is captured under
+/// `sessions/<id>/snapshots/`, keyed by `(turn_index, path)`. Bash-driven
+/// mutations are explicitly out of scope -- only `write`/`edit` have a
+/// well-defined pre-image at a clean boundary (the permission-decision
+/// point in `crates/rokr/src/main.rs`).
+pub struct CheckpointStore {
+    snapshots_dir: PathBuf,
+}
+
+impl CheckpointStore {
+    /// `data_dir` is the same already-resolved central data directory
+    /// [`SessionStore::open`] takes; snapshots for `session_id` live under
+    /// `data_dir/sessions/<session_id>/snapshots/`.
+    pub fn open(data_dir: impl Into<PathBuf>, session_id: &str) -> Self {
+        Self {
+            snapshots_dir: data_dir.into().join("sessions").join(session_id).join("snapshots"),
+        }
+    }
+
+    /// Writes `old_content`'s pre-image for `(turn_index, path)` under this
+    /// session's `snapshots/` directory (created if needed), returning
+    /// `(snapshot_id, newly_written)`: `snapshot_id` is what a
+    /// [`SessionHandle::append_checkpoint`] call can correlate with
+    /// `turn_index` in a `Checkpoint` record; `newly_written` is `true` only
+    /// the FIRST time this `(turn_index, path)` key is captured (see
+    /// "First-write-wins" below) -- callers should only append a
+    /// `Checkpoint` record when it's `true`, to avoid appending a
+    /// duplicate-`snapshot_id` `Checkpoint` record for a mutation that wrote
+    /// no new snapshot.
+    ///
+    /// `old_content` is `Some(content)` for a pre-existing file (including a
+    /// genuinely empty one -- `Some("")`) and `None` for a brand-new file
+    /// write, which has no pre-image at all. These two cases are stored
+    /// distinguishably on disk: `Some(content)` writes `content` verbatim to
+    /// the snapshot's content file (so a future rollback ticket can restore
+    /// it byte-for-byte); `None` writes no content file at all, only a
+    /// `<snapshot_id>.absent` marker file, so a future rollback ticket can
+    /// tell "restore this content" apart from "this file didn't exist,
+    /// delete it" -- an empty-string content file alone would be ambiguous
+    /// between the two.
+    ///
+    /// First-write-wins (ticket 38 scope-amendment, F-001 per argus review):
+    /// a turn's tool loop can mutate the SAME path more than once (e.g.
+    /// `write` then `edit`) -- only the FIRST call for a given
+    /// `(turn_index, path)` key actually writes anything; a later call for
+    /// the same key is a no-op (`newly_written: false`) that just returns
+    /// the already-captured snapshot_id, since that first call already
+    /// holds the true turn-start pre-image (a later call's `old_content` is
+    /// already the post-first-mutation content, not the real pre-turn
+    /// state). This also prevents an absent-marker and a content file from
+    /// ever coexisting for the same snapshot_id (e.g. a brand-new-file
+    /// write followed by a second write to the same now-existing path
+    /// within the same turn).
+    pub fn snapshot(
+        &self,
+        turn_index: usize,
+        path: &str,
+        old_content: Option<&str>,
+    ) -> std::io::Result<(String, bool)> {
+        std::fs::create_dir_all(&self.snapshots_dir)?;
+
+        let snapshot_id = Self::snapshot_id(turn_index, path);
+        let content_path = self.snapshots_dir.join(&snapshot_id);
+        let absent_marker_path = self.snapshots_dir.join(format!("{snapshot_id}.absent"));
+
+        if content_path.exists() || absent_marker_path.exists() {
+            return Ok((snapshot_id, false));
+        }
+
+        match old_content {
+            Some(content) => {
+                std::fs::write(content_path, content)?;
+            }
+            None => {
+                std::fs::write(absent_marker_path, "")?;
+            }
+        }
+
+        Ok((snapshot_id, true))
+    }
+
+    /// Deterministically derives a filesystem-safe snapshot id from
+    /// `(turn_index, path)`: every non-alphanumeric character in `path` is
+    /// replaced with `_`, prefixed with the turn index, so two different
+    /// `(turn_index, path)` pairs never collide (short of `path` itself
+    /// containing only characters that sanitize to the same string, which
+    /// none of this codebase's real paths do) and the id stays readable for
+    /// debugging on disk.
+    fn snapshot_id(turn_index: usize, path: &str) -> String {
+        let sanitized_path: String = path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        format!("t{turn_index}-{sanitized_path}")
     }
 }
 
@@ -1273,6 +1386,196 @@ mod tests {
         assert!(
             !matches.contains(&no_match_id),
             "expected search to exclude the session with no matching content, got: {matches:?}"
+        );
+    }
+
+    /// Ticket 38 (checkpoint-pre-images): `CheckpointStore::snapshot` writes
+    /// a file's pre-image content under `sessions/<id>/snapshots/`, keyed by
+    /// `(turn_index, path)` -- proves the stored bytes exactly match what
+    /// was passed in, and that the keying actually distinguishes different
+    /// `(turn_index, path)` pairs rather than colliding/overwriting: same
+    /// path at two different turn indices, and two different paths at the
+    /// same turn index, must each land in their own snapshot file.
+    #[test]
+    fn checkpoint_store_snapshot_writes_pre_image_keyed_by_turn_and_path() {
+        let dir = unique_temp_dir("checkpoint-store");
+        let store = CheckpointStore::open(&dir, "sess-checkpoint-1");
+
+        let path_a = "/some/project/a.txt";
+        let path_b = "/some/project/b.txt";
+
+        let (snapshot_turn0_path_a, newly_written_turn0_path_a) = store
+            .snapshot(0, path_a, Some("content-a-turn0"))
+            .expect("snapshotting an existing file's content should succeed");
+        let (snapshot_turn1_path_a, newly_written_turn1_path_a) = store
+            .snapshot(1, path_a, Some("content-a-turn1"))
+            .expect("snapshotting the same path at a later turn should succeed");
+        let (snapshot_turn0_path_b, newly_written_turn0_path_b) = store
+            .snapshot(0, path_b, Some("content-b-turn0"))
+            .expect("snapshotting a different path at the same turn should succeed");
+
+        assert!(
+            newly_written_turn0_path_a && newly_written_turn1_path_a && newly_written_turn0_path_b,
+            "each of these three distinct (turn_index, path) keys is captured for the first \
+             time, so all three should report newly_written: true"
+        );
+
+        assert_ne!(
+            snapshot_turn0_path_a, snapshot_turn1_path_a,
+            "same path at two different turn indices must not collide"
+        );
+        assert_ne!(
+            snapshot_turn0_path_a, snapshot_turn0_path_b,
+            "two different paths at the same turn index must not collide"
+        );
+
+        let snapshots_dir = dir
+            .join("sessions")
+            .join("sess-checkpoint-1")
+            .join("snapshots");
+        assert_eq!(
+            std::fs::read_to_string(snapshots_dir.join(&snapshot_turn0_path_a)).unwrap(),
+            "content-a-turn0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshots_dir.join(&snapshot_turn1_path_a)).unwrap(),
+            "content-a-turn1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshots_dir.join(&snapshot_turn0_path_b)).unwrap(),
+            "content-b-turn0"
+        );
+    }
+
+    /// Ticket 38 (checkpoint-pre-images), step 5: a brand-new file write has
+    /// no pre-image at all -- distinct from a pre-existing but genuinely
+    /// empty file. `snapshot`'s `old_content: Option<&str>` lets a caller
+    /// pass `None` for the former and `Some("")` for the latter, and this
+    /// asserts the on-disk result is actually distinguishable: an empty
+    /// pre-existing file still produces a (zero-byte) content file, while an
+    /// absent pre-image produces no content file at all, only a distinct
+    /// marker.
+    #[test]
+    fn checkpoint_store_snapshot_distinguishes_absent_pre_image_from_empty_pre_existing_file() {
+        let dir = unique_temp_dir("checkpoint-store-absent");
+        let store = CheckpointStore::open(&dir, "sess-checkpoint-2");
+
+        let (empty_snapshot, _) = store
+            .snapshot(0, "/some/pre-existing-empty.txt", Some(""))
+            .expect("snapshotting a genuinely empty pre-existing file should succeed");
+        let (absent_snapshot, _) = store
+            .snapshot(1, "/some/brand-new-file.txt", None)
+            .expect("snapshotting a new-file write (no pre-image) should succeed");
+
+        let snapshots_dir = dir
+            .join("sessions")
+            .join("sess-checkpoint-2")
+            .join("snapshots");
+
+        assert!(
+            snapshots_dir.join(&empty_snapshot).exists(),
+            "an empty pre-existing file must still produce a content file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(snapshots_dir.join(&empty_snapshot)).unwrap(),
+            ""
+        );
+        assert!(
+            !snapshots_dir.join(&absent_snapshot).exists(),
+            "an absent pre-image must not produce a content file"
+        );
+        assert!(
+            snapshots_dir
+                .join(format!("{absent_snapshot}.absent"))
+                .exists(),
+            "an absent pre-image must produce a distinct on-disk marker"
+        );
+    }
+
+    /// Ticket 38 scope-amendment (F-001, argus review): a turn's tool loop
+    /// doing `write` then `edit` on the SAME path is a normal pattern -- the
+    /// second call's `old` is the post-first-write content, which must NOT
+    /// clobber the true turn-start pre-image already captured by the first
+    /// call. Asserts first-write-wins: a second `snapshot` call for the
+    /// SAME `(turn_index, path)` key returns the SAME snapshot_id, and the
+    /// stored bytes still match the FIRST call's content, not the second.
+    #[test]
+    fn checkpoint_store_snapshot_first_write_wins_on_repeated_key_within_same_turn() {
+        let dir = unique_temp_dir("checkpoint-store-first-write-wins");
+        let store = CheckpointStore::open(&dir, "sess-checkpoint-3");
+        let path = "/some/project/repeated.txt";
+
+        let (first_snapshot, first_newly_written) = store
+            .snapshot(0, path, Some("original"))
+            .expect("first snapshot call should succeed");
+        let (second_snapshot, second_newly_written) = store
+            .snapshot(0, path, Some("intermediate"))
+            .expect("second snapshot call for the same key should succeed (as a no-op write)");
+
+        assert_eq!(
+            first_snapshot, second_snapshot,
+            "the same (turn_index, path) key must produce the same snapshot_id"
+        );
+        assert!(first_newly_written, "the first call for a new key must report newly_written: true");
+        assert!(
+            !second_newly_written,
+            "the second call for an ALREADY-captured key must report newly_written: false, so \
+             a caller knows not to append a duplicate Checkpoint record"
+        );
+
+        let snapshots_dir = dir
+            .join("sessions")
+            .join("sess-checkpoint-3")
+            .join("snapshots");
+        assert_eq!(
+            std::fs::read_to_string(snapshots_dir.join(&first_snapshot)).unwrap(),
+            "original",
+            "the SECOND snapshot call for the same (turn_index, path) key must not overwrite \
+             the FIRST call's true pre-turn pre-image"
+        );
+    }
+
+    /// Ticket 38 scope-amendment (F-001, argus review): if the first
+    /// mutation of a path within a turn is a brand-new-file write
+    /// (`old_content: None`, producing a `.absent` marker) and a LATER
+    /// mutation of the SAME path within the SAME turn passes `Some(content)`
+    /// (e.g. a second `write` call after the file now exists), the second
+    /// call must still be a no-op -- it must NOT also create a content file
+    /// alongside the `.absent` marker, which would be an ambiguous,
+    /// contradictory on-disk state (both "this file didn't exist" and
+    /// "here is its content" for the same snapshot_id).
+    #[test]
+    fn checkpoint_store_snapshot_first_write_wins_does_not_create_coexisting_absent_and_content_files(
+    ) {
+        let dir = unique_temp_dir("checkpoint-store-first-write-wins-absent");
+        let store = CheckpointStore::open(&dir, "sess-checkpoint-4");
+        let path = "/some/project/new-then-mutated.txt";
+
+        let (first_snapshot, first_newly_written) = store
+            .snapshot(0, path, None)
+            .expect("first snapshot call (brand-new file, no pre-image) should succeed");
+        let (second_snapshot, second_newly_written) = store
+            .snapshot(0, path, Some("later content"))
+            .expect("second snapshot call for the same key should succeed (as a no-op write)");
+
+        assert_eq!(first_snapshot, second_snapshot);
+        assert!(first_newly_written);
+        assert!(
+            !second_newly_written,
+            "a second call for an already-captured key must report newly_written: false"
+        );
+
+        let snapshots_dir = dir
+            .join("sessions")
+            .join("sess-checkpoint-4")
+            .join("snapshots");
+        assert!(
+            snapshots_dir.join(format!("{first_snapshot}.absent")).exists(),
+            "the original absent marker must still be present"
+        );
+        assert!(
+            !snapshots_dir.join(&first_snapshot).exists(),
+            "no content file must coexist with the absent marker for the same snapshot_id"
         );
     }
 
