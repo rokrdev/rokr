@@ -756,13 +756,25 @@ async fn main() -> ExitCode {
                     // On failure the transcript is left untouched and a
                     // notice is prepended to this turn's reply instead of
                     // losing history.
-                    let prior_usage = {
+                    let (prior_usage, effective_usage_for_percent) = {
                         let mut guard = last_known_usage.lock().unwrap();
                         let prior = *guard;
-                        if usage.input_tokens != 0 || usage.output_tokens != 0 {
+                        let effective = if usage.input_tokens != 0 || usage.output_tokens != 0 {
                             *guard = Some(usage);
-                        }
-                        prior
+                            usage
+                        } else {
+                            // F-011 (argus review): some OpenAI-compatible
+                            // proxies intermittently omit real usage for a
+                            // turn (an all-zero figure) -- treating that as
+                            // "this turn used zero tokens" would visibly
+                            // drop the status line's percentage to 0%. Fall
+                            // back to whatever was last known (or the same
+                            // all-zero `usage` if nothing real has ever
+                            // been reported this session, matching today's
+                            // very first-turn behavior).
+                            guard.unwrap_or(usage)
+                        };
+                        (prior, effective)
                     };
 
                     // Ticket 43 (mouse-scroll-status-line): sent after every
@@ -772,8 +784,15 @@ async fn main() -> ExitCode {
                     // status line rather than leaving the previous turn's
                     // percentage stale). `context_window_size` is the same
                     // `u32` already captured by this closure for
-                    // `should_compact` below.
-                    let context_percent = (usage.input_tokens + usage.output_tokens) as f64
+                    // `should_compact` below. F-011: uses
+                    // `effective_usage_for_percent` (falls back to the last
+                    // known real usage on an all-zero report) rather than
+                    // the raw `usage` -- scoped ONLY to this status-line
+                    // percentage; `should_compact` below still sees the raw
+                    // `usage`/`prior_usage` unchanged.
+                    let context_percent = (effective_usage_for_percent.input_tokens
+                        + effective_usage_for_percent.output_tokens)
+                        as f64
                         / context_window_size as f64;
                     let _ = status_tx.send(rokr_tui::SessionStatus { context_percent });
 
@@ -1103,19 +1122,19 @@ async fn capture_checkpoint_if_granted_diff(
 /// handled here so both `ResumeMode::Id` and `ResumeMode::Continue` share
 /// the identical resolution logic.
 ///
-/// Ticket 38 (checkpoint-pre-images): also seeds a starting `turn_index`
-/// (the 4th tuple element) for the resumed session. Per `fold`'s doc
-/// comment (`rokr-session`), a `Rollback` record does not rewind
+/// Ticket 38 (checkpoint-pre-images) / F-003 (argus review, phase-5): also
+/// seeds a starting `turn_index` (the 4th tuple element) for the resumed
+/// session. This comes directly from `fold`'s own real `next_turn_index`
+/// (carried through `ResumeState`, see `rokr-session`), NOT from a separate
+/// `store.list_sessions()` lookup against `sessions/index.jsonl` -- the
+/// index is a denormalized, appended-incrementally read-optimization over
+/// the session's own `session.jsonl` log, and can be missing an entry
+/// entirely (or stale) for a session that legitimately exists on disk. Per
+/// `fold`'s doc comment, a `Rollback` record does not rewind
 /// `next_turn_index` -- later genuinely-new turns keep incrementing from
-/// where the raw `Turn` count left off -- so the correct seed is the
-/// session's raw `Turn` record count, read via `store.list_sessions()`'s
-/// matching `SessionIndexEntry.turn_count` (the same field
-/// `handle_resume_command` already reads for its confirmation message).
-/// Falls back to 0 (with a `turn_count` of 0 being indistinguishable from
-/// "not found in the index yet") if the index lookup fails or has no
-/// matching entry -- a degraded-but-safe fallback consistent with this
-/// function's existing pattern of degrading gracefully on `open_session`
-/// failure rather than hard-erroring.
+/// where the raw `Turn` count left off -- and `ResumeState::next_turn_index`
+/// already reflects that correctly because it's the exact same value `fold`
+/// itself computed while building `messages` above.
 #[allow(clippy::type_complexity)]
 fn resolve_resumed_session(
     store: &rokr_session::SessionStore,
@@ -1134,17 +1153,6 @@ fn resolve_resumed_session(
         ExitCode::FAILURE
     })?;
 
-    let initial_turn_index = store
-        .list_sessions()
-        .ok()
-        .and_then(|entries| {
-            entries
-                .into_iter()
-                .find(|entry| entry.session_id == session_id)
-        })
-        .map(|entry| entry.turn_count)
-        .unwrap_or(0);
-
     let session_handle = match store.open_session(session_id) {
         Ok(handle) => Some(Arc::new(handle)),
         Err(err) => {
@@ -1157,7 +1165,7 @@ fn resolve_resumed_session(
         messages,
         resume_state.last_known_usage,
         session_handle,
-        initial_turn_index,
+        resume_state.next_turn_index,
     ))
 }
 
@@ -1180,6 +1188,20 @@ fn resolve_resumed_session(
 ///
 /// `arg` is everything after `/resume ` (e.g. `"01ABC... --yes"` or just
 /// `"01ABC..."`); this fn splits off a trailing `--yes` itself.
+///
+/// F-007 (argus review): flushes the ORIGIN session's writer BEFORE
+/// resolving/opening the TARGET, so an append enqueued just before this
+/// jump (this turn's own `Turn` record, or an earlier `Checkpoint` record
+/// from the same turn) is guaranteed to reach disk before this session's
+/// log is later re-read by a future jump back to it.
+///
+/// F-003 / F-008 (argus review): both the unconfirmed warning message and
+/// the confirmed swap re-seed `turn_index` from `fold`'s real
+/// `next_turn_index` (via `ResumeState`), not from `sessions/index.jsonl`'s
+/// `turn_count` -- a target session that exists on disk but is absent from
+/// the index (e.g. the index file was lost or is stale) still needs to
+/// work correctly rather than falling back to "no such session" or a wrong
+/// turn_index of 0.
 async fn handle_resume_command(
     store: &rokr_session::SessionStore,
     transcript: &tokio::sync::Mutex<Vec<rokr_core::Message>>,
@@ -1193,13 +1215,9 @@ async fn handle_resume_command(
         None => (arg.trim(), false),
     };
 
-    let target_entry = match store.list_sessions() {
+    let indexed_entry = match store.list_sessions() {
         Ok(entries) => entries.into_iter().find(|entry| entry.session_id == target_id),
         Err(err) => return format!("failed to look up session {target_id}: {err}"),
-    };
-    let target_entry = match target_entry {
-        Some(entry) => entry,
-        None => return format!("no such session {target_id}"),
     };
 
     let current_id = session_handle
@@ -1212,11 +1230,41 @@ async fn handle_resume_command(
     }
 
     if !confirmed {
-        return format!(
-            "Switching to {target_id} ({}, {} turns) replaces your current context. \
-             Run '/resume {target_id} --yes' to confirm.",
-            target_entry.title, target_entry.turn_count
-        );
+        // F-008: an indexed entry gives a real title/turn-count for the
+        // warning message. A session that exists on disk but is absent
+        // from sessions/index.jsonl (e.g. the index file was lost or is
+        // stale) still needs a warning rather than a wrong "no such
+        // session" -- fall back to `resume_session` just to confirm the
+        // session actually exists and to derive a REAL turn count from the
+        // fold (not a placeholder), with a placeholder title since only
+        // the index ever carried one.
+        return match indexed_entry {
+            Some(entry) => format!(
+                "Switching to {target_id} ({}, {} turns) replaces your current context. \
+                 Run '/resume {target_id} --yes' to confirm.",
+                entry.title, entry.turn_count
+            ),
+            None => match store.resume_session(target_id) {
+                Ok((_, _, resume_state)) => format!(
+                    "Switching to {target_id} (<not in session index>, {} turns) replaces \
+                     your current context. Run '/resume {target_id} --yes' to confirm.",
+                    resume_state.next_turn_index
+                ),
+                Err(_) => format!("no such session {target_id}"),
+            },
+        };
+    }
+
+    // F-007: flush the ORIGIN session's writer BEFORE resolving/opening the
+    // TARGET. Without this, an append enqueued just before this jump (e.g.
+    // this turn's own Turn record, or an earlier Checkpoint record from the
+    // same turn) has no guaranteed opportunity to reach disk before this
+    // session's log is later re-read by a FUTURE jump back to it -- and
+    // briefly having two writer tasks alive against the same origin file
+    // (the old one draining its queue, a hypothetical new one) is also
+    // avoided by making sure the old one's queue is fully drained first.
+    if let Some(origin_handle) = session_handle.read().await.as_ref() {
+        origin_handle.flush().await;
     }
 
     let (messages, _meta, resume_state) = match store.resume_session(target_id) {
@@ -1232,13 +1280,10 @@ async fn handle_resume_command(
 
     *transcript.lock().await = messages;
     *last_known_usage.lock().unwrap() = resume_state.last_known_usage;
-    // Ticket 38 (checkpoint-pre-images): re-seed `turn_index` to the
-    // TARGET session's real prior `Turn` count -- `target_entry` was
-    // already fetched above for the confirmation message, so this reuses
-    // it rather than a second `list_sessions()` lookup. Without this, a
-    // turn submitted after this jump would capture checkpoints keyed by
-    // the WRONG (origin) session's turn numbering.
-    *turn_index.lock().unwrap() = target_entry.turn_count;
+    // F-003: re-seed turn_index from fold's real next_turn_index (NOT
+    // index.jsonl's turn_count, which can be missing/stale for a session
+    // absent from the index -- see F-008 above).
+    *turn_index.lock().unwrap() = resume_state.next_turn_index;
     *session_handle.write().await = Some(new_handle);
 
     format!("Resumed {target_id}; continuing from its context")
@@ -2018,6 +2063,267 @@ mod tests {
             1,
             "expected exactly one Checkpoint record for two mutations of the same path within \
              the same turn, got: {checkpoint_records:?}"
+        );
+    }
+
+    /// F-003 (argus review, phase-5-session-management): `turn_index` for a
+    /// resumed session must be seeded from `fold`'s own real
+    /// `next_turn_index` (via `ResumeState`), not from a separate
+    /// `store.list_sessions()` lookup against `sessions/index.jsonl` --
+    /// which can be missing an entry entirely for a session that
+    /// legitimately exists on disk. Builds a session's `session.jsonl`
+    /// directly (bypassing `create_session`/`append_header` entirely) so
+    /// `sessions/index.jsonl` is NEVER created, mirroring
+    /// `resume_command_with_confirm_flag_swaps_transcript_restores_usage_and_repoints_writer`'s
+    /// hand-appended-fixture convention.
+    #[tokio::test]
+    async fn resolve_resumed_session_seeds_turn_index_from_fold_when_no_index_entry_exists() {
+        let dir = unique_temp_dir("resolve-resumed-no-index");
+        let session_id = "01HANDBUILTNOINDEXSEED".to_string();
+        let session_dir = dir.join("sessions").join(&session_id);
+        std::fs::create_dir_all(&session_dir).expect("failed to create session dir fixture");
+
+        let mut records = vec![rokr_session::SessionRecord::Header {
+            schema_version: 1,
+            session_id: session_id.clone(),
+            created_at: "2026-07-20T00:00:00Z".to_string(),
+            project_path: "/projects/no-index".to_string(),
+            agent_tier: "build".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+        }];
+        for i in 0..3u64 {
+            records.push(rokr_session::SessionRecord::Turn {
+                message: Message::user_text(format!("turn {i}")),
+                usage: UsageRecord {
+                    input_tokens: i + 1,
+                    output_tokens: i + 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                timestamp: format!("2026-07-20T00:00:0{i}Z"),
+            });
+        }
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize SessionRecord"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(session_dir.join("session.jsonl"), contents)
+            .expect("failed to write session.jsonl fixture");
+
+        assert!(
+            !dir.join("sessions").join("index.jsonl").exists(),
+            "sessions/index.jsonl must not exist for this test to be meaningful"
+        );
+
+        let store = rokr_session::SessionStore::open(&dir);
+        let (_, _, _, turn_index) = match resolve_resumed_session(&store, session_id.clone()) {
+            Ok(resolved) => resolved,
+            Err(_) => panic!(
+                "resolve_resumed_session should succeed against a hand-built fixture log even \
+                 when sessions/index.jsonl has no entry for it"
+            ),
+        };
+
+        assert_eq!(
+            turn_index, 3,
+            "expected turn_index to be seeded from fold's real next_turn_index (3 raw Turn \
+             records), not a stale/missing index lookup (F-003), got: {turn_index}"
+        );
+    }
+
+    /// F-003 (jump path) + F-008 (argus review): `/resume <id> --yes` must
+    /// still succeed, and correctly re-seed `turn_index` from the real
+    /// fold, even when the TARGET session has no `sessions/index.jsonl`
+    /// entry at all -- proving the fallback path (`store.resume_session`
+    /// used to both confirm existence and derive `next_turn_index`) rather
+    /// than failing with "no such session" just because the index lookup
+    /// came up empty.
+    #[tokio::test]
+    async fn resume_command_yes_falls_back_to_resume_session_and_seeds_turn_index_when_target_absent_from_index(
+    ) {
+        let dir = unique_temp_dir("resume-command-no-index-target");
+        let store = rokr_session::SessionStore::open(&dir);
+
+        let current_handle = store
+            .create_session()
+            .expect("create_session should succeed for the current session");
+        current_handle.append_header(
+            1,
+            current_handle.session_id().to_string(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/current".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        current_handle.flush().await;
+
+        let target_session_id = "01HANDBUILTNOINDEXTARGET".to_string();
+        let target_session_dir = dir.join("sessions").join(&target_session_id);
+        std::fs::create_dir_all(&target_session_dir)
+            .expect("failed to create target session dir fixture");
+        let mut records = vec![rokr_session::SessionRecord::Header {
+            schema_version: 1,
+            session_id: target_session_id.clone(),
+            created_at: "2026-07-20T01:00:00Z".to_string(),
+            project_path: "/projects/target".to_string(),
+            agent_tier: "plan".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+        }];
+        for i in 0..3u64 {
+            records.push(rokr_session::SessionRecord::Turn {
+                message: Message::user_text(format!("target turn {i}")),
+                usage: UsageRecord {
+                    input_tokens: i + 1,
+                    output_tokens: i + 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                timestamp: format!("2026-07-20T01:00:0{i}Z"),
+            });
+        }
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize SessionRecord"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(target_session_dir.join("session.jsonl"), contents)
+            .expect("failed to write target session.jsonl fixture");
+
+        let transcript = tokio::sync::Mutex::new(vec![Message::user_text("current turn")]);
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(current_handle)));
+        let last_known_usage = std::sync::Mutex::new(None);
+        let turn_index = std::sync::Mutex::new(0usize);
+
+        let reply = handle_resume_command(
+            &store,
+            &transcript,
+            &session_handle,
+            &last_known_usage,
+            &turn_index,
+            &format!("{target_session_id} --yes"),
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            format!("Resumed {target_session_id}; continuing from its context"),
+            "expected the jump to succeed via the resume_session fallback despite the target \
+             session having no sessions/index.jsonl entry (F-008), got: {reply:?}"
+        );
+        assert_eq!(
+            *turn_index.lock().unwrap(),
+            3,
+            "expected turn_index to be seeded from the real fold (F-003), not a nonexistent \
+             index entry"
+        );
+    }
+
+    /// F-007 (argus review): `/resume <id> --yes` must flush the ORIGIN
+    /// session's writer BEFORE resolving/opening the TARGET, so an append
+    /// enqueued just before the jump (fire-and-forget, no explicit flush)
+    /// is guaranteed to have reached disk before a LATER jump back to that
+    /// same origin session re-reads its log. Uses the default
+    /// current-thread `#[tokio::test]` flavor deliberately: determinism
+    /// here depends on there being no other OS thread that could race the
+    /// writer task independently of this test's own explicit yield points.
+    #[tokio::test]
+    async fn jump_flushes_origin_session_before_swapping_so_a_later_rejump_sees_the_pending_append(
+    ) {
+        let dir = unique_temp_dir("resume-command-flush-before-jump");
+        let store = rokr_session::SessionStore::open(&dir);
+
+        let handle_a = store
+            .create_session()
+            .expect("create_session should succeed for session A");
+        let session_a_id = handle_a.session_id().to_string();
+        handle_a.append_header(
+            1,
+            session_a_id.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/a".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        handle_a.flush().await;
+
+        let handle_b = store
+            .create_session()
+            .expect("create_session should succeed for session B");
+        let session_b_id = handle_b.session_id().to_string();
+        handle_b.append_header(
+            1,
+            session_b_id.clone(),
+            "2026-07-20T01:00:00Z".to_string(),
+            "/projects/b".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        handle_b.flush().await;
+
+        let pending_text = "pending unflushed turn in session A before jump";
+        // Deliberately fire-and-forget: no `.flush().await` here, simulating
+        // a write enqueued just before the jump.
+        handle_a.append_turn(
+            Message::user_text(pending_text),
+            UsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            "2026-07-20T00:00:01Z".to_string(),
+        );
+
+        let transcript = tokio::sync::Mutex::new(Vec::new());
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(handle_a)));
+        let last_known_usage = std::sync::Mutex::new(None);
+        let turn_index = std::sync::Mutex::new(0usize);
+
+        let reply_to_b = handle_resume_command(
+            &store,
+            &transcript,
+            &session_handle,
+            &last_known_usage,
+            &turn_index,
+            &format!("{session_b_id} --yes"),
+        )
+        .await;
+        assert_eq!(
+            reply_to_b,
+            format!("Resumed {session_b_id}; continuing from its context")
+        );
+
+        let reply_to_a = handle_resume_command(
+            &store,
+            &transcript,
+            &session_handle,
+            &last_known_usage,
+            &turn_index,
+            &format!("{session_a_id} --yes"),
+        )
+        .await;
+        assert_eq!(
+            reply_to_a,
+            format!("Resumed {session_a_id}; continuing from its context")
+        );
+
+        assert!(
+            transcript
+                .lock()
+                .await
+                .iter()
+                .any(|m| m.text().contains(pending_text)),
+            "expected the pending unflushed turn appended to session A before the first jump \
+             to have been flushed to session A's session.jsonl by handle_resume_command's \
+             F-007 origin-flush, and therefore visible after re-jumping back to A"
         );
     }
 }

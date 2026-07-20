@@ -76,7 +76,7 @@ pub enum SessionRecord {
 /// `replaced_through` into one summary message; `Rollback` discards
 /// everything above `target` from the *current* working output (it does not
 /// rewind `next_turn_index`, so later genuinely-new turns still append).
-pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage>) {
+pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage>, usize) {
     let mut output: Vec<(usize, Message)> = Vec::new();
     let mut next_turn_index: usize = 0;
     let mut last_known_usage: Option<rokr_core::Usage> = None;
@@ -110,7 +110,7 @@ pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage
     }
 
     let messages = output.into_iter().map(|(_, message)| message).collect();
-    (messages, last_known_usage)
+    (messages, last_known_usage, next_turn_index)
 }
 
 /// Metadata about a session, extracted from its log's `Header` record.
@@ -134,6 +134,11 @@ pub struct SessionMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeState {
     pub last_known_usage: Option<rokr_core::Usage>,
+    /// The count of prior raw `Turn` records folded so far -- the index the
+    /// NEXT genuinely-new `Turn` record will occupy once appended (matches
+    /// `fold`'s own `next_turn_index` semantics: a `Rollback` does not
+    /// rewind it).
+    pub next_turn_index: usize,
 }
 
 /// One denormalized metadata snapshot about a session, read from and
@@ -417,9 +422,16 @@ impl SessionStore {
                 model: String::new(),
             });
 
-        let (messages, last_known_usage) = fold(&records);
+        let (messages, last_known_usage, next_turn_index) = fold(&records);
 
-        Ok((messages, meta, ResumeState { last_known_usage }))
+        Ok((
+            messages,
+            meta,
+            ResumeState {
+                last_known_usage,
+                next_turn_index,
+            },
+        ))
     }
 
     /// Lists session ids under `data_dir/sessions/`, sorted lexicographically
@@ -730,12 +742,25 @@ impl CheckpointStore {
     /// containing only characters that sanitize to the same string, which
     /// none of this codebase's real paths do) and the id stays readable for
     /// debugging on disk.
+    ///
+    /// F-006 (argus review): appends a short deterministic hash of the
+    /// UNSANITIZED `path` so two different paths that sanitize to the same
+    /// string (e.g. `foo-bar.txt` vs `foo_bar.txt`) still get distinct ids.
+    /// `parse_turn_index` remains unaffected: it only reads the digits
+    /// before the FIRST `-`, which is still exactly the boundary right
+    /// after `turn_index` (the sanitized path segment never contains a
+    /// literal `-`, since sanitization maps it to `_`) -- the new trailing
+    /// `-{hash_suffix}` lands inside the discarded remainder.
     fn snapshot_id(turn_index: usize, path: &str) -> String {
+        use std::hash::{Hash, Hasher};
         let sanitized_path: String = path
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        format!("t{turn_index}-{sanitized_path}")
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let hash_suffix = format!("{:08x}", hasher.finish() as u32);
+        format!("t{turn_index}-{sanitized_path}-{hash_suffix}")
     }
 
     /// Ticket 39 (rollback-command): parses the leading `turn_index` back
@@ -917,7 +942,7 @@ impl IndexState {
 /// How long a title (the first user prompt) is allowed to get before
 /// `/sessions`' listing truncates it -- picked to keep a one-line-per-
 /// session listing readable, not from any PRD-specified figure.
-const TITLE_MAX_CHARS: usize = 60;
+const TITLE_MAX_CHARS: usize = 80;
 
 fn truncate_title(text: &str) -> String {
     if text.chars().count() > TITLE_MAX_CHARS {
@@ -926,6 +951,31 @@ fn truncate_title(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Derives a session index title (the one-line `/sessions` listing's
+/// "title" column) from a message: the FIRST LINE of its first `Text`
+/// content block, with internal whitespace collapsed to single spaces,
+/// trimmed, and truncated to `TITLE_MAX_CHARS` with an ellipsis if it
+/// overflows (architect ruling, phase-5-session-management: supersedes an
+/// earlier "just replace \n with a space over the whole message" draft).
+/// Only the FIRST `Text` block is considered (other block kinds --
+/// `ToolUse`/`ToolResult` -- contribute nothing to a title and are never
+/// reached here since a `Turn` record's message is always constructed via
+/// `Message::user_text`, a single `Text` block); only its FIRST LINE is
+/// considered, which naturally clips e.g. an @-mention-expanded file's
+/// contents down to something reasonable for a one-line listing, without
+/// separate handling for that case.
+fn derive_title(message: &Message) -> String {
+    let first_text_block = message.content.iter().find_map(|block| match block {
+        rokr_core::ContentBlock::Text { text, .. } => Some(text.as_str()),
+        rokr_core::ContentBlock::ToolUse { .. } | rokr_core::ContentBlock::ToolResult { .. } => {
+            None
+        }
+    });
+    let first_line = first_text_block.and_then(|text| text.lines().next()).unwrap_or("");
+    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_title(&collapsed)
 }
 
 /// Scans `session_file_path`'s existing contents (if any) into the baseline
@@ -973,7 +1023,7 @@ fn compute_initial_index_state(
                 } => {
                     state.turn_count += 1;
                     if state.title.is_none() {
-                        state.title = Some(truncate_title(&message.text()));
+                        state.title = Some(derive_title(&message));
                     }
                     state.updated_at = timestamp;
                 }
@@ -1005,9 +1055,30 @@ async fn run_writer(
     while let Some(command) = rx.recv().await {
         match command {
             WriterCommand::Append(record) => {
-                if let Ok(mut line) = serde_json::to_string(&record) {
-                    line.push('\n');
-                    let _ = file.write_all(line.as_bytes()).await;
+                // F-004 (argus review): every failure branch below used to
+                // be silently discarded (`let _ = ...`/`if let Ok(...) =
+                // ...` with no `else`) -- a full disk, a permissions
+                // problem, or a serialization bug would vanish without a
+                // trace. Each now logs a warning naming the session id, so
+                // a real failure is at least visible, while still not
+                // panicking/propagating (this task is scoped to visibility,
+                // not retry/backoff semantics).
+                match serde_json::to_string(&record) {
+                    Ok(mut line) => {
+                        line.push('\n');
+                        if let Err(err) = file.write_all(line.as_bytes()).await {
+                            eprintln!(
+                                "warning: session {}: failed to write session.jsonl record: {err}",
+                                index_state.session_id
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "warning: session {}: failed to serialize session.jsonl record: {err}",
+                            index_state.session_id
+                        );
+                    }
                 }
 
                 // A Compaction/Rollback/Checkpoint record leaves the index
@@ -1033,7 +1104,7 @@ async fn run_writer(
                     } => {
                         index_state.turn_count += 1;
                         if index_state.title.is_none() {
-                            index_state.title = Some(truncate_title(&message.text()));
+                            index_state.title = Some(derive_title(message));
                         }
                         index_state.updated_at = timestamp.clone();
                         true
@@ -1042,15 +1113,38 @@ async fn run_writer(
                 };
 
                 if index_changed {
-                    if let Ok(mut line) = serde_json::to_string(&index_state.to_entry()) {
-                        line.push('\n');
-                        let _ = index_file.write_all(line.as_bytes()).await;
+                    match serde_json::to_string(&index_state.to_entry()) {
+                        Ok(mut line) => {
+                            line.push('\n');
+                            if let Err(err) = index_file.write_all(line.as_bytes()).await {
+                                eprintln!(
+                                    "warning: session {}: failed to write index.jsonl entry: {err}",
+                                    index_state.session_id
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "warning: session {}: failed to serialize index.jsonl entry: {err}",
+                                index_state.session_id
+                            );
+                        }
                     }
                 }
             }
             WriterCommand::Flush(ack) => {
-                let _ = file.flush().await;
-                let _ = index_file.flush().await;
+                if let Err(err) = file.flush().await {
+                    eprintln!(
+                        "warning: session {}: failed to flush session.jsonl: {err}",
+                        index_state.session_id
+                    );
+                }
+                if let Err(err) = index_file.flush().await {
+                    eprintln!(
+                        "warning: session {}: failed to flush index.jsonl: {err}",
+                        index_state.session_id
+                    );
+                }
                 let _ = ack.send(());
             }
         }
@@ -1129,7 +1223,7 @@ mod tests {
             },
         ];
 
-        let (messages, last_usage) = fold(&records);
+        let (messages, last_usage, _next_turn_index) = fold(&records);
 
         assert_eq!(
             messages,
@@ -1176,7 +1270,7 @@ mod tests {
             },
         ];
 
-        let (messages, last_usage) = fold(&records);
+        let (messages, last_usage, _next_turn_index) = fold(&records);
 
         assert_eq!(
             messages,
@@ -1217,7 +1311,7 @@ mod tests {
             SessionRecord::Rollback { target: 1 },
         ];
 
-        let (messages, last_usage) = fold(&records);
+        let (messages, last_usage, _next_turn_index) = fold(&records);
 
         assert_eq!(
             messages,
@@ -1265,7 +1359,7 @@ mod tests {
             SessionRecord::Rollback { target: 3 },
         ];
 
-        let (messages, last_usage) = fold(&records);
+        let (messages, last_usage, _next_turn_index) = fold(&records);
 
         assert_eq!(
             messages,
@@ -1437,9 +1531,10 @@ mod tests {
             .resume_session(&session_id)
             .expect("resume_session should succeed against the fixture log");
 
-        let (expected_messages, expected_last_usage) = fold(&records);
+        let (expected_messages, expected_last_usage, expected_next_turn_index) = fold(&records);
         assert_eq!(messages, expected_messages);
         assert_eq!(resume_state.last_known_usage, expected_last_usage);
+        assert_eq!(resume_state.next_turn_index, expected_next_turn_index);
 
         match header {
             SessionRecord::Header {
@@ -1916,6 +2011,50 @@ mod tests {
         );
     }
 
+    /// F-006 (argus review): two different paths that sanitize to the SAME
+    /// string (e.g. `foo-bar.txt` vs `foo_bar.txt` -- both non-alphanumeric
+    /// separator chars collapse to `_`) must not collide on the same
+    /// `snapshot_id`. Pre-fix, `snapshot`'s first-write-wins `exists()`
+    /// check would treat the second path's snapshot as "already captured"
+    /// and silently drop its pre-image content.
+    #[test]
+    fn checkpoint_store_snapshot_id_distinguishes_paths_that_sanitize_to_the_same_string() {
+        let dir = unique_temp_dir("checkpoint-collision");
+        let store = CheckpointStore::open(&dir, "sess-collision-1");
+
+        let path_dash = dir.join("foo-bar.txt").to_string_lossy().into_owned();
+        let path_underscore = dir.join("foo_bar.txt").to_string_lossy().into_owned();
+
+        let (id_dash, newly_dash) = store.snapshot(0, &path_dash, Some("dash-content")).unwrap();
+        let (id_underscore, newly_underscore) =
+            store.snapshot(0, &path_underscore, Some("underscore-content")).unwrap();
+
+        assert!(newly_dash && newly_underscore);
+        assert_ne!(
+            id_dash, id_underscore,
+            "two paths that sanitize to the same string must not share a snapshot_id"
+        );
+
+        let snapshots_dir = dir.join("sessions").join("sess-collision-1").join("snapshots");
+        assert_eq!(std::fs::read_to_string(snapshots_dir.join(&id_dash)).unwrap(), "dash-content");
+        assert_eq!(
+            std::fs::read_to_string(snapshots_dir.join(&id_underscore)).unwrap(),
+            "underscore-content"
+        );
+
+        std::fs::write(&path_dash, "dash-current").unwrap();
+        std::fs::write(&path_underscore, "underscore-current").unwrap();
+
+        let mut touched = store.rollback_to(0).unwrap();
+        touched.sort();
+        let mut expected_touched = vec![path_dash.clone(), path_underscore.clone()];
+        expected_touched.sort();
+        assert_eq!(touched, expected_touched);
+
+        assert_eq!(std::fs::read_to_string(&path_dash).unwrap(), "dash-content");
+        assert_eq!(std::fs::read_to_string(&path_underscore).unwrap(), "underscore-content");
+    }
+
     /// Ticket 40 (prompt-history): appending more than `MAX_ENTRIES` entries
     /// and reloading must return exactly `MAX_ENTRIES` entries, oldest-first,
     /// with the earliest excess entries trimmed off -- proves both the
@@ -1983,5 +2122,157 @@ mod tests {
             + "\n";
         std::fs::write(session_dir.join("session.jsonl"), contents)
             .expect("failed to write session.jsonl fixture");
+    }
+
+    /// F-004 (argus review): `run_writer` must not panic when a real
+    /// `write_all` fails (previously every failure branch was silently
+    /// discarded via `let _ = ...`/`if let Ok(...) = ...` with no
+    /// diagnostic at all) -- it should log a warning and keep processing
+    /// subsequent commands normally. Forces a genuine write failure by
+    /// handing `run_writer` a `File` opened `read(true)` only (no write
+    /// access) against a path pre-created and chmod'd `0o444`, so the
+    /// internal `file.write_all` call genuinely errors at the OS level
+    /// rather than being simulated.
+    ///
+    /// This test deliberately does NOT assert on the literal `eprintln!`
+    /// warning text: capturing actual stderr output in an automated Rust
+    /// test would require process-wide fd redirection, which is fragile in
+    /// a parallel test binary -- other concurrently-running tests' own
+    /// `eprintln!` calls would also land in the redirected stream and
+    /// either corrupt this assertion or this test would corrupt theirs.
+    /// Instead this proves the *behavioral* contract (no panic, keeps
+    /// processing) which is what actually matters for correctness.
+    #[tokio::test]
+    async fn run_writer_survives_a_write_failure_without_panicking_and_keeps_processing_commands()
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir("run-writer-write-failure");
+
+        let session_file_path = dir.join("readonly-session.jsonl");
+        std::fs::write(&session_file_path, "").expect("failed to pre-create session.jsonl fixture");
+        let mut perms = std::fs::metadata(&session_file_path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&session_file_path, perms).unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&session_file_path)
+            .expect("should be able to open the read-only fixture for reading");
+
+        let index_file_path = dir.join("index.jsonl");
+        let index_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&index_file_path)
+            .expect("index.jsonl fixture should be creatable");
+
+        let index_state = IndexState {
+            session_id: "sess-write-failure".to_string(),
+            project_path: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            title: None,
+            turn_count: 0,
+            last_model: String::new(),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer_task = tokio::spawn(run_writer(file, index_file, index_state, rx));
+
+        // This Append's `file.write_all` will genuinely fail (the file
+        // handle has no write access) -- pre-fix this was silently
+        // swallowed with no diagnostic; post-fix it additionally logs a
+        // warning, but either way the writer task must not panic.
+        tx.send(WriterCommand::Append(SessionRecord::Turn {
+            message: Message::user_text("this write is doomed to fail"),
+            usage: UsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            timestamp: "2026-07-20T00:00:00Z".to_string(),
+        }))
+        .expect("channel send should succeed");
+
+        // Proves the writer task kept processing commands after the
+        // failed write, rather than panicking and dropping the receiver:
+        // a `Flush` sent right after still gets acked.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(WriterCommand::Flush(ack_tx))
+            .expect("channel send should succeed");
+        ack_rx
+            .await
+            .expect("writer task should still be alive and ack the Flush after the failed write");
+
+        drop(tx);
+        writer_task
+            .await
+            .expect("writer task should exit cleanly (not panic) once the channel is dropped");
+
+        // Restore write permission so the temp dir cleans up without issue.
+        let mut restored_perms = std::fs::metadata(&session_file_path).unwrap().permissions();
+        restored_perms.set_mode(0o644);
+        std::fs::set_permissions(&session_file_path, restored_perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Architect ruling (phase-5-session-management): supersedes the earlier
+    /// "replace \n with a space over the whole message" mechanical item.
+    /// `derive_title` must take only the FIRST LINE of the first `Text`
+    /// block, dropping any subsequent lines entirely (not joining them).
+    #[test]
+    fn derive_title_takes_only_first_line_of_first_text_block_collapsing_whitespace() {
+        let message = Message::user_text(
+            "line one has  extra   spaces\nline two should be dropped entirely",
+        );
+        assert_eq!(derive_title(&message), "line one has extra spaces");
+    }
+
+    /// Internal whitespace (tabs, stray `\r`, repeated spaces) within that
+    /// first line collapses to single spaces, and leading/trailing
+    /// whitespace is trimmed.
+    #[test]
+    fn derive_title_trims_and_collapses_carriage_returns_and_tabs() {
+        let message = Message::user_text("  \tfirst line with\ttabs and \r stray carriage return  ");
+        // Still only ONE line here (no \n), so the whole thing collapses/trims.
+        assert_eq!(
+            derive_title(&message),
+            "first line with tabs and stray carriage return"
+        );
+    }
+
+    /// `TITLE_MAX_CHARS` moved from 60 to ~80 per the architect ruling.
+    #[test]
+    fn derive_title_truncates_long_first_line_to_eighty_chars_with_ellipsis() {
+        let long_line = "x".repeat(100);
+        let message = Message::user_text(long_line);
+        let title = derive_title(&message);
+        assert_eq!(title, format!("{}...", "x".repeat(80)));
+    }
+
+    /// A message whose first content block is a `ToolUse` (not `Text`) must
+    /// still find and use the first REAL `Text` block, not blow up or return
+    /// an empty title. Constructed directly since `Message::user_text` only
+    /// ever produces a single `Text` block.
+    #[test]
+    fn derive_title_ignores_non_text_content_blocks_and_uses_first_text_block() {
+        let message = rokr_core::Message {
+            role: rokr_core::Role::User,
+            content: vec![
+                rokr_core::ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "some_tool".to_string(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+                rokr_core::ContentBlock::Text {
+                    text: "the real first line\nsecond line".to_string(),
+                    cache_control: None,
+                },
+            ],
+        };
+        assert_eq!(derive_title(&message), "the real first line");
     }
 }

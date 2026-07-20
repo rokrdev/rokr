@@ -427,19 +427,77 @@ enum EditorError {
 /// save, and the prompt buffer's existing contract (ticket 41,
 /// multiline-input: append-only, no forced trailing newline) shouldn't gain
 /// one merely from a round trip through `$EDITOR`.
+///
+/// Process-wide counter mixed into the temp file name alongside the
+/// nanosecond timestamp and PID. `edit_buffer_with_editor` used to write via
+/// `fs::write`, which silently overwrote on a name collision, so a same-tick
+/// collision was harmless. F-005 switched the temp file open to
+/// `create_new(true)` (see below), which instead *fails* on collision -- and
+/// the test binary runs several tests that call `edit_buffer_with_editor`
+/// concurrently on different threads, all sharing one PID, so two threads
+/// reading `SystemTime::now()` in the same clock tick could compute an
+/// identical path and hard-error. The counter guarantees every call within
+/// this process gets a distinct path regardless of clock resolution.
+static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn edit_buffer_with_editor(buffer: &str, editor_command: &str) -> Result<String, EditorError> {
-    let mut parts = editor_command.split_whitespace();
-    let program = parts.next().ok_or(EditorError::NotSet)?;
-    let args: Vec<&str> = parts.collect();
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if editor_command.trim().is_empty() {
+        return Err(EditorError::NotSet);
+    }
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let temp_path = std::env::temp_dir().join(format!("rokr-editor-{}-{nanos}.txt", std::process::id()));
-    std::fs::write(&temp_path, buffer).map_err(EditorError::Io)?;
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = std::env::temp_dir().join(format!(
+        "rokr-editor-{}-{nanos}-{counter}.txt",
+        std::process::id()
+    ));
 
-    let status = match Command::new(program).args(&args).arg(&temp_path).status() {
+    // F-005 (security, argus review): `OpenOptions::create_new(true)` fails
+    // atomically if `temp_path` already exists in ANY form -- including as
+    // a pre-planted symlink -- closing both the "predictable name" attack
+    // (an attacker pre-creates the path) and the "truncate-follows-symlink"
+    // attack (a plain `fs::write` would happily follow a symlink and
+    // clobber whatever it points at). `mode(0o600)` makes the file
+    // owner-read-write-only from creation, never briefly world-readable
+    // the way a bare `fs::create`/`fs::write` (mode 0644 by default) would
+    // be for the window between creation and any later chmod.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)
+        .map_err(EditorError::Io)?;
+    {
+        use std::io::Write as _;
+        file.write_all(buffer.as_bytes()).map_err(EditorError::Io)?;
+    }
+    drop(file);
+
+    // F-010 (argus review): spawned via the user's OWN shell (`sh -c`)
+    // rather than this process doing a naive `split_whitespace` on
+    // `editor_command` -- a naive split mangles a quoted argument (e.g.
+    // `EDITOR="code --wait --user-data-dir='/some path'"`), splitting it
+    // apart at the embedded space rather than respecting the quoting. `sh
+    // -c` parses `editor_command` exactly the way the user's own shell
+    // would, and the temp file path is passed as `$1` (a real positional
+    // parameter, safely substituted regardless of any special characters
+    // it might contain) rather than being string-interpolated into the `-c`
+    // script text. This is a deliberate, reviewed choice, not an oversight:
+    // it spawns the user's own `$EDITOR` value through their own shell --
+    // the same trust level as running the editor binary itself, since
+    // `$EDITOR` is already arbitrary user-controlled code.
+    let status = match Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor_command} \"$1\""))
+        .arg("sh") // becomes $0 inside the -c script
+        .arg(&temp_path) // becomes $1 inside the -c script
+        .status()
+    {
         Ok(status) => status,
         Err(io_err) => {
             let _ = std::fs::remove_file(&temp_path);
@@ -460,6 +518,16 @@ fn edit_buffer_with_editor(buffer: &str, editor_command: &str) -> Result<String,
     Ok(contents)
 }
 
+/// Resolves the `$EDITOR` env var into a usable editor command, falling
+/// back to `vi` when it's unset OR set to an empty/whitespace-only string
+/// (F-009, argus review) -- e.g. `EDITOR=""` in a script-generated
+/// environment should behave the same as `$EDITOR` being unset entirely,
+/// not surface a confusing "no editor command to run" error.
+fn resolve_editor_command(raw: Option<String>) -> String {
+    raw.filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_string())
+}
+
 /// Handles the editor keybinding (ticket 42, editor-integration): reads
 /// `$EDITOR` (falling back to `vi` if unset or empty), suspends the
 /// terminal via `guard`, runs [`edit_buffer_with_editor`] against the
@@ -476,7 +544,7 @@ fn run_editor_keybinding(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     guard: &TerminalGuard,
 ) -> io::Result<()> {
-    let editor_command = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let editor_command = resolve_editor_command(std::env::var("EDITOR").ok());
 
     guard.suspend();
     let result = edit_buffer_with_editor(&state.prompt_input, &editor_command);
@@ -1417,6 +1485,120 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    /// F-005 (argus review, security): the temp file `edit_buffer_with_editor`
+    /// writes the prompt buffer to must be created with owner-only
+    /// (`0600`) permissions from the moment it's created -- never briefly
+    /// world-readable, and never silently following/clobbering a
+    /// pre-planted symlink at the same predictable path. Proven here by
+    /// having the scripted "editor" `stat` its own `$1` argument (the temp
+    /// file) and record the octal mode into a marker file this test can
+    /// read back after the process exits and the temp file is deleted.
+    #[test]
+    fn edit_buffer_with_editor_creates_temp_file_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_dir = std::env::temp_dir().join(format!(
+            "rokr-tui-editor-perm-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&script_dir).expect("failed to create script dir");
+        let script_path = script_dir.join("permission_check_editor.sh");
+        let marker_path = script_dir.join("perm_marker.txt");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nstat -f '%Lp' \"$1\" > {marker_path:?} 2>/dev/null || stat -c '%a' \"$1\" > {marker_path:?}\n"
+            ),
+        )
+        .expect("failed to write permission-check editor script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("failed to stat permission-check editor script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)
+            .expect("failed to make permission-check editor script executable");
+
+        edit_buffer_with_editor("content", script_path.to_str().expect("script path should be valid utf-8"))
+            .expect("scripted editor should succeed");
+
+        let mode = std::fs::read_to_string(&marker_path)
+            .expect("marker file should have been written by the script")
+            .trim()
+            .to_string();
+        assert_eq!(
+            mode, "600",
+            "expected the editor temp file to be created with mode 0600, got: {mode}"
+        );
+
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    /// F-010 (argus review, security): `editor_command` is spawned through
+    /// the user's own shell (`sh -c`), not a naive `split_whitespace`, so a
+    /// quoted argument (e.g. `EDITOR="code --wait --user-data-dir='/some
+    /// path'"`) is parsed the same way the user's own shell would parse it.
+    /// `$1` here is the quoted `"hello world"` token from `editor_command`
+    /// below; `$2` is the real temp file path `edit_buffer_with_editor`
+    /// appends. If the shell correctly parsed the quotes, `$1` arrives as
+    /// ONE argument (`hello world`, no embedded quote characters); a naive
+    /// pre-fix whitespace split would instead have passed the literal
+    /// tokens `"hello` and `world"` as two separate args and shifted `$2`
+    /// to the wrong value entirely.
+    #[test]
+    fn editor_command_with_quoted_argument_is_parsed_by_shell_not_naive_whitespace_split() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_dir = std::env::temp_dir().join(format!(
+            "rokr-tui-editor-quoted-arg-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&script_dir).expect("failed to create script dir");
+        let script_path = script_dir.join("quoted_arg_editor.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf '%s' \"$1\" >> \"$2\"\n")
+            .expect("failed to write quoted-arg editor script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("failed to stat quoted-arg editor script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)
+            .expect("failed to make quoted-arg editor script executable");
+
+        let editor_command = format!(
+            "{} \"hello world\"",
+            script_path.to_str().expect("script path should be valid utf-8")
+        );
+        let result = edit_buffer_with_editor("original", &editor_command)
+            .expect("scripted editor with a quoted argument should succeed");
+
+        assert_eq!(
+            result, "originalhello world",
+            "expected the quoted \"hello world\" argument to arrive as a single, correctly-parsed \
+             value appended after the pre-existing buffer content"
+        );
+
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    /// F-009 (argus review): `$EDITOR` set to an empty or whitespace-only
+    /// string (e.g. `EDITOR=""` in a script-generated environment) must
+    /// fall back to `vi`, the same as `$EDITOR` being unset entirely --
+    /// not surface a confusing "no editor command to run" error.
+    #[test]
+    fn resolve_editor_command_falls_back_to_vi_when_env_value_is_missing_or_blank() {
+        assert_eq!(resolve_editor_command(None), "vi");
+        assert_eq!(resolve_editor_command(Some(String::new())), "vi");
+        assert_eq!(resolve_editor_command(Some("   ".to_string())), "vi");
+        assert_eq!(resolve_editor_command(Some("code --wait".to_string())), "code --wait");
     }
 
     /// Ticket 43 (mouse-scroll-status-line): mouse-wheel scroll adjusts

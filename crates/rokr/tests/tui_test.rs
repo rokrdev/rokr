@@ -7726,3 +7726,201 @@ async fn header_shows_context_usage_percentage_after_a_turn_completes() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// The raw pty byte stream accumulated by these tests is a cell-diffed
+/// terminal UPDATE log, not a screen snapshot: ratatui only re-transmits
+/// cells that actually changed since the previous frame. The Header's
+/// status line is `"{elapsed} | context {percent}%"` -- the single space
+/// between the literal word "context" and the percentage figure is
+/// frequently an unchanged cell (it was already a space in the prior
+/// frame), so it gets skipped by the diff and a cursor-repositioning
+/// escape sequence is emitted in its place instead of the space byte
+/// itself. That means a literal contiguous `"context 50%"` (or `"context
+/// 0%"`) substring essentially never appears in the raw byte stream, even
+/// when that's exactly what's rendered on screen. What DOES appear
+/// contiguously is the percentage token itself (e.g. `"50%"`, `"0%"`),
+/// since every one of ITS cells changes together and is written as one
+/// run. A bare substring search for `"0%"` is unsafe on its own though --
+/// `"50%"` itself ends in the literal characters `"0%"` -- so this checks
+/// for a `"0%"` occurrence that is NOT immediately preceded by a `'5'`
+/// (which is how "50%"'s own tail would appear).
+fn contains_bare_zero_percent(haystack: &str) -> bool {
+    haystack
+        .match_indices("0%")
+        .any(|(idx, _)| idx == 0 || !haystack[..idx].ends_with('5'))
+}
+
+/// F-011 (argus review, phase-5-session-management): a turn whose reported
+/// usage is all-zero (some OpenAI-compatible proxies intermittently omit
+/// real usage figures rather than reporting them honestly) must not reset
+/// the Header's context-usage percentage to 0% -- main.rs's `submit`
+/// closure should fall back to the last REAL non-zero usage figure instead.
+#[tokio::test]
+async fn zero_usage_turn_leaves_context_percentage_at_previous_known_value() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let first_reply_text = "FirstReplyWithRealUsageForZeroUsageTest";
+    let second_reply_text = "SecondReplyWithZeroUsageForZeroUsageTest";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-real-usage",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": first_reply_text },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 90000, "completion_tokens": 10000, "total_tokens": 100000 }
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-zero-usage",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": second_reply_text },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-zero-usage-percent");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-zero-usage-percent");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    writer
+        .write_all(b"firstpromptzerousagetest\r")
+        .expect("failed to write first prompt to pty");
+
+    let first_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) && output.contains("50%") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(first_reply_text),
+        "expected the first mocked reply to render, got: {output:?}"
+    );
+    assert!(
+        output.contains("50%"),
+        "expected the Header to show a 50% context-usage figure after the first turn's real \
+         usage was reported, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"secondpromptzerousagetest\r")
+        .expect("failed to write second prompt to pty");
+
+    let second_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < second_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(second_reply_text),
+        "expected the second mocked reply (all-zero usage) to render, got: {output:?}"
+    );
+
+    // Give the header a moment to settle on whatever percentage it's going
+    // to render post-second-turn before asserting on it.
+    thread::sleep(Duration::from_millis(300));
+    while let Ok(chunk) = rx.try_recv() {
+        output.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    assert!(
+        !contains_bare_zero_percent(&output),
+        "expected the Header to NEVER render a bare 0% context-usage figure -- a zero-usage \
+         turn should fall back to the last known real usage rather than resetting the \
+         percentage, got: {output:?}"
+    );
+    assert!(
+        output.contains("50%"),
+        "expected the Header to still show a 50% context-usage figure after the zero-usage \
+         second turn, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
