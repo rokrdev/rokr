@@ -198,10 +198,68 @@ async fn main() -> ExitCode {
                 rokr_provider::RetryPolicy::default(),
             );
 
-            let provider: Result<SharedProvider, String> = match built {
-                Ok(built) => Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
-                Err(err) => Err(err),
-            };
+            // Ticket 34 (persist-new-sessions): the Header record needs a
+            // provider/model string pair captured at the SAME construction
+            // pass as `provider` itself, before `built.resilient` is moved
+            // into the shared lock -- `ResilientProvider` exposes no
+            // accessor to recover this after the fact (see its own doc
+            // comment on why), so it must be read off `built.selected`
+            // (the plain `AnyProvider` `BuiltProvider` also returns) right
+            // here.
+            let (provider, provider_name, model_name): (Result<SharedProvider, String>, String, String) =
+                match built {
+                    Ok(built) => {
+                        let (provider_name, model_name) = match &built.selected {
+                            rokr_provider::AnyProvider::OpenAi(_) => (
+                                "openai".to_string(),
+                                std::env::var(rokr_provider::openai::ENV_MODEL)
+                                    .unwrap_or_else(|_| "unknown".to_string()),
+                            ),
+                            rokr_provider::AnyProvider::Anthropic(_) => (
+                                "anthropic".to_string(),
+                                std::env::var(rokr_provider::anthropic::ENV_MODEL)
+                                    .unwrap_or_else(|_| "unknown".to_string()),
+                            ),
+                        };
+                        (
+                            Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
+                            provider_name,
+                            model_name,
+                        )
+                    }
+                    Err(err) => (Err(err), "unknown".to_string(), "unknown".to_string()),
+                };
+
+            // Ticket 34 (persist-new-sessions): constructed once at
+            // startup, central storage (not per-project) per the PRD.
+            // A store/creation failure degrades gracefully (no persistence
+            // this run) rather than crashing the TUI, matching this
+            // function's existing pattern for other optional startup
+            // concerns (e.g. repo map generation). Wrapped in `Arc` (rather
+            // than requiring `SessionHandle: Clone`) so it can be cloned
+            // into `submit`'s closure below without touching rokr-session's
+            // type.
+            let session_handle: Option<Arc<rokr_session::SessionHandle>> =
+                match rokr_session::SessionStore::open(default_data_dir()).create_session() {
+                    Ok(handle) => {
+                        handle.append_header(
+                            1,
+                            handle.session_id().to_string(),
+                            now_timestamp(),
+                            cwd.as_ref()
+                                .map(|c| c.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            agent.prompt_name().to_string(),
+                            provider_name.clone(),
+                            model_name.clone(),
+                        );
+                        Some(Arc::new(handle))
+                    }
+                    Err(err) => {
+                        eprintln!("failed to create session log: {err}");
+                        None
+                    }
+                };
 
             // In-memory only (no persistence, per the PRD): accumulates
             // every turn across submits for the lifetime of the process, so
@@ -258,6 +316,7 @@ async fn main() -> ExitCode {
                 let repo_map = repo_map.clone();
                 let last_known_usage = last_known_usage.clone();
                 let config_dir = config_dir.clone();
+                let session_handle = session_handle.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -431,6 +490,20 @@ async fn main() -> ExitCode {
                     .await
                     .map_err(|err| err.to_string())?;
 
+                    // Ticket 34 (persist-new-sessions): the Turn record's
+                    // message is built from the ORIGINAL submitted `input`
+                    // (before `@path`-mention expansion), matching what the
+                    // acceptance test asserts -- the persisted log should
+                    // show exactly what the user typed, not the expanded
+                    // form that actually goes out on the wire.
+                    if let Some(session_handle) = &session_handle {
+                        session_handle.append_turn(
+                            rokr_core::Message::user_text(input.clone()),
+                            rokr_session::UsageRecord::from(usage),
+                            now_timestamp(),
+                        );
+                    }
+
                     // Auto-compaction (ticket 20): checked once per
                     // submitted turn using that turn's own final usage
                     // figure. Runs inside this same async submit future —
@@ -576,6 +649,38 @@ async fn main() -> ExitCode {
 /// running history.
 fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
     transcript.push(rokr_core::Message::user_text(input));
+}
+
+/// Resolves the central data directory for session persistence:
+/// `$XDG_DATA_HOME/rokr` if `XDG_DATA_HOME` is set and non-empty,
+/// otherwise `$HOME/.local/share/rokr`. Mirrors
+/// `rokr_config::default_config_dir`'s exact resolution pattern (ticket 34:
+/// persist-new-sessions — PRD decision "Central storage, not per-project":
+/// all session data lives under `$XDG_DATA_HOME/rokr/`, not inside the
+/// project being worked on).
+fn default_data_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".local/share"));
+    base.join("rokr")
+}
+
+/// Returns the current time as a plain Unix-epoch-seconds string. There is
+/// no date/time-formatting crate in this workspace today (see
+/// `rokr-provider::auth`'s own `expires_at` field, which is a plain `u64`
+/// seconds-since-epoch for the same reason) — `SessionRecord`'s
+/// `created_at`/`timestamp` fields are typed `String` with no enforced
+/// format, so epoch seconds serialized as a string satisfies that type
+/// without pulling in a new dependency for this ticket.
+fn now_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 /// Resolves `name` to a concrete backend and writes it into the shared

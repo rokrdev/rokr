@@ -113,6 +113,161 @@ pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage
     (messages, last_known_usage)
 }
 
+use std::path::PathBuf;
+
+/// Commands sent over a session's single ordered writer channel (PRD
+/// decision 1: "One ordered writer per store"). `Append` enqueues a record
+/// without waiting for it to reach disk; `Flush` is a synchronization point
+/// used by tests (and any future caller, e.g. a graceful-shutdown path) that
+/// needs to know a prior `Append` has actually landed -- because the
+/// channel preserves FIFO order, a `Flush` command is only processed after
+/// every `Append` sent before it.
+enum WriterCommand {
+    Append(SessionRecord),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Owns the write side of one session's on-disk `session.jsonl` log.
+/// Constructed by [`SessionStore::create_session`]; every typed `append_*`
+/// method enqueues onto an `mpsc` channel read by a single dedicated writer
+/// task (spawned in `create_session`) that owns the open file handle --
+/// never a direct file write from this handle, so concurrent callers
+/// (a parent turn and a subagent's turns, per the PRD's Phase 4 note) can
+/// never race on the file.
+pub struct SessionHandle {
+    session_id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<WriterCommand>,
+}
+
+impl SessionHandle {
+    /// The ULID identifying this session's directory
+    /// (`sessions/<session_id>/`).
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Enqueues a `Header` record. Intended to be called exactly once, at
+    /// session creation.
+    pub fn append_header(
+        &self,
+        schema_version: u32,
+        session_id: String,
+        created_at: String,
+        project_path: String,
+        agent_tier: String,
+        provider: String,
+        model: String,
+    ) {
+        self.enqueue(SessionRecord::Header {
+            schema_version,
+            session_id,
+            created_at,
+            project_path,
+            agent_tier,
+            provider,
+            model,
+        });
+    }
+
+    /// Enqueues a `Turn` record. Intended to be called once per submitted
+    /// prompt, after that turn's reply and usage are known.
+    pub fn append_turn(&self, message: Message, usage: UsageRecord, timestamp: String) {
+        self.enqueue(SessionRecord::Turn {
+            message,
+            usage,
+            timestamp,
+        });
+    }
+
+    fn enqueue(&self, record: SessionRecord) {
+        // The writer task's receiver only disappears when the task itself
+        // is gone (e.g. process shutdown mid-write) -- a dropped send here
+        // is not this handle's problem to recover from; logging is a
+        // follow-up concern, not required by this ticket's acceptance
+        // criterion.
+        let _ = self.tx.send(WriterCommand::Append(record));
+    }
+
+    /// Waits until every record enqueued before this call has actually been
+    /// written to disk. Not on the hot path of a live session -- used by
+    /// tests (and any future graceful-shutdown path) that need a
+    /// synchronization point rather than the fire-and-forget behavior
+    /// `append_header`/`append_turn` intentionally provide.
+    pub async fn flush(&self) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(WriterCommand::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.await;
+        }
+    }
+}
+
+/// Owns the on-disk root under which every session directory lives
+/// (`<data_dir>/sessions/<ulid>/`).
+pub struct SessionStore {
+    data_dir: PathBuf,
+}
+
+impl SessionStore {
+    /// `data_dir` is the already-resolved central data directory (e.g.
+    /// `$XDG_DATA_HOME/rokr`); sessions live under `data_dir/sessions/`.
+    pub fn open(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+        }
+    }
+
+    /// Creates a new session: generates a ULID (chosen, per the PRD, so
+    /// lexicographic directory sort order is also chronological order),
+    /// creates `sessions/<ulid>/`, opens `session.jsonl` for append, and
+    /// spawns the single dedicated writer task that owns that file handle
+    /// for the rest of this session's life. Returns a [`SessionHandle`]
+    /// exposing only typed append methods -- callers never see the raw
+    /// file or channel.
+    pub fn create_session(&self) -> std::io::Result<SessionHandle> {
+        let session_id = ulid::Ulid::new().to_string();
+        let session_dir = self.data_dir.join("sessions").join(&session_id);
+        std::fs::create_dir_all(&session_dir)?;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(session_dir.join("session.jsonl"))?;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run_writer(file, rx));
+
+        Ok(SessionHandle { session_id, tx })
+    }
+}
+
+/// The single dedicated writer task (PRD decision 1: "One ordered writer
+/// per store"). Owns `file` for its entire lifetime; every `Append` is
+/// serialized to one JSON line and written in the order it was enqueued,
+/// so a parent's and a subagent's turns interleave correctly without any
+/// file lock.
+async fn run_writer(
+    file: std::fs::File,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WriterCommand>,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::from_std(file);
+    while let Some(command) = rx.recv().await {
+        match command {
+            WriterCommand::Append(record) => {
+                if let Ok(mut line) = serde_json::to_string(&record) {
+                    line.push('\n');
+                    let _ = file.write_all(line.as_bytes()).await;
+                }
+            }
+            WriterCommand::Flush(ack) => {
+                let _ = file.flush().await;
+                let _ = ack.send(());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +489,90 @@ mod tests {
             ]
         );
         assert_eq!(last_usage, Some(rokr_core::Usage::from(usage(4))));
+    }
+
+    /// Ticket 34 (persist-new-sessions): proves the writer task actually
+    /// exists and actually writes -- not just that the types compile.
+    /// Appends a Header then a Turn through the typed handle, calls
+    /// `flush().await` to synchronize with the writer task (since
+    /// `append_*` intentionally never blocks on IO), then reads
+    /// `session.jsonl` directly off disk and asserts both records landed,
+    /// in order, and round-trip through `SessionRecord`'s own
+    /// deserialization.
+    #[tokio::test]
+    async fn session_store_create_session_spawns_writer_task_and_appends_via_typed_handle() {
+        let dir = unique_temp_dir("session-store");
+        let store = SessionStore::open(&dir);
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed against a fresh temp dir");
+
+        handle.append_header(
+            1,
+            handle.session_id().to_string(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/some/project".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        handle.append_turn(
+            Message::user_text("hello session store"),
+            UsageRecord {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            "2026-07-20T00:00:01Z".to_string(),
+        );
+
+        handle.flush().await;
+
+        let session_file = dir
+            .join("sessions")
+            .join(handle.session_id())
+            .join("session.jsonl");
+        let contents = std::fs::read_to_string(&session_file)
+            .expect("session.jsonl should exist after flush");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly a Header record followed by a Turn record, got: {contents:?}"
+        );
+
+        let first: SessionRecord =
+            serde_json::from_str(lines[0]).expect("first line should deserialize");
+        let second: SessionRecord =
+            serde_json::from_str(lines[1]).expect("second line should deserialize");
+
+        assert!(
+            matches!(first, SessionRecord::Header { .. }),
+            "expected first record to be Header, got: {first:?}"
+        );
+        match second {
+            SessionRecord::Turn { message, .. } => {
+                assert_eq!(message.text(), "hello session store");
+            }
+            other => panic!("expected second record to be Turn, got: {other:?}"),
+        }
+    }
+
+    /// Mirrors `crates/rokr/src/main.rs`'s own `unique_temp_dir` test
+    /// helper -- a fresh, uniquely-named directory under the system temp
+    /// dir, so this test never touches a shared path another test (or a
+    /// parallel run) might also be using.
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rokr-session-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

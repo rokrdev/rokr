@@ -265,6 +265,224 @@ async fn typed_prompt_renders_model_response_in_view() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
 
+/// Ticket 34 (persist-new-sessions) acceptance test: submitting a prompt
+/// must persist a `Header` record and a `Turn` record (containing the exact
+/// prompt text) to a `session.jsonl` file under a ULID-named directory in
+/// `XDG_DATA_HOME/rokr/sessions/`. RED phase: `main.rs` has not been wired
+/// to construct a `SessionStore` or write any records yet, so this is
+/// expected to fail (no `sessions/` directory will even exist).
+#[tokio::test]
+async fn submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Single token (no spaces) for the same reason as the other tests in
+    // this file: ratatui only redraws changed cells, so a literal substring
+    // match on raw pty bytes needs to avoid spaces that might not get
+    // rewritten.
+    let canned_response = "MockedAssistantReplyForSessionPersistenceTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-persist",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-persist");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-persist");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-persist");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"persisttestprompt\r")
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("persisttestprompt"),
+        "expected pty output to contain the typed prompt, got: {output:?}"
+    );
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let sessions_dir = xdg_data_home.join("rokr").join("sessions");
+    let session_dir_entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&sessions_dir)
+        .unwrap_or_else(|err| {
+            panic!(
+                "expected sessions directory to exist at {sessions_dir:?}, got error: {err:?}"
+            )
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+
+    assert_eq!(
+        session_dir_entries.len(),
+        1,
+        "expected exactly one ULID-named session directory under {sessions_dir:?}, got: {:?}",
+        session_dir_entries
+            .iter()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    );
+
+    let session_dir = session_dir_entries[0].path();
+    let session_jsonl_path = session_dir.join("session.jsonl");
+    assert!(
+        session_jsonl_path.exists(),
+        "expected session.jsonl to exist at {session_jsonl_path:?}"
+    );
+
+    let session_jsonl_contents = std::fs::read_to_string(&session_jsonl_path)
+        .expect("failed to read session.jsonl contents");
+    let lines: Vec<&str> = session_jsonl_contents
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    assert!(
+        lines.len() >= 2,
+        "expected at least 2 non-empty lines in session.jsonl, got {}: {session_jsonl_contents:?}",
+        lines.len()
+    );
+
+    let header_record: rokr_session::SessionRecord = serde_json::from_str(lines[0])
+        .expect("failed to parse first session.jsonl line as a SessionRecord");
+    assert!(
+        matches!(header_record, rokr_session::SessionRecord::Header { .. }),
+        "expected the first session.jsonl record to be a Header record, got: {header_record:?}"
+    );
+
+    let turn_record: rokr_session::SessionRecord = serde_json::from_str(lines[1])
+        .expect("failed to parse second session.jsonl line as a SessionRecord");
+    match turn_record {
+        rokr_session::SessionRecord::Turn { message, .. } => {
+            assert_eq!(
+                message.text(),
+                "persisttestprompt",
+                "expected the persisted Turn record's message text to exactly match the \
+                 submitted prompt"
+            );
+        }
+        other => panic!("expected the second session.jsonl record to be a Turn record, got: {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+}
+
 #[tokio::test]
 async fn typed_prompt_triggers_read_tool_call_and_renders_final_reply() {
     use wiremock::matchers::{method, path};
