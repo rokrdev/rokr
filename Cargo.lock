@@ -1985,6 +1985,11 @@ dependencies = [
 [[package]]
 name = "rokr-session"
 version = "0.1.0"
+dependencies = [
+ "rokr-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "rokr-tools"
