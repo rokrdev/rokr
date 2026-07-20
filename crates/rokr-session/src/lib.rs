@@ -113,6 +113,29 @@ pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage
     (messages, last_known_usage)
 }
 
+/// Metadata about a session, extracted from its log's `Header` record.
+/// Returned by [`SessionStore::resume_session`] alongside the folded
+/// transcript and [`ResumeState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMeta {
+    pub session_id: String,
+    pub created_at: String,
+    pub project_path: String,
+    pub agent_tier: String,
+    pub provider: String,
+    pub model: String,
+}
+
+/// State restored on resume that isn't itself part of the folded
+/// transcript -- currently just the most recently known
+/// [`rokr_core::Usage`], carried forward so a resumed session's
+/// auto-compaction threshold check (and ticket 36's swap-warning check)
+/// have the same figure a live session would have accumulated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeState {
+    pub last_known_usage: Option<rokr_core::Usage>,
+}
+
 use std::path::PathBuf;
 
 /// Commands sent over a session's single ordered writer channel (PRD
@@ -216,15 +239,14 @@ impl SessionStore {
         }
     }
 
-    /// Creates a new session: generates a ULID (chosen, per the PRD, so
-    /// lexicographic directory sort order is also chronological order),
-    /// creates `sessions/<ulid>/`, opens `session.jsonl` for append, and
-    /// spawns the single dedicated writer task that owns that file handle
-    /// for the rest of this session's life. Returns a [`SessionHandle`]
-    /// exposing only typed append methods -- callers never see the raw
-    /// file or channel.
-    pub fn create_session(&self) -> std::io::Result<SessionHandle> {
-        let session_id = ulid::Ulid::new().to_string();
+    /// Shared by `create_session` and `open_session`: creates
+    /// `sessions/<session_id>/` if needed, opens `session.jsonl` for
+    /// append (creating it if it doesn't already exist), and spawns the
+    /// single dedicated writer task that owns that file handle for the
+    /// rest of this session's life. Returns a [`SessionHandle`] exposing
+    /// only typed append methods -- callers never see the raw file or
+    /// channel.
+    fn open_handle_for(&self, session_id: String) -> std::io::Result<SessionHandle> {
         let session_dir = self.data_dir.join("sessions").join(&session_id);
         std::fs::create_dir_all(&session_dir)?;
 
@@ -237,6 +259,116 @@ impl SessionStore {
         tokio::spawn(run_writer(file, rx));
 
         Ok(SessionHandle { session_id, tx })
+    }
+
+    /// Creates a new session: generates a ULID (chosen, per the PRD, so
+    /// lexicographic directory sort order is also chronological order),
+    /// creates `sessions/<ulid>/`, opens `session.jsonl` for append, and
+    /// spawns the single dedicated writer task that owns that file handle
+    /// for the rest of this session's life. Returns a [`SessionHandle`]
+    /// exposing only typed append methods -- callers never see the raw
+    /// file or channel.
+    pub fn create_session(&self) -> std::io::Result<SessionHandle> {
+        let session_id = ulid::Ulid::new().to_string();
+        self.open_handle_for(session_id)
+    }
+
+    /// Opens an existing session's log for continued appends after a
+    /// resume. No Header record is (re)written here -- it's already the
+    /// first line of the log from when the session was originally created.
+    pub fn open_session(&self, session_id: impl Into<String>) -> std::io::Result<SessionHandle> {
+        self.open_handle_for(session_id.into())
+    }
+
+    /// Reads `session.jsonl` for `session_id`, parses each line as a
+    /// `SessionRecord` (an unparseable/unknown-tag line is skipped with an
+    /// `eprintln` warning rather than aborting the read, per the PRD's
+    /// forward-compatibility policy), extracts [`SessionMeta`] from the
+    /// `Header` record if present (falling back to a mostly-empty
+    /// `SessionMeta` stamped with just `session_id` if no `Header` is
+    /// found), and folds every record via [`fold`] into the resumed
+    /// `Vec<Message>` plus a [`ResumeState`] carrying the restored
+    /// `last_known_usage`.
+    pub fn resume_session(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<(Vec<Message>, SessionMeta, ResumeState)> {
+        let session_jsonl_path = self
+            .data_dir
+            .join("sessions")
+            .join(session_id)
+            .join("session.jsonl");
+        let contents = std::fs::read_to_string(&session_jsonl_path)?;
+
+        let records: Vec<SessionRecord> = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| match serde_json::from_str::<SessionRecord>(line) {
+                Ok(record) => Some(record),
+                Err(err) => {
+                    eprintln!(
+                        "warning: skipping unparseable session.jsonl line in \
+                         {session_jsonl_path:?}: {err}"
+                    );
+                    None
+                }
+            })
+            .collect();
+
+        let meta = records
+            .iter()
+            .find_map(|record| match record {
+                SessionRecord::Header {
+                    session_id,
+                    created_at,
+                    project_path,
+                    agent_tier,
+                    provider,
+                    model,
+                    ..
+                } => Some(SessionMeta {
+                    session_id: session_id.clone(),
+                    created_at: created_at.clone(),
+                    project_path: project_path.clone(),
+                    agent_tier: agent_tier.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                }),
+                _ => None,
+            })
+            .unwrap_or_else(|| SessionMeta {
+                session_id: session_id.to_string(),
+                created_at: String::new(),
+                project_path: String::new(),
+                agent_tier: String::new(),
+                provider: String::new(),
+                model: String::new(),
+            });
+
+        let (messages, last_known_usage) = fold(&records);
+
+        Ok((messages, meta, ResumeState { last_known_usage }))
+    }
+
+    /// Lists session ids under `data_dir/sessions/`, sorted lexicographically
+    /// (ULIDs sort chronologically), returning the last (most recent) one.
+    /// `Ok(None)` if the sessions directory doesn't exist yet.
+    pub fn most_recent_session_id(&self) -> std::io::Result<Option<String>> {
+        let sessions_dir = self.data_dir.join("sessions");
+        let read_dir = match std::fs::read_dir(&sessions_dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        let mut session_ids: Vec<String> = read_dir
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        session_ids.sort();
+
+        Ok(session_ids.into_iter().next_back())
     }
 }
 
@@ -574,5 +706,102 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Ticket 35 (resume-session): hand-builds a `session.jsonl` fixture
+    /// (via real `SessionRecord` values serialized with `serde_json`, never
+    /// hand-typed JSON) containing a `Header`, several `Turn`s, a
+    /// `Compaction`, and a `Rollback` -- proving `SessionStore::resume_session`
+    /// actually delegates to the real `fold()` function (reusing the same
+    /// record shape as `fold_handles_compaction_followed_by_rollback_together`
+    /// above) rather than reimplementing folding logic ad hoc, and that it
+    /// correctly extracts `SessionMeta` from the `Header` record.
+    #[test]
+    fn resume_session_folds_log_into_messages_and_restores_last_known_usage() {
+        let dir = unique_temp_dir("resume-session");
+        let session_id = "resume-test-session".to_string();
+        let session_dir = dir.join("sessions").join(&session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let header = SessionRecord::Header {
+            schema_version: 1,
+            session_id: session_id.clone(),
+            created_at: "2026-07-20T00:00:00Z".to_string(),
+            project_path: "/Users/bharat/projects/rokr".to_string(),
+            agent_tier: "build".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+        };
+        let records = vec![
+            header.clone(),
+            SessionRecord::Turn {
+                message: Message::user_text("turn0"),
+                usage: usage(0),
+                timestamp: "t0".to_string(),
+            },
+            SessionRecord::Turn {
+                message: Message::assistant_text("turn1"),
+                usage: usage(1),
+                timestamp: "t1".to_string(),
+            },
+            SessionRecord::Compaction {
+                summary: "summary of turns 0-1".to_string(),
+                replaced_through: 1,
+            },
+            SessionRecord::Turn {
+                message: Message::user_text("turn2"),
+                usage: usage(2),
+                timestamp: "t2".to_string(),
+            },
+            SessionRecord::Turn {
+                message: Message::assistant_text("turn3"),
+                usage: usage(3),
+                timestamp: "t3".to_string(),
+            },
+            SessionRecord::Turn {
+                message: Message::user_text("turn4"),
+                usage: usage(4),
+                timestamp: "t4".to_string(),
+            },
+            SessionRecord::Rollback { target: 3 },
+        ];
+
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize SessionRecord"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(session_dir.join("session.jsonl"), contents)
+            .expect("failed to write session.jsonl fixture");
+
+        let store = SessionStore::open(&dir);
+        let (messages, meta, resume_state) = store
+            .resume_session(&session_id)
+            .expect("resume_session should succeed against the fixture log");
+
+        let (expected_messages, expected_last_usage) = fold(&records);
+        assert_eq!(messages, expected_messages);
+        assert_eq!(resume_state.last_known_usage, expected_last_usage);
+
+        match header {
+            SessionRecord::Header {
+                session_id,
+                created_at,
+                project_path,
+                agent_tier,
+                provider,
+                model,
+                ..
+            } => {
+                assert_eq!(meta.session_id, session_id);
+                assert_eq!(meta.created_at, created_at);
+                assert_eq!(meta.project_path, project_path);
+                assert_eq!(meta.agent_tier, agent_tier);
+                assert_eq!(meta.provider, provider);
+                assert_eq!(meta.model, model);
+            }
+            _ => unreachable!("header is constructed as Header above"),
+        }
     }
 }

@@ -5,7 +5,39 @@ use rokr_core::Provider;
 
 mod subagent;
 
-const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>] [auth login]";
+const USAGE: &str =
+    "Usage: rokr [--version] [--agent <plan|build>] [--resume <id>] [--continue] [auth login]";
+
+/// Ticket 35 (resume-session): which prior session (if any) this run should
+/// resume into, extracted from the raw CLI args before the existing
+/// `--version`/`auth login`/`parse_agent_tier` matching runs.
+enum ResumeMode {
+    None,
+    Id(String),
+    Continue,
+}
+
+/// Pulls `--resume <id>` / `--continue` (in any position) out of `args`,
+/// returning the resolved `ResumeMode` plus the remaining args untouched --
+/// so the existing `--version` / `auth login` / `parse_agent_tier` matching
+/// keeps working exactly as today, just against the filtered remainder.
+fn extract_resume_mode(args: &[String]) -> (ResumeMode, Vec<String>) {
+    let mut mode = ResumeMode::None;
+    let mut remaining = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--resume" => {
+                if let Some(id) = iter.next() {
+                    mode = ResumeMode::Id(id.clone());
+                }
+            }
+            "--continue" => mode = ResumeMode::Continue,
+            other => remaining.push(other.to_string()),
+        }
+    }
+    (mode, remaining)
+}
 
 /// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
 /// when no flag is given. `Plan` is read-only: read/glob/grep/ls only, so
@@ -63,8 +95,14 @@ fn parse_agent_tier(args: &[String]) -> Result<AgentTier, ()> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Ticket 35 (resume-session): pulled out BEFORE the existing match so
+    // `--resume <id>` / `--continue` can appear anywhere on the command
+    // line without disturbing the `--version` / `auth login` /
+    // `parse_agent_tier` matching below, which now runs against
+    // `remaining_args` instead of the raw `args`.
+    let (resume_mode, remaining_args) = extract_resume_mode(&args);
 
-    match args.as_slice() {
+    match remaining_args.as_slice() {
         [flag] if flag == "--version" => {
             println!("rokr {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -85,7 +123,7 @@ async fn main() -> ExitCode {
             }
         }
         _ => {
-            let agent = match parse_agent_tier(&args) {
+            let agent = match parse_agent_tier(&remaining_args) {
                 Ok(agent) => agent,
                 Err(()) => {
                     eprintln!("{USAGE}");
@@ -230,47 +268,89 @@ async fn main() -> ExitCode {
                     Err(err) => (Err(err), "unknown".to_string(), "unknown".to_string()),
                 };
 
-            // Ticket 34 (persist-new-sessions): constructed once at
-            // startup, central storage (not per-project) per the PRD.
-            // A store/creation failure degrades gracefully (no persistence
-            // this run) rather than crashing the TUI, matching this
-            // function's existing pattern for other optional startup
-            // concerns (e.g. repo map generation). Wrapped in `Arc` (rather
-            // than requiring `SessionHandle: Clone`) so it can be cloned
-            // into `submit`'s closure below without touching rokr-session's
-            // type.
-            let session_handle: Option<Arc<rokr_session::SessionHandle>> =
-                match rokr_session::SessionStore::open(default_data_dir()).create_session() {
-                    Ok(handle) => {
-                        handle.append_header(
-                            1,
-                            handle.session_id().to_string(),
-                            now_timestamp(),
-                            cwd.as_ref()
-                                .map(|c| c.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                            agent.prompt_name().to_string(),
-                            provider_name.clone(),
-                            model_name.clone(),
-                        );
-                        Some(Arc::new(handle))
-                    }
-                    Err(err) => {
-                        eprintln!("failed to create session log: {err}");
-                        None
-                    }
-                };
+            // Ticket 34 (persist-new-sessions) / ticket 35 (resume-session):
+            // constructed once at startup, central storage (not
+            // per-project) per the PRD. `ResumeMode::None` preserves
+            // exactly today's behavior (`create_session` + `append_header`,
+            // empty transcript, no known usage). `ResumeMode::Id`/`Continue`
+            // instead resolve a concrete prior session id, fold its log via
+            // `resume_session` to seed `transcript`/`last_known_usage`, and
+            // open (not create) that session's log for continued appends --
+            // no Header is re-written, it's already the first line of the
+            // log. A store/creation failure degrades gracefully (no
+            // persistence this run) rather than crashing the TUI, matching
+            // this function's existing pattern for other optional startup
+            // concerns (e.g. repo map generation); a resume failure,
+            // though, is a hard error -- there is nothing sensible to fall
+            // back to if the session the user explicitly asked to resume
+            // can't be read. Wrapped in `Arc` (rather than requiring
+            // `SessionHandle: Clone`) so it can be cloned into `submit`'s
+            // closure below without touching rokr-session's type.
+            let store = rokr_session::SessionStore::open(default_data_dir());
 
-            // In-memory only (no persistence, per the PRD): accumulates
-            // every turn across submits for the lifetime of the process, so
-            // each new prompt is sent with the full prior conversation
-            // history rather than in isolation. Stays system-prompt-free —
-            // pure conversation history; `rokr_core::run_tool_loop` prepends
-            // the system segment itself (via `context::assemble()`) on
-            // every outgoing send, so it never needs to live here.
-            let transcript: Vec<rokr_core::Message> = Vec::new();
+            let (initial_transcript, initial_last_known_usage, session_handle): (
+                Vec<rokr_core::Message>,
+                Option<rokr_core::Usage>,
+                Option<Arc<rokr_session::SessionHandle>>,
+            ) = match resume_mode {
+                ResumeMode::None => {
+                    let session_handle = match store.create_session() {
+                        Ok(handle) => {
+                            handle.append_header(
+                                1,
+                                handle.session_id().to_string(),
+                                now_timestamp(),
+                                cwd.as_ref()
+                                    .map(|c| c.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                agent.prompt_name().to_string(),
+                                provider_name.clone(),
+                                model_name.clone(),
+                            );
+                            Some(Arc::new(handle))
+                        }
+                        Err(err) => {
+                            eprintln!("failed to create session log: {err}");
+                            None
+                        }
+                    };
+                    (Vec::new(), None, session_handle)
+                }
+                ResumeMode::Continue => {
+                    let session_id = match store.most_recent_session_id() {
+                        Ok(Some(id)) => id,
+                        Ok(None) => {
+                            eprintln!("no prior session found to continue");
+                            return ExitCode::FAILURE;
+                        }
+                        Err(err) => {
+                            eprintln!("failed to look up most recent session: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    match resolve_resumed_session(&store, session_id) {
+                        Ok(resolved) => resolved,
+                        Err(code) => return code,
+                    }
+                }
+                ResumeMode::Id(session_id) => match resolve_resumed_session(&store, session_id) {
+                    Ok(resolved) => resolved,
+                    Err(code) => return code,
+                },
+            };
+
+            // In-memory only (no persistence beyond the session log, per
+            // the PRD): accumulates every turn across submits for the
+            // lifetime of the process, so each new prompt is sent with the
+            // full prior conversation history rather than in isolation.
+            // Seeded from a resumed session's folded messages when
+            // applicable (ticket 35), otherwise starts empty. Stays
+            // system-prompt-free — pure conversation history;
+            // `rokr_core::run_tool_loop` prepends the system segment itself
+            // (via `context::assemble()`) on every outgoing send, so it
+            // never needs to live here.
             let transcript: Arc<tokio::sync::Mutex<Vec<rokr_core::Message>>> =
-                Arc::new(tokio::sync::Mutex::new(transcript));
+                Arc::new(tokio::sync::Mutex::new(initial_transcript));
 
             // Ticket 20 (auto-compaction-threshold): both `Copy`, captured
             // by value once by the outer `move` closure below and reused
@@ -284,9 +364,11 @@ async fn main() -> ExitCode {
             // unreported (some OpenAI-compatible proxies intermittently
             // omit it) can fall back to the last real figure instead of
             // the much cruder chars/4 estimate, which is reserved for the
-            // case no real usage has ever arrived yet this session.
+            // case no real usage has ever arrived yet this session. Ticket
+            // 35 (resume-session): seeded from the resumed session's
+            // restored usage when applicable, otherwise `None` as before.
             let last_known_usage: Arc<std::sync::Mutex<Option<rokr_core::Usage>>> =
-                Arc::new(std::sync::Mutex::new(None));
+                Arc::new(std::sync::Mutex::new(initial_last_known_usage));
 
             // Ticket 21 (manual-compact-command): cloned here, before
             // `submit`'s `move` closure below takes ownership of the
@@ -649,6 +731,46 @@ async fn main() -> ExitCode {
 /// running history.
 fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
     transcript.push(rokr_core::Message::user_text(input));
+}
+
+/// Ticket 35 (resume-session): resolves a concrete `session_id` (already
+/// looked up from `--continue` if needed) into the seed values `main`'s
+/// `_` arm needs -- the folded prior transcript, the restored
+/// `last_known_usage`, and a `SessionHandle` opened (not created) for
+/// continued appends, since the resumed session's `Header` record is
+/// already the first line of its log. Both `store.resume_session` failing
+/// (the session the user explicitly asked to resume can't be read -- a
+/// hard error, unlike `create_session` failing at plain startup, which
+/// degrades gracefully) and `store.open_session` failing (degrades
+/// gracefully, same as `create_session` failing at plain startup) are
+/// handled here so both `ResumeMode::Id` and `ResumeMode::Continue` share
+/// the identical resolution logic.
+#[allow(clippy::type_complexity)]
+fn resolve_resumed_session(
+    store: &rokr_session::SessionStore,
+    session_id: String,
+) -> Result<
+    (
+        Vec<rokr_core::Message>,
+        Option<rokr_core::Usage>,
+        Option<Arc<rokr_session::SessionHandle>>,
+    ),
+    ExitCode,
+> {
+    let (messages, _meta, resume_state) = store.resume_session(&session_id).map_err(|err| {
+        eprintln!("failed to resume session {session_id}: {err}");
+        ExitCode::FAILURE
+    })?;
+
+    let session_handle = match store.open_session(session_id) {
+        Ok(handle) => Some(Arc::new(handle)),
+        Err(err) => {
+            eprintln!("failed to reopen session log for continued appends: {err}");
+            None
+        }
+    };
+
+    Ok((messages, resume_state.last_known_usage, session_handle))
 }
 
 /// Resolves the central data directory for session persistence:

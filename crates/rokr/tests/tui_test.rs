@@ -483,6 +483,234 @@ async fn submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl()
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
 
+/// Ticket 35 (resume-session) acceptance test: `rokr --resume <id>` against
+/// a hand-built fixture session directory must fold that session's prior
+/// `Header`/`Turn` records into the running transcript BEFORE the first new
+/// prompt is accepted, so the very next outgoing request (there's no
+/// `/compact` in this test, so it's the first and only request) carries the
+/// prior turn's content alongside the newly typed prompt. Mirrors
+/// `submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl`'s
+/// exact harness pattern (PTY spawn, wiremock mock server, `unique_temp_dir`
+/// for HOME/XDG_CONFIG_HOME/XDG_DATA_HOME, ROKR_OPENAI_* env vars), differing
+/// only in: (1) pre-seeding a fixture `session.jsonl` under
+/// `XDG_DATA_HOME/rokr/sessions/<fixture_id>/` before spawning, (2) passing
+/// `--resume <fixture_id>`, and (3) inspecting the captured request body
+/// (via `mock_server.received_requests()`) instead of the persisted log.
+///
+/// Note: the repo map is always regenerated fresh from the current
+/// filesystem on every startup, resume included (PRD decision 3, "Resume
+/// and jump") -- there is no separate repo-map-from-log code path for this
+/// test to accidentally exercise, so no repo-map fixture is needed here.
+#[tokio::test]
+async fn resuming_a_session_includes_prior_turn_in_next_outgoing_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Single tokens (no spaces) for the same ratatui-partial-redraw reason
+    // as the other tests in this file.
+    let canned_response = "MockedAssistantReplyForResumeTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-resume",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-resume");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-resume");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-resume");
+
+    // Hand-build the fixture session BEFORE spawning: a Header record (via
+    // `rokr_session::SessionRecord` + `serde_json::to_string`, never a
+    // hand-typed JSON string) followed by a Turn record whose message text
+    // contains a unique token this test can later assert appeared in the
+    // outgoing request body.
+    let fixture_session_id = "01FIXTURERESUMESESSION0000";
+    let fixture_session_dir = xdg_data_home
+        .join("rokr")
+        .join("sessions")
+        .join(fixture_session_id);
+    std::fs::create_dir_all(&fixture_session_dir)
+        .expect("failed to create fixture session directory");
+
+    let fixture_header = rokr_session::SessionRecord::Header {
+        schema_version: 1,
+        session_id: fixture_session_id.to_string(),
+        created_at: "2026-07-20T00:00:00Z".to_string(),
+        project_path: "/tmp/fixture-project".to_string(),
+        agent_tier: "plan".to_string(),
+        provider: "openai".to_string(),
+        model: "gpt-4o-mini".to_string(),
+    };
+    let fixture_turn = rokr_session::SessionRecord::Turn {
+        message: rokr_core::Message::user_text("priorturnuniquetoken"),
+        usage: rokr_session::UsageRecord {
+            input_tokens: 5,
+            output_tokens: 7,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        },
+        timestamp: "2026-07-20T00:00:01Z".to_string(),
+    };
+    let fixture_contents = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&fixture_header).expect("serialize fixture Header"),
+        serde_json::to_string(&fixture_turn).expect("serialize fixture Turn"),
+    );
+    std::fs::write(fixture_session_dir.join("session.jsonl"), fixture_contents)
+        .expect("failed to write fixture session.jsonl");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--resume");
+    cmd.arg(fixture_session_id);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"newpromptaftereresume\r")
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("newpromptaftereresume"),
+        "expected pty output to contain the typed prompt, got: {output:?}"
+    );
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+
+    // No `/compact` happens in this test, so the FIRST request submitted is
+    // the one carrying the resumed history plus the new prompt.
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains("priorturnuniquetoken"),
+        "expected the first outgoing request body to contain the resumed session's prior \
+         turn text ('priorturnuniquetoken'), proving the resumed session's prior turn was \
+         folded into the transcript before this request went out; got body: \
+         {first_request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+}
+
 #[tokio::test]
 async fn typed_prompt_triggers_read_tool_call_and_renders_final_reply() {
     use wiremock::matchers::{method, path};
