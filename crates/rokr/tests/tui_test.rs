@@ -5376,3 +5376,241 @@ fn sessions_command_lists_prior_sessions_with_metadata() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
+
+/// Ticket 37 (session-search): `/search <term>` is a lazy, on-demand scan
+/// of every session's own on-disk `session.jsonl` body (PRD decision 2) --
+/// it must never consult `sessions/index.jsonl`, so a term that only
+/// appears inside a `Compaction` summary (never surfaced in that cache)
+/// must still be found. Hand-writes three session bodies directly under
+/// `xdg_data_home/rokr/sessions/<id>/session.jsonl` (via real
+/// `rokr_session::SessionRecord` values + `serde_json`, never a hand-typed
+/// JSON string, matching this file's established fixture convention) --
+/// deliberately does NOT write `index.jsonl` at all, so a search that
+/// somehow depended on that cache would find nothing.
+#[test]
+fn search_command_returns_matching_session_ids_for_content_substring() {
+    let home = unique_temp_dir("home-search");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-search");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-search");
+
+    let sessions_dir = xdg_data_home.join("rokr").join("sessions");
+
+    let turn_match_id = "searchturnmatchsession".to_string();
+    let turn_match_dir = sessions_dir.join(&turn_match_id);
+    std::fs::create_dir_all(&turn_match_dir).expect("failed to create turn-match session dir");
+    let turn_match_records = vec![
+        rokr_session::SessionRecord::Header {
+            schema_version: 1,
+            session_id: turn_match_id.clone(),
+            created_at: "2026-07-20T00:00:00Z".to_string(),
+            project_path: "/tmp/fixture-project-alpha".to_string(),
+            agent_tier: "build".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-fixture".to_string(),
+        },
+        rokr_session::SessionRecord::Turn {
+            message: rokr_core::Message::user_text("please find zzyzxfindableterm in here"),
+            usage: rokr_session::UsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            timestamp: "2026-07-20T00:00:01Z".to_string(),
+        },
+    ];
+    let turn_match_contents = turn_match_records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize fixture record"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(turn_match_dir.join("session.jsonl"), turn_match_contents)
+        .expect("failed to write turn-match session.jsonl fixture");
+
+    let compaction_match_id = "searchcompactionmatchsession".to_string();
+    let compaction_match_dir = sessions_dir.join(&compaction_match_id);
+    std::fs::create_dir_all(&compaction_match_dir)
+        .expect("failed to create compaction-match session dir");
+    let compaction_match_records = vec![
+        rokr_session::SessionRecord::Header {
+            schema_version: 1,
+            session_id: compaction_match_id.clone(),
+            created_at: "2026-07-20T01:00:00Z".to_string(),
+            project_path: "/tmp/fixture-project-beta".to_string(),
+            agent_tier: "build".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-fixture".to_string(),
+        },
+        rokr_session::SessionRecord::Turn {
+            message: rokr_core::Message::user_text("unrelated live turn content"),
+            usage: rokr_session::UsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            timestamp: "2026-07-20T01:00:01Z".to_string(),
+        },
+        rokr_session::SessionRecord::Compaction {
+            summary: "earlier discussion mentioned zzyzxfindableterm in passing".to_string(),
+            replaced_through: 0,
+        },
+    ];
+    let compaction_match_contents = compaction_match_records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize fixture record"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(
+        compaction_match_dir.join("session.jsonl"),
+        compaction_match_contents,
+    )
+    .expect("failed to write compaction-match session.jsonl fixture");
+
+    let no_match_id = "searchnomatchsession".to_string();
+    let no_match_dir = sessions_dir.join(&no_match_id);
+    std::fs::create_dir_all(&no_match_dir).expect("failed to create no-match session dir");
+    let no_match_records = vec![
+        rokr_session::SessionRecord::Header {
+            schema_version: 1,
+            session_id: no_match_id.clone(),
+            created_at: "2026-07-20T02:00:00Z".to_string(),
+            project_path: "/tmp/fixture-project-gamma".to_string(),
+            agent_tier: "build".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-fixture".to_string(),
+        },
+        rokr_session::SessionRecord::Turn {
+            message: rokr_core::Message::user_text("completely unrelated content"),
+            usage: rokr_session::UsageRecord {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            timestamp: "2026-07-20T02:00:01Z".to_string(),
+        },
+    ];
+    let no_match_contents = no_match_records
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("serialize fixture record"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(no_match_dir.join("session.jsonl"), no_match_contents)
+        .expect("failed to write no-match session.jsonl fixture");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/search zzyzxfindableterm\r")
+        .expect("failed to write /search to pty");
+
+    let search_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < search_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&turn_match_id) && output.contains(&compaction_match_id) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(&turn_match_id),
+        "expected /search output to contain the turn-match session id, got: {output:?}"
+    );
+    assert!(
+        output.contains(&compaction_match_id),
+        "expected /search output to contain the compaction-match session id (a term that \
+         only appears inside a Compaction summary must still be found), got: {output:?}"
+    );
+    assert!(
+        !output.contains(&no_match_id),
+        "expected /search output to exclude the no-match session id, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+}

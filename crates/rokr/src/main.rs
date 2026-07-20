@@ -711,6 +711,25 @@ async fn main() -> ExitCode {
                         .await;
                     }
 
+                    // Ticket 37 (session-search): `/search <term>` is a
+                    // lazy, on-demand scan of every session's on-disk body
+                    // (PRD decision 2) -- it never consults
+                    // `sessions/index.jsonl`, so a term that only appears
+                    // inside a `Compaction` summary is still found. Mirrors
+                    // the `/resume ` seam above: everything after the
+                    // literal prefix is the search term, delegated straight
+                    // to `SessionStore::search`.
+                    if let Some(term) = input.strip_prefix("/search ") {
+                        let term = term.trim();
+                        return match store.search(term) {
+                            Ok(matches) if matches.is_empty() => {
+                                format!("No sessions found matching {term:?}.")
+                            }
+                            Ok(matches) => matches.join("\n"),
+                            Err(err) => format!("failed to search sessions: {err}"),
+                        };
+                    }
+
                     match input.as_str() {
                         "/sessions" => match store.list_sessions() {
                             Ok(entries) if entries.is_empty() => {

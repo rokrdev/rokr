@@ -447,6 +447,70 @@ impl SessionStore {
 
         Ok(by_id.into_values().collect())
     }
+
+    /// Lazily scans every session's own on-disk `session.jsonl` body for a
+    /// case-sensitive substring match against `term` (PRD decision 2: full-
+    /// text search is an on-demand scan at search time -- no persisted or
+    /// maintained secondary search index). Deliberately does not consult
+    /// `sessions/index.jsonl`: that cache never carries `Compaction`
+    /// summary text, so a term that exists solely inside a `Compaction`
+    /// summary (not any live `Turn`) would be invisible to an index-based
+    /// lookup -- this scans each session's real log instead, the same way
+    /// `resume_session` does. Session ids are discovered by listing
+    /// `data_dir/sessions/` directories, mirroring
+    /// `most_recent_session_id`. An unparseable line is skipped with an
+    /// `eprintln` warning, same policy as `resume_session`. Returned in
+    /// session-id sort order (ULIDs sort chronologically). `Ok(Vec::new())`
+    /// if the sessions directory doesn't exist yet.
+    pub fn search(&self, term: &str) -> std::io::Result<Vec<String>> {
+        let sessions_dir = self.data_dir.join("sessions");
+        let read_dir = match std::fs::read_dir(&sessions_dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        let mut session_ids: Vec<String> = read_dir
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        session_ids.sort();
+
+        let mut matches = Vec::new();
+        for session_id in session_ids {
+            let session_jsonl_path = sessions_dir.join(&session_id).join("session.jsonl");
+            let contents = match std::fs::read_to_string(&session_jsonl_path) {
+                Ok(contents) => contents,
+                Err(_) => continue,
+            };
+
+            let found = contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| match serde_json::from_str::<SessionRecord>(line) {
+                    Ok(record) => Some(record),
+                    Err(err) => {
+                        eprintln!(
+                            "warning: skipping unparseable session.jsonl line in \
+                             {session_jsonl_path:?}: {err}"
+                        );
+                        None
+                    }
+                })
+                .any(|record| match record {
+                    SessionRecord::Turn { message, .. } => message.text().contains(term),
+                    SessionRecord::Compaction { summary, .. } => summary.contains(term),
+                    _ => false,
+                });
+
+            if found {
+                matches.push(session_id);
+            }
+        }
+
+        Ok(matches)
+    }
 }
 
 /// In-memory running state `run_writer` (ticket 36) keeps for the shared
@@ -1108,5 +1172,125 @@ mod tests {
         assert_eq!(entry_b.title, "first prompt in session beta");
         assert_eq!(entry_b.turn_count, 1);
         assert_eq!(entry_b.last_model, "gpt-test");
+    }
+
+    /// Ticket 37 (session-search): `search` is a lazy, on-demand scan of
+    /// each session's own `session.jsonl` body (PRD decision 2 -- no
+    /// persisted secondary search index), not a lookup against the
+    /// `sessions/index.jsonl` cache `list_sessions` reads. Three fixture
+    /// sessions prove three cases: a term appearing inside a live `Turn`
+    /// matches; a term appearing *only* inside a `Compaction` summary
+    /// (never surfaced in `index.jsonl`) still matches -- the PRD calls
+    /// this out as a deliberate decision, not an accident; and a session
+    /// containing neither is excluded.
+    #[test]
+    fn search_returns_only_sessions_containing_substring_including_within_compaction_summary() {
+        let dir = unique_temp_dir("search-sessions");
+
+        let turn_match_id = "search-turn-match-session".to_string();
+        write_session_fixture(
+            &dir,
+            &turn_match_id,
+            &[
+                SessionRecord::Header {
+                    schema_version: 1,
+                    session_id: turn_match_id.clone(),
+                    created_at: "2026-07-20T00:00:00Z".to_string(),
+                    project_path: "/projects/alpha".to_string(),
+                    agent_tier: "build".to_string(),
+                    provider: "anthropic".to_string(),
+                    model: "claude-test".to_string(),
+                },
+                SessionRecord::Turn {
+                    message: Message::user_text("please find zzyzxfindableterm in here"),
+                    usage: usage(0),
+                    timestamp: "t0".to_string(),
+                },
+            ],
+        );
+
+        let compaction_match_id = "search-compaction-match-session".to_string();
+        write_session_fixture(
+            &dir,
+            &compaction_match_id,
+            &[
+                SessionRecord::Header {
+                    schema_version: 1,
+                    session_id: compaction_match_id.clone(),
+                    created_at: "2026-07-20T01:00:00Z".to_string(),
+                    project_path: "/projects/beta".to_string(),
+                    agent_tier: "build".to_string(),
+                    provider: "anthropic".to_string(),
+                    model: "claude-test".to_string(),
+                },
+                SessionRecord::Turn {
+                    message: Message::user_text("unrelated live turn content"),
+                    usage: usage(0),
+                    timestamp: "t0".to_string(),
+                },
+                SessionRecord::Compaction {
+                    summary: "earlier discussion mentioned zzyzxfindableterm in passing"
+                        .to_string(),
+                    replaced_through: 0,
+                },
+            ],
+        );
+
+        let no_match_id = "search-no-match-session".to_string();
+        write_session_fixture(
+            &dir,
+            &no_match_id,
+            &[
+                SessionRecord::Header {
+                    schema_version: 1,
+                    session_id: no_match_id.clone(),
+                    created_at: "2026-07-20T02:00:00Z".to_string(),
+                    project_path: "/projects/gamma".to_string(),
+                    agent_tier: "build".to_string(),
+                    provider: "anthropic".to_string(),
+                    model: "claude-test".to_string(),
+                },
+                SessionRecord::Turn {
+                    message: Message::user_text("completely unrelated content"),
+                    usage: usage(0),
+                    timestamp: "t0".to_string(),
+                },
+            ],
+        );
+
+        let store = SessionStore::open(&dir);
+        let mut matches = store
+            .search("zzyzxfindableterm")
+            .expect("search should succeed against fixture sessions");
+        matches.sort();
+
+        let mut expected = vec![turn_match_id, compaction_match_id];
+        expected.sort();
+        assert_eq!(
+            matches, expected,
+            "expected search to return exactly the turn-match and compaction-match sessions"
+        );
+        assert!(
+            !matches.contains(&no_match_id),
+            "expected search to exclude the session with no matching content, got: {matches:?}"
+        );
+    }
+
+    /// Test-only helper: writes `records` (real `SessionRecord` values,
+    /// serialized via `serde_json`, never hand-typed JSON) as
+    /// `sessions/<session_id>/session.jsonl` under `dir`, mirroring how
+    /// `resume_session_folds_log_into_messages_and_restores_last_known_usage`
+    /// builds its fixture inline.
+    fn write_session_fixture(dir: &std::path::Path, session_id: &str, records: &[SessionRecord]) {
+        let session_dir = dir.join("sessions").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let contents = records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize SessionRecord"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(session_dir.join("session.jsonl"), contents)
+            .expect("failed to write session.jsonl fixture");
     }
 }
