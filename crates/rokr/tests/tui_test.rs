@@ -7349,3 +7349,380 @@ async fn pressing_editor_keybinding_with_scripted_editor_command_updates_prompt_
     let _ = std::fs::remove_dir_all(&xdg_data_home);
     let _ = std::fs::remove_dir_all(&editor_script_dir);
 }
+
+/// Ticket 43 (mouse-scroll-status-line) acceptance test: `TerminalGuard`
+/// enables mouse capture on startup (asserted via the raw SGR-mode-enable
+/// escape sequence crossterm's `EnableMouseCapture` writes), and once the
+/// View pane's transcript exceeds one screen, sending raw SGR mouse-wheel
+/// escape sequences over the PTY moves the scrollback offset -- revealing
+/// content that was previously scrolled off the top of the pane -- without
+/// requiring any keypress.
+#[tokio::test]
+async fn mouse_wheel_scroll_moves_view_offset_in_running_session() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // 40 short, unique, whitespace-free tokens -- long enough that, once
+    // rendered bottom-anchored in an ~16-row-tall View pane (24 pty rows -
+    // 3-row Header - 3-row Prompt - 4 border rows), the earliest lines are
+    // genuinely clipped off-screen and never written to the pty at all
+    // until scrolled into view.
+    //
+    // Deliberately built from 40 DISTINCT REPEATED CHARACTERS (`"aaaa..."`,
+    // `"bbbb..."`, ...) rather than a shared "scrollline" stem + a 2-digit
+    // suffix (which is what this looked like originally): ratatui's
+    // `CrosstermBackend` diffs the previous and next `Buffer` cell-by-cell
+    // and only emits escape codes for the cells that actually changed. Two
+    // lines sharing a common prefix (e.g. "scrollline03" -> "scrollline00")
+    // only differ in their last digit, so scrolling from one into view over
+    // another only ever rewrites that one differing cell -- the shared
+    // "scrollline0" prefix is never retransmitted, so the full string
+    // "scrollline00" never appears anywhere in the raw PTY byte stream even
+    // though it is genuinely visible on screen (verified independently by
+    // replaying a captured session through a `pyte`/vt100 terminal
+    // emulator). Since every one of the 40 lines here uses an entirely
+    // different repeated letter, ANY two of them differ at EVERY column,
+    // so scrolling one into a row previously occupied by another always
+    // forces a full-row rewrite, making `output.contains(...)` a reliable
+    // check again.
+    let letters: Vec<char> = ('a'..='z').chain('A'..='N').collect(); // 26 + 14 = 40
+    let long_reply: String = letters
+        .iter()
+        .map(|c| c.to_string().repeat(12))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-scroll",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": long_reply
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mouse-scroll");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mouse-scroll");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("?1006h"),
+        "expected TerminalGuard to enable SGR mouse capture on startup \
+         (crossterm's EnableMouseCapture sequence), got: {output:?}"
+    );
+
+    writer
+        .write_all(b"gimme the list\r")
+        .expect("failed to write prompt to pty");
+
+    let last_line_owned = letters[39].to_string().repeat(12);
+    let last_line = last_line_owned.as_str();
+    let first_line_owned = letters[0].to_string().repeat(12);
+    let first_line = first_line_owned.as_str();
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(last_line) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(last_line),
+        "expected the bottom-anchored View pane to show the tail of the long \
+         reply, got: {output:?}"
+    );
+    assert!(
+        !output.contains(first_line),
+        "expected the earliest line of the long reply to be scrolled off \
+         the top of the View pane before any scrolling, got: {output:?}"
+    );
+
+    // Raw SGR mouse-wheel-up escape sequences (crossterm 0.28's parser:
+    // Cb=64 -> MouseEventKind::ScrollUp), sent 12 times (x3 lines/tick =
+    // 36 lines) -- comfortably enough to walk the whole 40-line transcript
+    // back into view given the pane's ~16-row inner height.
+    let scroll_up = b"\x1b[<64;10;10M";
+    for _ in 0..12 {
+        writer
+            .write_all(scroll_up)
+            .expect("failed to write mouse scroll-up sequence to pty");
+    }
+
+    let scroll_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < scroll_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_line) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(first_line),
+        "expected mouse-wheel scroll-up to reveal the earliest line of the \
+         transcript, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 43 (mouse-scroll-status-line) acceptance test: once a turn's
+/// usage is reported, the Header block renders a context-usage percentage
+/// computed as `(input_tokens + output_tokens) / context_window_size`. The
+/// default `context_window_size` is 200_000 (rokr-config's default), so a
+/// mocked reply with prompt_tokens=90_000/completion_tokens=10_000 yields
+/// exactly 50%.
+#[tokio::test]
+async fn header_shows_context_usage_percentage_after_a_turn_completes() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let canned_response = "MockedReplyForContextPercentTest";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-context-percent",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 90000,
+                "completion_tokens": 10000,
+                "total_tokens": 100000
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-context-percent");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-context-percent");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !output.contains("50%"),
+        "expected no context-usage percentage before any turn completes, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"trigger the turn\r")
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(canned_response),
+        "expected the mocked assistant reply to render, got: {output:?}"
+    );
+
+    let percent_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < percent_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("50%") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("50%"),
+        "expected the Header to render a 50% context-usage figure after the \
+         turn's usage (90_000 + 10_000 input+output tokens over the default \
+         200_000 context_window_size) was reported, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}

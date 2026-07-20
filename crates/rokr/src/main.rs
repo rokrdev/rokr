@@ -463,6 +463,17 @@ async fn main() -> ExitCode {
             // reason.
             let history_append_data_dir = data_dir.clone();
 
+            // Ticket 43 (mouse-scroll-status-line): created here (like
+            // `on_history_append`'s data_dir clone above) so `submit`'s
+            // `move` closure below can capture its own clone of the sender
+            // -- the receiver crosses into `rokr_tui::run` unchanged,
+            // mirroring how `history`/`on_history_append` are threaded
+            // through from main.rs rather than being created inside
+            // rokr-tui's own event loop (unlike the permission channel,
+            // which rokr-tui owns end-to-end since only it needs both
+            // ends).
+            let (status_tx, status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
+
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
@@ -473,6 +484,7 @@ async fn main() -> ExitCode {
                 let session_handle = session_handle.clone();
                 let turn_index = turn_index.clone();
                 let data_dir = data_dir.clone();
+                let status_tx = status_tx.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -753,6 +765,18 @@ async fn main() -> ExitCode {
                         prior
                     };
 
+                    // Ticket 43 (mouse-scroll-status-line): sent after every
+                    // turn's usage is known, regardless of whether it was
+                    // just folded into `last_known_usage` above (even an
+                    // all-zero usage figure is still worth reflecting in the
+                    // status line rather than leaving the previous turn's
+                    // percentage stale). `context_window_size` is the same
+                    // `u32` already captured by this closure for
+                    // `should_compact` below.
+                    let context_percent = (usage.input_tokens + usage.output_tokens) as f64
+                        / context_window_size as f64;
+                    let _ = status_tx.send(rokr_tui::SessionStatus { context_percent });
+
                     let notice = if rokr_core::should_compact(
                         usage,
                         prior_usage,
@@ -956,7 +980,7 @@ async fn main() -> ExitCode {
                 }
             };
 
-            match rokr_tui::run(submit, command, prompt_history, on_history_append).await {
+            match rokr_tui::run(submit, command, prompt_history, on_history_append, status_rx).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) if err.is_not_a_tty() => {
                     // Not an error in a scripting/piping context: config is

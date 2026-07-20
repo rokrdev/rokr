@@ -5,9 +5,12 @@ use std::io::{self, IsTerminal, Stdout};
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -33,6 +36,9 @@ const PROMPT_HEIGHT: u16 = 3;
 /// pane than the scroll-to-bottom logic in [`draw`] already has to account
 /// for.
 const MAX_DIFF_LINES: usize = 18;
+/// How many lines each individual mouse-wheel tick moves the View pane's
+/// scroll offset by (ticket 43, mouse-scroll-status-line).
+const SCROLL_LINES_PER_TICK: u16 = 3;
 
 /// State rendered into the TUI's View section. Owns the scrollback lines
 /// shown in the View pane and the current prompt input buffer.
@@ -57,6 +63,31 @@ pub struct AppState {
     /// submissions immediately, not only ones persisted before this
     /// process started.
     pub history: Vec<String>,
+    /// Ticket 43 (mouse-scroll-status-line): how many lines the View pane is
+    /// scrolled up from the live bottom-anchored position. `0` means fully
+    /// caught up (auto-follows new output); mouse wheel Up/Down (see
+    /// `adjust_view_scroll_offset`) adjust it. Deliberately expressed as a
+    /// constant *distance from the bottom* rather than an absolute line
+    /// index: this is the simplest representation that requires no book-
+    /// keeping when new output arrives -- the view naturally keeps
+    /// following along `offset` lines behind the latest content rather than
+    /// either snapping back to the bottom or freezing at a fixed absolute
+    /// line (see `draw`'s scroll_y computation). A keypress does not reset
+    /// this offset either, by the same "simplest thing that works" choice --
+    /// only scrolling back down (or reaching the bottom) clears it.
+    pub view_scroll_offset: u16,
+    /// Ticket 43: elapsed session time, recomputed from a TUI-local
+    /// `Instant` captured once at session start (see `run_blocking`) and
+    /// copied in here by the event loop so `draw` stays a pure function of
+    /// `AppState` -- this also makes the status line's time-formatting
+    /// testable with a fixed `Duration`, without any real wall-clock wait.
+    pub elapsed: Duration,
+    /// Ticket 43: the most recently reported context-window usage, or
+    /// `None` before any turn has completed. Delivered from `main.rs` over a
+    /// status-update channel mirroring the permission-request channel's
+    /// shape -- a plain primitive, no rokr-core types crossing into this
+    /// crate (see `SessionStatus`'s own doc comment).
+    pub session_status: Option<SessionStatus>,
 }
 
 /// A gated tool call awaiting user permission, described in primitives only
@@ -80,6 +111,22 @@ pub enum PermissionDetail {
     /// Old/new content for a `write`-style change, rendered as a
     /// line-level diff.
     Diff { old: String, new: String },
+}
+
+/// Plain data describing the session status line's contents (ticket 43,
+/// mouse-scroll-status-line): elapsed time is computed TUI-locally (see
+/// `AppState::elapsed`), but the context-window usage percentage requires
+/// token counts that only `main.rs` has access to (rokr-tui must not depend
+/// on rokr-core's `Usage` type), so `main.rs` computes the percentage itself
+/// and sends it across a status-update channel as this primitive struct --
+/// mirroring how `PermissionRequest`/`PermissionHandle` round-trip a
+/// primitive shape rather than a rokr-core type directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionStatus {
+    /// Fraction (not a whole percent) of the context window used by the
+    /// most recent turn's reported usage: `(input_tokens + output_tokens) /
+    /// context_window_size`. Rendered multiplied by 100 in `draw`.
+    pub context_percent: f64,
 }
 
 /// Handle for requesting permission mid-`submit`, round-tripped through the
@@ -137,7 +184,8 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         ])
         .split(frame.area());
 
-    let header = Block::default().borders(Borders::ALL).title(HEADER_TITLE);
+    let header = Paragraph::new(status_line_text(state))
+        .block(Block::default().borders(Borders::ALL).title(HEADER_TITLE));
     frame.render_widget(header, chunks[0]);
 
     let mut view_lines = state.view_lines.clone();
@@ -159,12 +207,19 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     } else if state.pending {
         view_lines.push("...".to_string());
     }
-    // While a permission prompt is showing, anchor the Paragraph's scroll to
-    // the bottom so the prompt + "[y]/[n]" line stay visible even when a
-    // long transcript (or, previously, a long diff — now capped by
-    // MAX_DIFF_LINES) would otherwise push them past the bottom of the View
-    // pane. `Paragraph` has no bottom-anchor mode, so this computes an
-    // explicit `scroll` offset instead.
+    // Bottom-anchor the View pane so the latest content -- the permission
+    // prompt/"[y]/[n]" line, the pending indicator, or just the tail of a
+    // long transcript -- stays visible instead of ratatui's default
+    // scroll-from-top clipping it once content exceeds the pane's height.
+    // Ticket 43 (mouse-scroll-status-line) generalizes this beyond the
+    // permission-prompt case it originally shipped for: `state
+    // .view_scroll_offset` (adjusted by mouse wheel, see
+    // `adjust_view_scroll_offset`) shifts the anchor UP from the bottom by
+    // that many lines, so scrolling back through history works the same way
+    // in normal operation. While a permission prompt is showing, any manual
+    // scroll offset is ignored and the view is forced fully to the bottom
+    // instead -- per the acceptance criterion, mouse scrolling must never
+    // affect an open permission prompt.
     //
     // Known limitation: this counts *unwrapped* logical lines against the
     // pane's inner height, not post-wrap rendered rows, since wrapping
@@ -175,12 +230,13 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     // each one into a real rendered row regardless of pane width. Only
     // *wrapping* of a long single logical line remains an approximation; a
     // very long unwrapped line could still make the estimate short.
+    let inner_height = chunks[1].height.saturating_sub(2); // top/bottom border
+    let total_lines: usize = view_lines.iter().map(|line| line.split('\n').count()).sum();
+    let max_scroll = (total_lines as u16).saturating_sub(inner_height);
     let scroll_y = if showing_permission_prompt {
-        let inner_height = chunks[1].height.saturating_sub(2); // top/bottom border
-        let total_lines: usize = view_lines.iter().map(|line| line.split('\n').count()).sum();
-        (total_lines as u16).saturating_sub(inner_height)
+        max_scroll
     } else {
-        0
+        max_scroll.saturating_sub(state.view_scroll_offset)
     };
     // Wrapped so a long line (e.g. a bash command in a permission prompt)
     // doesn't get silently clipped at the pane's width.
@@ -210,6 +266,38 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     frame.render_widget(prompt, chunks[2]);
 }
 
+/// Formats `elapsed` as `mm:ss`, or `hh:mm:ss` once it reaches an hour.
+/// Ticket 43 (mouse-scroll-status-line): a pure function of a `Duration` so
+/// the status line's time rendering is unit-testable without any real
+/// wall-clock wait -- the caller (`draw`, via `state.elapsed`) supplies
+/// whatever duration matters for the test.
+fn format_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Builds the Header block's status-line text: elapsed session time, plus a
+/// context-window usage percentage once at least one turn's usage has been
+/// reported (`state.session_status`). Extracted as a pure function of
+/// `AppState` so it's unit-testable the same way `draw`'s other helpers are.
+fn status_line_text(state: &AppState) -> String {
+    let elapsed = format_elapsed(state.elapsed);
+    match state.session_status {
+        Some(status) => {
+            let percent = (status.context_percent * 100.0).round() as i64;
+            format!("{elapsed} | context {percent}%")
+        }
+        None => elapsed,
+    }
+}
+
 /// Renders `old` and `new` as a naive line-level diff: every line of `old`
 /// prefixed `-`, every line of `new` prefixed `+`. Not a minimal/LCS diff —
 /// deliberately simple per the ticket ("no new diff crate, plain old/new
@@ -233,8 +321,9 @@ fn truncate_diff(mut lines: Vec<String>) -> Vec<String> {
     lines
 }
 
-/// Ensures raw mode is disabled and the alternate screen is left, no matter
-/// how the event loop exits (normal return, early `?`, or panic unwind).
+/// Ensures raw mode is disabled, mouse capture is turned off, and the
+/// alternate screen is left, no matter how the event loop exits (normal
+/// return, early `?`, or panic unwind).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -244,25 +333,34 @@ impl TerminalGuard {
         // the alternate screen fails, the guard still gets dropped on the way
         // out and disables raw mode instead of leaking it.
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        // Ticket 43 (mouse-scroll-status-line): mouse capture is enabled
+        // alongside the alternate screen. Known trade-off (PRD decision 6):
+        // enabling mouse capture disables the terminal's native click-drag
+        // text selection in most emulators. Mitigation shipped this phase is
+        // documentation only, no toggle command: Shift-drag (the common
+        // terminal-emulator convention) bypasses application mouse capture
+        // and still performs native OS text selection.
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(guard)
     }
 
-    /// Ticket 42 ($EDITOR integration): temporarily leaves raw mode and the
-    /// alternate screen so a suspended `$EDITOR` subprocess can use the
-    /// terminal normally, mirroring `restore_terminal`'s best-effort
-    /// semantics -- the guard's own `Drop` still restores the terminal on
-    /// the way out of `run_blocking` regardless of whether `resume` below
-    /// is ever reached.
+    /// Ticket 42 ($EDITOR integration): temporarily leaves raw mode, mouse
+    /// capture, and the alternate screen so a suspended `$EDITOR` subprocess
+    /// can use the terminal normally, mirroring `restore_terminal`'s
+    /// best-effort semantics -- the guard's own `Drop` still restores the
+    /// terminal on the way out of `run_blocking` regardless of whether
+    /// `resume` below is ever reached. Ticket 43 extends this to mouse
+    /// capture: left enabled, a suspended `$EDITOR` would have its own mouse
+    /// handling clobbered by rokr's capture mode.
     fn suspend(&self) {
         restore_terminal();
     }
 
-    /// Re-enters raw mode and the alternate screen after `suspend`, so the
-    /// render loop can keep drawing.
+    /// Re-enters raw mode, mouse capture, and the alternate screen after
+    /// `suspend`, so the render loop can keep drawing.
     fn resume(&self) -> io::Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(())
     }
 }
@@ -277,7 +375,7 @@ fn restore_terminal() {
     // Best-effort: we're often already unwinding or exiting, so there's no
     // good way to react to failures here.
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 /// Installs a panic hook that restores the terminal (raw mode off, leave
@@ -419,11 +517,19 @@ fn run_editor_keybinding(
 /// Up/Down recall, and `on_history_append` is invoked with each submitted
 /// prompt so the caller (`main.rs`) can persist it — both are primitives
 /// only, since rokr-tui must not depend on rokr-session.
+///
+/// `status_rx` (ticket 43, mouse-scroll-status-line) delivers `SessionStatus`
+/// updates -- primitive context-usage figures computed by the caller once a
+/// turn's usage is known -- into the render loop, the mirror image of the
+/// permission-request channel (there, rokr-tui owns both ends and hands the
+/// caller a `PermissionHandle`; here, the caller creates and owns the
+/// channel and rokr-tui just consumes the receiving end).
 pub async fn run<F, Fut, C, Fut2>(
     submit: F,
     command: C,
     history: Vec<String>,
     on_history_append: impl Fn(String) + Send + Sync + 'static,
+    status_rx: mpsc::Receiver<SessionStatus>,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -444,7 +550,7 @@ where
     let on_history_append: Arc<dyn Fn(String) + Send + Sync> = Arc::new(on_history_append);
 
     tokio::task::spawn_blocking(move || {
-        run_blocking(handle, submit, command, history, on_history_append)
+        run_blocking(handle, submit, command, history, on_history_append, status_rx)
     })
     .await
     .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
@@ -456,6 +562,7 @@ fn run_blocking<F, Fut, C, Fut2>(
     command: C,
     history: Vec<String>,
     on_history_append: Arc<dyn Fn(String) + Send + Sync>,
+    status_rx: mpsc::Receiver<SessionStatus>,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -472,8 +579,25 @@ where
         history,
         ..AppState::default()
     };
+    // Ticket 43 (mouse-scroll-status-line): captured once here, right after
+    // entering the terminal -- this is "session start" for elapsed-time
+    // purposes even for a resumed session (PRD decision 6's "or at resume
+    // time"): there is no cross-process-restart wall-clock state to thread
+    // through, so "resume time" is simply whenever THIS process's TUI loop
+    // begins.
+    let start_instant = Instant::now();
 
-    event_loop(&mut terminal, &mut state, &handle, &submit, &command, &on_history_append, &guard)
+    event_loop(
+        &mut terminal,
+        &mut state,
+        &handle,
+        &submit,
+        &command,
+        &on_history_append,
+        &guard,
+        start_instant,
+        status_rx,
+    )
 }
 
 fn event_loop<F, Fut, C, Fut2>(
@@ -484,6 +608,8 @@ fn event_loop<F, Fut, C, Fut2>(
     command: &C,
     on_history_append: &Arc<dyn Fn(String) + Send + Sync>,
     guard: &TerminalGuard,
+    start_instant: Instant,
+    status_rx: mpsc::Receiver<SessionStatus>,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -513,6 +639,18 @@ where
     let mut history_cursor: Option<usize> = None;
 
     loop {
+        // Ticket 43: only marks dirty when the WHOLE-SECOND elapsed value
+        // actually changes, not on every ~100ms poll cycle below -- keeps
+        // ADR 0008's "redraw only on state change" intact (the visible
+        // mm:ss/hh:mm:ss text is unchanged sub-second, so redrawing then
+        // would be pure waste) while still ticking the status line forward
+        // once a second even when no other input/event arrives.
+        let elapsed = start_instant.elapsed();
+        if elapsed.as_secs() != state.elapsed.as_secs() {
+            state.elapsed = elapsed;
+            dirty = true;
+        }
+
         if dirty {
             terminal.draw(|frame| draw(frame, state))?;
             dirty = false;
@@ -521,6 +659,11 @@ where
         if let Ok((request, responder)) = perm_rx.try_recv() {
             state.permission_request = Some(request);
             pending_permission_responder = Some(responder);
+            dirty = true;
+        }
+
+        if let Ok(status) = status_rx.try_recv() {
+            state.session_status = Some(status);
             dirty = true;
         }
 
@@ -696,6 +839,17 @@ where
                         _ => {}
                     }
                 }
+                Event::Mouse(mouse_event) => {
+                    let new_offset = adjust_view_scroll_offset(
+                        state.view_scroll_offset,
+                        mouse_event.kind,
+                        state.permission_request.is_some(),
+                    );
+                    if new_offset != state.view_scroll_offset {
+                        state.view_scroll_offset = new_offset;
+                        dirty = true;
+                    }
+                }
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -803,6 +957,44 @@ fn route_input(input: String) -> InputRoute {
         InputRoute::Command(input)
     } else {
         InputRoute::Submit(input)
+    }
+}
+
+/// Ticket 43 (mouse-scroll-status-line): decides the new View-pane scroll
+/// offset for a mouse-wheel event. Pure and side-effect-free, mirroring
+/// `should_quit`/`handle_permission_key`/`route_input`/`history_navigate_*`.
+///
+/// Scrolling is scoped ONLY to the View pane's scrollback offset -- it never
+/// reads or writes `prompt_input`, so it can't affect the prompt buffer.
+/// `permission_prompt_showing` makes this a no-op while a permission prompt
+/// is up (PRD decision 6: mouse input must never affect an open permission
+/// prompt); the prompt's own bottom-anchored rendering in `draw` also
+/// ignores this offset independently, so scrolling can't disturb it even if
+/// this guard were ever bypassed.
+///
+/// This app has exactly one scrollable region (the View pane), so every
+/// wheel event is treated as a View-scroll regardless of the pointer's
+/// on-screen row/column -- no separate positional hit-testing against the
+/// View pane's rendered bounds, since there is nothing else on screen a
+/// wheel event could plausibly mean.
+///
+/// `ScrollUp` increases the offset (scrolls back through history, away from
+/// the live bottom); `ScrollDown` decreases it, saturating at 0 (fully
+/// caught up to the bottom). Any other `MouseEventKind` (click, drag, moved)
+/// is a no-op -- PRD decision 6 explicitly defers mouse-driven text
+/// selection/click-to-jump to a later slice.
+fn adjust_view_scroll_offset(
+    offset: u16,
+    kind: MouseEventKind,
+    permission_prompt_showing: bool,
+) -> u16 {
+    if permission_prompt_showing {
+        return offset;
+    }
+    match kind {
+        MouseEventKind::ScrollUp => offset.saturating_add(SCROLL_LINES_PER_TICK),
+        MouseEventKind::ScrollDown => offset.saturating_sub(SCROLL_LINES_PER_TICK),
+        _ => offset,
     }
 }
 
@@ -1225,5 +1417,94 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    /// Ticket 43 (mouse-scroll-status-line): mouse-wheel scroll adjusts
+    /// `AppState.view_scroll_offset` and nothing else -- in particular, it
+    /// must never touch `prompt_input`, since scrolling is scoped to the
+    /// View pane's scrollback only.
+    #[test]
+    fn mouse_scroll_event_adjusts_view_offset_without_touching_prompt_buffer() {
+        let mut state = AppState {
+            prompt_input: "unsent draft".to_string(),
+            ..Default::default()
+        };
+
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollUp, false);
+        assert_eq!(state.view_scroll_offset, SCROLL_LINES_PER_TICK);
+        assert_eq!(state.prompt_input, "unsent draft");
+
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollUp, false);
+        assert_eq!(state.view_scroll_offset, SCROLL_LINES_PER_TICK * 2);
+
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollDown, false);
+        assert_eq!(state.view_scroll_offset, SCROLL_LINES_PER_TICK);
+        assert_eq!(
+            state.prompt_input, "unsent draft",
+            "mouse scrolling must never touch the prompt buffer"
+        );
+
+        // A permission prompt showing must block the scroll from moving at
+        // all, per PRD decision 6.
+        let offset_before = state.view_scroll_offset;
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollUp, true);
+        assert_eq!(
+            state.view_scroll_offset, offset_before,
+            "scrolling must not affect an open permission prompt"
+        );
+    }
+
+    /// Ticket 43 (mouse-scroll-status-line): the Header block's status line
+    /// renders elapsed session time (formatted mm:ss, or hh:mm:ss once past
+    /// an hour) and a context-usage percentage derived from
+    /// `AppState.session_status`, once a turn's usage has been reported.
+    #[test]
+    fn status_line_renders_elapsed_time_and_context_usage_percentage_from_session_status() {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            elapsed: Duration::from_secs(125), // 02:05
+            session_status: Some(SessionStatus { context_percent: 0.42 }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rendered: String = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("02:05"),
+            "expected the header to show elapsed time 02:05, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("42%"),
+            "expected the header to show a 42% context-usage figure, got: {rendered:?}"
+        );
+
+        // Past an hour, the formatter switches to hh:mm:ss.
+        let long_state = AppState {
+            elapsed: Duration::from_secs(3725), // 01:02:05
+            ..Default::default()
+        };
+        terminal.draw(|frame| draw(frame, &long_state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("01:02:05"),
+            "expected elapsed time past the one-hour mark to render as \
+             hh:mm:ss, got: {rendered:?}"
+        );
     }
 }
