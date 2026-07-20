@@ -449,6 +449,18 @@ where
                     }
 
                     match key.code {
+                        KeyCode::Enter if handle_enter_key(state, key.modifiers) => {
+                            // Ticket 41 (multiline-input): Alt+Enter or
+                            // Shift+Enter inserted a newline into
+                            // `prompt_input` instead of submitting (see
+                            // `handle_enter_key`) -- typing, so it exits any
+                            // history walk in progress the same way
+                            // `Char`/`Backspace` do below, rather than
+                            // leaving a stale recall cursor pointed at a
+                            // buffer that's now been hand-edited.
+                            history_cursor = None;
+                            dirty = true;
+                        }
                         KeyCode::Enter if !state.prompt_input.is_empty() => {
                             let input = std::mem::take(&mut state.prompt_input);
                             // Ticket 40 (prompt-history): captured at the
@@ -557,6 +569,40 @@ where
 fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool, pending: bool) -> bool {
     (matches!(code, KeyCode::Char('q')) && prompt_is_empty && !pending)
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Ticket 41 (multiline-input): an `Enter` keypress submits the prompt
+/// UNLESS `modifiers` carries ALT or SHIFT, in which case it instead
+/// appends a newline to `state.prompt_input` and returns `true` so the
+/// caller (`event_loop`'s `KeyCode::Enter` match guard) knows to treat this
+/// as a buffer edit rather than falling through to the submit arm.
+///
+/// PRD decision 5 (phase-5-session-management) fixes this split for the
+/// phase -- Enter always submits, Alt+Enter/Shift+Enter always inserts,
+/// not configurable -- so no further key-binding lookup is needed here.
+///
+/// SHIFT is checked alongside ALT for terminals that do transmit it (some
+/// modern terminal + keyboard-protocol combinations do), even though this
+/// crate doesn't opt into crossterm's kitty keyboard-enhancement flags, so
+/// a raw xterm-style PTY can only ever be driven via ALT in practice (see
+/// the crossterm-decoding doc comment on
+/// `multiline_prompt_composed_with_shift_enter_submits_as_single_prompt_on_enter`
+/// in `crates/rokr/tests/tui_test.rs` for the byte-level detail).
+///
+/// Deliberately append-only (no cursor-position tracking): this crate's
+/// input buffer has no separate edit-cursor concept yet (`Char`/
+/// `Backspace` only ever act at the end of `prompt_input`), and the
+/// acceptance criterion only requires composing and submitting a
+/// multi-line prompt, not mid-buffer cursor movement -- adding real
+/// cursor-aware insertion would be building more editor than this ticket
+/// asks for.
+fn handle_enter_key(state: &mut AppState, modifiers: KeyModifiers) -> bool {
+    if modifiers.contains(KeyModifiers::ALT) || modifiers.contains(KeyModifiers::SHIFT) {
+        state.prompt_input.push('\n');
+        true
+    } else {
+        false
+    }
 }
 
 /// What a keypress means while a permission prompt is showing (i.e.
@@ -953,5 +999,39 @@ mod tests {
     fn history_navigate_down_clears_to_empty_past_newest_entry() {
         let history = vec!["first".to_string(), "second".to_string()];
         assert_eq!(history_navigate_down(&history, Some(1)), HistoryDown::ClearToEmpty);
+    }
+
+    /// Ticket 41 (multiline-input) acceptance-adjacent unit test: Shift+Enter
+    /// (and Alt+Enter, its raw-PTY-portable equivalent -- see the
+    /// crossterm-decoding note on `handle_enter_key`) must insert a newline
+    /// into `prompt_input` rather than submitting -- asserted here by
+    /// showing the buffer keeps growing (never cleared the way the event
+    /// loop's `mem::take` on a real submit would empty it).
+    #[test]
+    fn shift_enter_inserts_newline_without_submitting() {
+        let mut state = AppState {
+            prompt_input: "line one".to_string(),
+            ..Default::default()
+        };
+
+        let inserted = handle_enter_key(&mut state, KeyModifiers::SHIFT);
+
+        assert!(inserted, "expected Shift+Enter to insert a newline, not submit");
+        assert_eq!(
+            state.prompt_input, "line one\n",
+            "expected the newline to be appended and the buffer preserved rather than cleared/submitted"
+        );
+
+        // Alt+Enter must behave identically (both are treated as "insert a
+        // newline" per the ticket).
+        let inserted_alt = handle_enter_key(&mut state, KeyModifiers::ALT);
+        assert!(inserted_alt, "expected Alt+Enter to insert a newline, not submit");
+        assert_eq!(state.prompt_input, "line one\n\n");
+
+        // A plain Enter (no ALT/SHIFT) must NOT be treated as a newline
+        // insert -- that's the event loop's cue to submit instead.
+        let inserted_plain = handle_enter_key(&mut state, KeyModifiers::NONE);
+        assert!(!inserted_plain, "expected plain Enter not to insert a newline");
+        assert_eq!(state.prompt_input, "line one\n\n", "plain Enter must not modify the buffer");
     }
 }

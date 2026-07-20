@@ -6921,3 +6921,223 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
+
+/// Ticket 41 (multiline-input) acceptance test: composing a prompt across
+/// two lines via Alt+Enter (crossterm's raw-PTY-portable equivalent of
+/// Shift+Enter -- confirmed by reading crossterm 0.28.1's unix ANSI parser
+/// at `event/sys/unix/parse.rs`: a lone `ESC` followed by any byte that
+/// isn't `O`/`[`/`ESC` recursively parses that byte as a normal key and ORs
+/// in `KeyModifiers::ALT`, so `\x1b\r` decodes to `KeyEvent { code: Enter,
+/// modifiers: ALT }`; a bare `\r` -- which is all a real Shift+Enter sends
+/// over a raw PTY without the kitty keyboard protocol enabled, which this
+/// app doesn't opt into -- is indistinguishable from plain Enter at the
+/// byte level, so Shift+Enter itself can't be driven from a PTY test; the
+/// source under test checks `ALT || SHIFT` so a terminal that does send
+/// SHIFT is still covered, just not exercised here), then pressing Enter,
+/// must submit the WHOLE two-line buffer as a single outgoing request
+/// rather than submitting on the first Alt+Enter.
+///
+/// Verified two ways:
+/// 1. Exactly one request reaches the mock server (proving the first
+///    Alt+Enter did not submit).
+/// 2. That request's JSON body contains the two typed lines joined by a
+///    literal newline (serialized as the two-character JSON escape `\n`),
+///    proving the newline landed IN the submitted content rather than
+///    being dropped or splitting the submission in two.
+///
+/// Single PTY spawn is enough here (unlike the two-process pattern in
+/// `pressing_up_after_restart_recalls_previously_submitted_prompt_from_history_file`,
+/// which specifically needed a restart to prove cross-session persistence).
+#[tokio::test]
+async fn multiline_prompt_composed_with_shift_enter_submits_as_single_prompt_on_enter() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Single tokens (no spaces), same reason as every other test in this
+    // file: ratatui's diff-based redraw can leave cursor-jump gaps across
+    // unchanged cells, so a literal multi-word substring match on raw pty
+    // bytes can spuriously fail.
+    let canned_response = "MockedAssistantReplyForMultilineInputTesting";
+    let line_one = "linealphaunique";
+    let line_two = "linebetaunique";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-multiline",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-multiline");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-multiline");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-multiline");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Type line one, then Alt+Enter (`ESC` immediately followed by `\r` --
+    // see the crossterm-decoding doc comment above) -- this must insert a
+    // newline, NOT submit.
+    writer
+        .write_all(line_one.as_bytes())
+        .expect("failed to write line one to pty");
+    writer
+        .write_all(b"\x1b\r")
+        .expect("failed to write Alt+Enter to pty");
+
+    // Type line two, then a plain Enter -- THIS must submit the whole
+    // two-line buffer as a single prompt.
+    writer
+        .write_all(line_two.as_bytes())
+        .expect("failed to write line two to pty");
+    writer
+        .write_all(b"\r")
+        .expect("failed to write Enter to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(line_one),
+        "expected pty output to contain the first typed line, got: {output:?}"
+    );
+    assert!(
+        output.contains(line_two),
+        "expected pty output to contain the second typed line, got: {output:?}"
+    );
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert_eq!(
+        received_requests.len(),
+        1,
+        "expected exactly ONE outgoing request -- proving the first Alt+Enter did not \
+         prematurely submit line one on its own -- got {} requests: {:?}",
+        received_requests.len(),
+        received_requests
+            .iter()
+            .map(|req| String::from_utf8_lossy(&req.body).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    let request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    let expected_joined_content = format!("{line_one}\\n{line_two}");
+    assert!(
+        request_body.contains(&expected_joined_content),
+        "expected the single outgoing request body to contain the two typed lines joined by a \
+         literal newline (JSON-escaped as {expected_joined_content:?}), proving the whole \
+         multi-line buffer was submitted as ONE prompt; got body: {request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+}
