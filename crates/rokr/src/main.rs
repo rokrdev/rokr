@@ -313,8 +313,13 @@ async fn main() -> ExitCode {
                 ResumeMode::None => {
                     let session_handle = match store.create_session() {
                         Ok(handle) => {
+                            // Schema v2 (architect ruling, phase-5): a
+                            // brand-new session's Header records schema
+                            // version 2 (Turn now carries a `messages` array,
+                            // not a singular `message`). Existing v1 logs are
+                            // read-shimmed, never rewritten.
                             handle.append_header(
-                                1,
+                                2,
                                 handle.session_id().to_string(),
                                 now_timestamp(),
                                 cwd.as_ref()
@@ -706,6 +711,14 @@ async fn main() -> ExitCode {
                     });
 
                     let mut transcript = transcript.lock().await;
+                    // Schema v2 (architect ruling, phase-5): capture the
+                    // transcript length BEFORE this turn's user message and
+                    // its whole exchange are appended, so the `Turn` record
+                    // below can persist EXACTLY the slice this submit
+                    // produced -- the user prompt plus every
+                    // assistant/tool-use/tool-result/final message
+                    // `run_tool_loop` appends in place.
+                    let start = transcript.len();
                     accumulate_user_turn(&mut transcript, expanded_input);
 
                     let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
@@ -721,17 +734,24 @@ async fn main() -> ExitCode {
                     .await
                     .map_err(|err| err.to_string())?;
 
-                    // Ticket 34 (persist-new-sessions): the Turn record's
-                    // message is built from the ORIGINAL submitted `input`
-                    // (before `@path`-mention expansion), matching what the
-                    // acceptance test asserts -- the persisted log should
-                    // show exactly what the user typed, not the expanded
-                    // form that actually goes out on the wire.
+                    // Schema v2 (architect ruling, phase-5): exactly ONE
+                    // `Turn` record per submit, appended after
+                    // `run_tool_loop` returns and BEFORE the auto-compaction
+                    // check below, carrying the FULL exchange
+                    // (`transcript[start..]`) -- the @path-mention-EXPANDED
+                    // user message (what actually went out on the wire) plus
+                    // every assistant/tool-use/tool-result/final message the
+                    // loop appended. Atomic: the whole exchange or nothing (a
+                    // crash mid-loop drops the in-flight turn), intentionally
+                    // not split into an early user append and a later
+                    // assistant append. Note this supersedes ticket 34's
+                    // earlier behavior of persisting the raw pre-expansion
+                    // `input`.
                     {
                         let session_handle_guard = session_handle.read().await;
                         if let Some(session_handle) = session_handle_guard.as_ref() {
                             session_handle.append_turn(
-                                rokr_core::Message::user_text(input.clone()),
+                                transcript[start..].to_vec(),
                                 rokr_session::UsageRecord::from(usage),
                                 now_timestamp(),
                             );
@@ -805,6 +825,19 @@ async fn main() -> ExitCode {
                     ) {
                         match rokr_core::compact_transcript(&provider, &transcript).await {
                             Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
+                                // RULING 2: persist a Compaction record. At
+                                // this point `turn_index` has already been
+                                // incremented for THIS turn (see above), so
+                                // its value is the raw turn count; the retained
+                                // tail turn is `raw_turn_count - 1` and the
+                                // summary replaces through `raw_turn_count - 2`.
+                                let raw_turn_count = *turn_index.lock().unwrap();
+                                append_compaction_record(
+                                    &session_handle,
+                                    &compacted,
+                                    raw_turn_count,
+                                )
+                                .await;
                                 *transcript = compacted;
                                 None
                             }
@@ -971,6 +1004,21 @@ async fn main() -> ExitCode {
                             .await
                             {
                                 Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
+                                    // RULING 2: persist a Compaction record.
+                                    // `/compact` never submits a turn itself,
+                                    // so `turn_index` is NOT incremented here
+                                    // -- its current value is the raw turn
+                                    // count (same derivation as the auto path:
+                                    // the retained tail turn is
+                                    // `raw_turn_count - 1`, the summary
+                                    // replaces through `raw_turn_count - 2`).
+                                    let raw_turn_count = *turn_index.lock().unwrap();
+                                    append_compaction_record(
+                                        &session_handle,
+                                        &compacted,
+                                        raw_turn_count,
+                                    )
+                                    .await;
                                     *transcript = compacted;
                                     if let Some(cwd) = cwd.as_deref() {
                                         let regenerated = rokr_tools::repo_map::generate(cwd);
@@ -1106,6 +1154,56 @@ async fn capture_checkpoint_if_granted_diff(
         Err(err) => {
             eprintln!("failed to capture pre-image checkpoint snapshot for {path}: {err}");
         }
+    }
+}
+
+/// The exact wrapper `rokr_core::compact_transcript` prepends to a fresh
+/// summary (and `rokr_session::fold` re-applies on resume). RULING 2 strips
+/// it back off before persisting a `Compaction` record's `summary` so the
+/// stored text is RAW -- storing the already-wrapped text would double-wrap
+/// it on the next resume.
+const COMPACTION_SUMMARY_WRAPPER_PREFIX: &str =
+    "[Earlier conversation summary — compacted to save context]\n\n";
+
+/// RULING 2 (architect ruling, phase-5): appends a `Compaction` record for a
+/// just-completed compaction, shared by BOTH the auto-compaction branch in
+/// `submit` and the manual `/compact` handler in `command`.
+///
+/// `compacted` is `compact_transcript`'s output: `compacted[0]` is the
+/// summary message with the wrapper prefix already baked in, and
+/// `compacted[1..]` is the untouched tail turn. This strips the wrapper back
+/// off `compacted[0]`'s text (falling back to the raw text if the prefix
+/// somehow isn't present) to recover the RAW summary to store, because
+/// `fold` re-applies that same wrapper on resume.
+///
+/// `raw_turn_count` is `*turn_index` at the compaction decision point (AFTER
+/// the per-turn increment in `submit`; the plain current value in
+/// `/compact`, which never increments). Compaction always retains exactly the
+/// tail turn (raw index `raw_turn_count - 1`), so the summary replaces
+/// through `(raw_turn_count - 1) - 1 == raw_turn_count - 2`. If that
+/// underflows (fewer than 2 raw turns -- `compact_transcript` should never
+/// return `Compacted` then, but guard defensively), NO record is appended.
+///
+/// No-ops if no session is currently active (persistence degraded at
+/// startup), matching `capture_checkpoint_if_granted_diff`'s handling.
+async fn append_compaction_record(
+    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
+    compacted: &[rokr_core::Message],
+    raw_turn_count: usize,
+) {
+    let Some(replaced_through) = raw_turn_count.checked_sub(2) else {
+        return;
+    };
+
+    let wrapped = compacted.first().map(|m| m.text()).unwrap_or_default();
+    let raw_summary = wrapped
+        .strip_prefix(COMPACTION_SUMMARY_WRAPPER_PREFIX)
+        .unwrap_or(&wrapped)
+        .to_string();
+
+    let guard = session_handle.read().await;
+    if let Some(handle) = guard.as_ref() {
+        handle.append_compaction(raw_summary, replaced_through);
     }
 }
 
@@ -1327,6 +1425,13 @@ async fn handle_resume_command(
 /// no-op (returns an error string, no mutation) if no session is currently
 /// active, matching `capture_checkpoint_if_granted_diff`'s degraded-startup
 /// handling elsewhere in this file.
+///
+/// RULING 3 (architect ruling, phase-5): additionally REFUSES (before any
+/// mutation, exact message `"cannot roll back past the last compaction —
+/// earlier turns were summarized"`) when the target is at or before the last
+/// `Compaction` record's `replaced_through` -- those earlier turns were
+/// summarized away and cannot be un-folded, so this is a hard refusal, not a
+/// partial rollback.
 async fn handle_rollback_command(
     data_dir: &std::path::Path,
     store: &rokr_session::SessionStore,
@@ -1362,6 +1467,23 @@ async fn handle_rollback_command(
         return "cannot roll back: no session is currently active".to_string();
     };
     let session_id = active_handle.session_id().to_string();
+
+    // RULING 3 (architect ruling, phase-5): rolling back INTO or BEFORE
+    // compacted territory is a hard refusal -- the summarized-away turns
+    // cannot be un-folded. Checked BEFORE any mutation (no filesystem
+    // restore, no Rollback record appended). A lookup error is treated
+    // conservatively as "cannot verify" and also refuses rather than risking
+    // a rollback past a compaction boundary.
+    match store.last_compaction_replaced_through(&session_id) {
+        Ok(Some(boundary)) if target <= boundary => {
+            return "cannot roll back past the last compaction — earlier turns were summarized"
+                .to_string();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return format!("rollback failed, no changes applied: {err}");
+        }
+    }
 
     let checkpoint_store = rokr_session::CheckpointStore::open(data_dir, &session_id);
     let touched = match checkpoint_store.rollback_to(target) {
@@ -1746,7 +1868,7 @@ mod tests {
             "gpt-test".to_string(),
         );
         target_handle.append_turn(
-            Message::user_text("target session first prompt"),
+            vec![Message::user_text("target session first prompt")],
             UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -1842,7 +1964,7 @@ mod tests {
             "gpt-test".to_string(),
         );
         target_handle.append_turn(
-            Message::user_text("target turn zero"),
+            vec![Message::user_text("target turn zero")],
             UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -1852,7 +1974,7 @@ mod tests {
             "2026-07-20T01:00:01Z".to_string(),
         );
         target_handle.append_turn(
-            Message::assistant_text("target turn one"),
+            vec![Message::assistant_text("target turn one")],
             UsageRecord {
                 input_tokens: 2,
                 output_tokens: 2,
@@ -1885,7 +2007,7 @@ mod tests {
         }
 
         target_handle.append_turn(
-            Message::user_text("target turn two after compaction"),
+            vec![Message::user_text("target turn two after compaction")],
             UsageRecord {
                 input_tokens: 3,
                 output_tokens: 3,
@@ -1952,7 +2074,7 @@ mod tests {
             let guard = session_handle.read().await;
             let handle = guard.as_ref().expect("session_handle should be repointed to target");
             handle.append_turn(
-                Message::user_text("post-jump new turn"),
+                vec![Message::user_text("post-jump new turn")],
                 UsageRecord {
                     input_tokens: 4,
                     output_tokens: 4,
@@ -2066,6 +2188,203 @@ mod tests {
         );
     }
 
+    /// RULING 2 (architect ruling, phase-5) done-when #1 (direct numeric
+    /// derivation): `append_compaction_record` derives `replaced_through =
+    /// raw_turn_count - 2` (compaction retains the tail turn at
+    /// `raw_turn_count - 1`, summary replaces through the one before it) and
+    /// stores the RAW summary text with the `[Earlier conversation summary
+    /// ...]` wrapper stripped back off (so `fold` doesn't double-wrap it on
+    /// resume). With `raw_turn_count = 3` (turns 0,1,2 submitted; turn 2 the
+    /// retained tail), the record's `replaced_through` must be 1.
+    #[tokio::test]
+    async fn append_compaction_record_derives_replaced_through_and_stores_raw_summary() {
+        let dir = unique_temp_dir("append-compaction-derivation");
+        let store = rokr_session::SessionStore::open(&dir);
+        let handle = store.create_session().expect("create_session should succeed");
+        let session_id = handle.session_id().to_string();
+        handle.append_header(
+            2,
+            session_id.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/compaction".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        handle.flush().await;
+
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(handle)));
+
+        // `compact_transcript`'s output: compacted[0] is the summary with the
+        // wrapper already baked in; compacted[1..] is the untouched tail turn.
+        let wrapped_summary =
+            format!("{COMPACTION_SUMMARY_WRAPPER_PREFIX}RawSummaryTextForDerivationTest");
+        let compacted = vec![
+            Message::user_text(wrapped_summary),
+            Message::user_text("the untouched tail turn prompt"),
+        ];
+
+        append_compaction_record(&session_handle, &compacted, 3).await;
+        session_handle.read().await.as_ref().unwrap().flush().await;
+
+        let contents =
+            std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
+                .expect("session.jsonl should exist");
+        let compaction_records: Vec<rokr_session::SessionRecord> = contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+            .filter(|record| matches!(record, rokr_session::SessionRecord::Compaction { .. }))
+            .collect();
+        assert_eq!(compaction_records.len(), 1, "expected exactly one Compaction record");
+        match &compaction_records[0] {
+            rokr_session::SessionRecord::Compaction {
+                summary,
+                replaced_through,
+            } => {
+                assert_eq!(
+                    *replaced_through, 1,
+                    "raw_turn_count 3 -> replaced_through 1 (tail turn 2 retained)"
+                );
+                assert_eq!(
+                    summary, "RawSummaryTextForDerivationTest",
+                    "the stored summary must have the wrapper prefix stripped back off"
+                );
+            }
+            other => panic!("expected a Compaction record, got: {other:?}"),
+        }
+    }
+
+    /// RULING 2 defensive guard: `append_compaction_record` appends NOTHING
+    /// when `raw_turn_count < 2` (`checked_sub(2)` underflows) -- there'd be
+    /// nothing before the tail to summarize, so no `Compaction` record should
+    /// be written rather than panicking or underflowing.
+    #[tokio::test]
+    async fn append_compaction_record_skips_when_fewer_than_two_turns() {
+        let dir = unique_temp_dir("append-compaction-guard");
+        let store = rokr_session::SessionStore::open(&dir);
+        let handle = store.create_session().expect("create_session should succeed");
+        let session_id = handle.session_id().to_string();
+        handle.append_header(
+            2,
+            session_id.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/compaction-guard".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        handle.flush().await;
+
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(handle)));
+        let compacted = vec![Message::user_text(format!(
+            "{COMPACTION_SUMMARY_WRAPPER_PREFIX}should not be stored"
+        ))];
+
+        append_compaction_record(&session_handle, &compacted, 1).await;
+        session_handle.read().await.as_ref().unwrap().flush().await;
+
+        let contents =
+            std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
+                .expect("session.jsonl should exist");
+        let compaction_count = contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+            .filter(|record| matches!(record, rokr_session::SessionRecord::Compaction { .. }))
+            .count();
+        assert_eq!(
+            compaction_count, 0,
+            "expected NO Compaction record when raw_turn_count < 2"
+        );
+    }
+
+    /// RULING 3 done-when #3 (compaction guard): `/rollback` to a target at
+    /// or before the last compaction's `replaced_through` is REFUSED with the
+    /// exact message and makes NO mutation -- no filesystem restore, no
+    /// `Rollback` record appended, transcript/usage/turn_index untouched.
+    /// Builds a session whose log holds a `Compaction { replaced_through: 1 }`
+    /// then attempts `/rollback` at target 1 (== boundary) and target 0 (<
+    /// boundary).
+    #[tokio::test]
+    async fn rollback_command_refuses_target_at_or_before_last_compaction_without_mutating() {
+        let dir = unique_temp_dir("rollback-compaction-guard");
+        let store = rokr_session::SessionStore::open(&dir);
+        let handle = store.create_session().expect("create_session should succeed");
+        let session_id = handle.session_id().to_string();
+        handle.append_header(
+            2,
+            session_id.clone(),
+            "2026-07-20T00:00:00Z".to_string(),
+            "/projects/guard".to_string(),
+            "build".to_string(),
+            "anthropic".to_string(),
+            "claude-test".to_string(),
+        );
+        // Three turns (indices 0,1,2), then a compaction summarizing through
+        // turn 1 (retaining tail turn 2).
+        for i in 0..3usize {
+            handle.append_turn(
+                vec![Message::user_text(format!("turn {i}"))],
+                UsageRecord {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                format!("2026-07-20T00:00:0{i}Z"),
+            );
+        }
+        handle.append_compaction("summary through turn 1".to_string(), 1);
+        handle.flush().await;
+
+        let log_before =
+            std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
+                .expect("session.jsonl should exist");
+
+        let transcript = tokio::sync::Mutex::new(vec![Message::user_text("live transcript")]);
+        let session_handle = tokio::sync::RwLock::new(Some(Arc::new(handle)));
+        let last_known_usage = std::sync::Mutex::new(None);
+        let turn_index = std::sync::Mutex::new(3usize);
+
+        const EXPECTED: &str =
+            "cannot roll back past the last compaction — earlier turns were summarized";
+
+        for target in ["1", "0"] {
+            let reply = handle_rollback_command(
+                &dir,
+                &store,
+                &transcript,
+                &session_handle,
+                &last_known_usage,
+                &turn_index,
+                target,
+            )
+            .await;
+            assert_eq!(
+                reply, EXPECTED,
+                "expected the exact refusal message for target {target:?}"
+            );
+        }
+
+        // No mutation: transcript, turn_index, and the on-disk log are all
+        // unchanged (no Rollback record appended).
+        assert_eq!(
+            transcript.lock().await.as_slice(),
+            &[Message::user_text("live transcript")],
+            "a refused rollback must not mutate the transcript"
+        );
+        assert_eq!(*turn_index.lock().unwrap(), 3, "turn_index must be untouched");
+        session_handle.read().await.as_ref().unwrap().flush().await;
+        let log_after =
+            std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
+                .expect("session.jsonl should still exist");
+        assert_eq!(
+            log_before, log_after,
+            "a refused rollback must append no Rollback record (log byte-identical)"
+        );
+    }
+
     /// F-003 (argus review, phase-5-session-management): `turn_index` for a
     /// resumed session must be seeded from `fold`'s own real
     /// `next_turn_index` (via `ResumeState`), not from a separate
@@ -2094,7 +2413,7 @@ mod tests {
         }];
         for i in 0..3u64 {
             records.push(rokr_session::SessionRecord::Turn {
-                message: Message::user_text(format!("turn {i}")),
+                messages: vec![Message::user_text(format!("turn {i}"))],
                 usage: UsageRecord {
                     input_tokens: i + 1,
                     output_tokens: i + 1,
@@ -2176,7 +2495,7 @@ mod tests {
         }];
         for i in 0..3u64 {
             records.push(rokr_session::SessionRecord::Turn {
-                message: Message::user_text(format!("target turn {i}")),
+                messages: vec![Message::user_text(format!("target turn {i}"))],
                 usage: UsageRecord {
                     input_tokens: i + 1,
                     output_tokens: i + 1,
@@ -2272,7 +2591,7 @@ mod tests {
         // Deliberately fire-and-forget: no `.flush().await` here, simulating
         // a write enqueued just before the jump.
         handle_a.append_turn(
-            Message::user_text(pending_text),
+            vec![Message::user_text(pending_text)],
             UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,

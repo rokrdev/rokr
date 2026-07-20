@@ -51,7 +51,19 @@ pub enum SessionRecord {
         model: String,
     },
     Turn {
-        message: Message,
+        /// Schema v2 (architect ruling, phase-5): a `Turn` is one record per
+        /// submit, carrying the user prompt PLUS every
+        /// assistant/tool-use/tool-result/final message that submit produced
+        /// -- not just the user prompt as schema v1 did. The `#[serde(alias =
+        /// "message")]` + custom `deserialize_with` are a READ SHIM ONLY for
+        /// v1 logs (Header `schema_version: 1`, a bare singular `message`
+        /// object): serde accepts either the v2 `messages` array key or the
+        /// v1 `message` object key, and `deserialize_messages_or_message`
+        /// disambiguates the shape. `Serialize` stays derived and always
+        /// writes the v2 `messages` array, so a v1 file is never rewritten --
+        /// only read-shimmed on load.
+        #[serde(alias = "message", deserialize_with = "deserialize_messages_or_message")]
+        messages: Vec<Message>,
         usage: UsageRecord,
         timestamp: String,
     },
@@ -68,6 +80,27 @@ pub enum SessionRecord {
     },
 }
 
+/// Read shim (architect ruling, phase-5, schema v2): deserializes a `Turn`
+/// record's messages from EITHER the v2 shape (a `messages` array) or the v1
+/// shape (a bare singular `message` object), so a v1 session log still
+/// resumes correctly without ever being rewritten. A v1 single message is
+/// wrapped into a one-element `Vec`.
+fn deserialize_messages_or_message<'de, D>(deserializer: D) -> Result<Vec<Message>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MessagesOrMessage {
+        Many(Vec<Message>),
+        One(Message),
+    }
+    match MessagesOrMessage::deserialize(deserializer)? {
+        MessagesOrMessage::Many(messages) => Ok(messages),
+        MessagesOrMessage::One(message) => Ok(vec![message]),
+    }
+}
+
 /// Folds an ordered log of [`SessionRecord`]s into the messages a resumed
 /// session should see, plus the most recently known [`rokr_core::Usage`].
 ///
@@ -80,12 +113,32 @@ pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage
     let mut output: Vec<(usize, Message)> = Vec::new();
     let mut next_turn_index: usize = 0;
     let mut last_known_usage: Option<rokr_core::Usage> = None;
+    // RULING 2 (F-00x fold contract fix): the compaction summary is tracked
+    // OUT of band rather than positionally inserted into `output`. A
+    // `Compaction` record OVERWRITES it (newest-wins -- `compact_transcript`
+    // re-summarizes a transcript whose head already IS the prior summary, so
+    // the newest summary text subsumes the old), and at the end it becomes
+    // ONE leading message at the very FRONT of the output -- never trailing.
+    // This replaces the old positional `insert_at` lookup, which silently
+    // appended the summary at the END whenever `replaced_through` matched no
+    // currently-buffered index.
+    let mut pending_summary: Option<String> = None;
 
     for record in records {
         match record {
             SessionRecord::Header { .. } | SessionRecord::Checkpoint { .. } => {}
-            SessionRecord::Turn { message, usage, .. } => {
-                output.push((next_turn_index, message.clone()));
+            SessionRecord::Turn {
+                messages, usage, ..
+            } => {
+                // Schema v2 (architect ruling, phase-5): a `Turn` record can
+                // now carry multiple messages (user prompt + assistant/tool
+                // messages from the same submit). Flatten every message into
+                // the output in order, tagging each with its OWNING turn's
+                // index (all share `next_turn_index`) so Compaction/Rollback
+                // filtering treats the whole exchange as one atomic turn.
+                for message in messages {
+                    output.push((next_turn_index, message.clone()));
+                }
                 last_known_usage = Some((*usage).into());
                 next_turn_index += 1;
             }
@@ -93,15 +146,11 @@ pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage
                 summary,
                 replaced_through,
             } => {
-                let insert_at = output
-                    .iter()
-                    .position(|(turn_index, _)| *turn_index <= *replaced_through)
-                    .unwrap_or(output.len());
+                // Newest-wins: overwrite (never combine/concatenate) the
+                // pending summary, and drop every buffered message at or
+                // below `replaced_through` (same as before).
+                pending_summary = Some(summary.clone());
                 output.retain(|(turn_index, _)| *turn_index > *replaced_through);
-                let summary_message = Message::user_text(format!(
-                    "[Earlier conversation summary — compacted to save context]\n\n{summary}"
-                ));
-                output.insert(insert_at, (*replaced_through, summary_message));
             }
             SessionRecord::Rollback { target } => {
                 output.retain(|(turn_index, _)| *turn_index <= *target);
@@ -109,7 +158,16 @@ pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage
         }
     }
 
-    let messages = output.into_iter().map(|(_, message)| message).collect();
+    // Flatten: the pending summary (if any) is ONE leading `user_text`
+    // message at the FRONT, followed by every retained buffered message in
+    // order.
+    let mut messages: Vec<Message> = Vec::with_capacity(output.len() + 1);
+    if let Some(summary) = pending_summary {
+        messages.push(Message::user_text(format!(
+            "[Earlier conversation summary — compacted to save context]\n\n{summary}"
+        )));
+    }
+    messages.extend(output.into_iter().map(|(_, message)| message));
     (messages, last_known_usage, next_turn_index)
 }
 
@@ -225,10 +283,13 @@ impl SessionHandle {
     }
 
     /// Enqueues a `Turn` record. Intended to be called once per submitted
-    /// prompt, after that turn's reply and usage are known.
-    pub fn append_turn(&self, message: Message, usage: UsageRecord, timestamp: String) {
+    /// prompt, after that turn's whole exchange (user prompt plus every
+    /// assistant/tool-use/tool-result/final message it produced) and usage
+    /// are known (schema v2, architect ruling phase-5): exactly ONE `Turn`
+    /// record per submit carrying the full `Vec<Message>`.
+    pub fn append_turn(&self, messages: Vec<Message>, usage: UsageRecord, timestamp: String) {
         self.enqueue(SessionRecord::Turn {
-            message,
+            messages,
             usage,
             timestamp,
         });
@@ -253,6 +314,23 @@ impl SessionHandle {
     /// makes a later resume/jump replay the truncated transcript correctly.
     pub fn append_rollback(&self, target: usize) {
         self.enqueue(SessionRecord::Rollback { target });
+    }
+
+    /// Enqueues a `Compaction` record (RULING 2, architect ruling phase-5).
+    /// Called from BOTH compaction call sites in `main.rs` -- the
+    /// auto-compaction branch in `submit` and the manual `/compact` handler
+    /// -- ONLY when `rokr_core::compact_transcript` actually
+    /// `CompactionOutcome::Compacted(..)`, never on `NothingToCompact`.
+    /// `summary` is the RAW summary text (the caller strips the
+    /// `[Earlier conversation summary ...]` wrapper prefix back off before
+    /// storing, because `fold` re-applies that exact wrapper on resume);
+    /// `replaced_through` is the highest turn index the summary collapses
+    /// through. Mirrors `append_rollback`'s append-only shape exactly.
+    pub fn append_compaction(&self, summary: String, replaced_through: usize) {
+        self.enqueue(SessionRecord::Compaction {
+            summary,
+            replaced_through,
+        });
     }
 
     fn enqueue(&self, record: SessionRecord) {
@@ -434,6 +512,45 @@ impl SessionStore {
         ))
     }
 
+    /// RULING 3 (architect ruling, phase-5): the `replaced_through` of the
+    /// LAST `Compaction` record in `session_id`'s log (in file order), or
+    /// `None` if the session has never been compacted. `handle_rollback_command`
+    /// consults this to REFUSE a `/rollback` whose target is at or before the
+    /// last compaction boundary -- earlier turns were summarized away and
+    /// cannot be un-folded. Reads the raw records directly (same
+    /// forward-compatibility skip-unparseable-line policy as
+    /// `resume_session`), never the denormalized index. `Ok(None)` if the log
+    /// doesn't exist yet.
+    pub fn last_compaction_replaced_through(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<usize>> {
+        let session_jsonl_path = self
+            .data_dir
+            .join("sessions")
+            .join(session_id)
+            .join("session.jsonl");
+        let contents = match std::fs::read_to_string(&session_jsonl_path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        let last = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<SessionRecord>(line).ok())
+            .filter_map(|record| match record {
+                SessionRecord::Compaction {
+                    replaced_through, ..
+                } => Some(replaced_through),
+                _ => None,
+            })
+            .next_back();
+
+        Ok(last)
+    }
+
     /// Lists session ids under `data_dir/sessions/`, sorted lexicographically
     /// (ULIDs sort chronologically), returning the last (most recent) one.
     /// `Ok(None)` if the sessions directory doesn't exist yet.
@@ -532,7 +649,9 @@ impl SessionStore {
                     }
                 })
                 .any(|record| match record {
-                    SessionRecord::Turn { message, .. } => message.text().contains(term),
+                    SessionRecord::Turn { messages, .. } => {
+                        messages.iter().any(|message| message.text().contains(term))
+                    }
                     SessionRecord::Compaction { summary, .. } => summary.contains(term),
                     _ => false,
                 });
@@ -675,13 +794,17 @@ impl CheckpointStore {
         Ok((snapshot_id, true))
     }
 
-    /// Ticket 39 (rollback-command), PRD decision 4: restores every
-    /// captured pre-image at turn indices >= `target_turn`, in
-    /// reverse-chronological order (highest turn_index first), so that for
-    /// a path snapshotted at multiple qualifying turns the FINAL restored
-    /// content on disk is the EARLIEST one (closest to `target_turn`) --
-    /// the state the path was in right before `target_turn`'s own mutation
-    /// ran. A snapshot captured with no pre-image (a `.absent` marker -- a
+    /// Ticket 39 (rollback-command), PRD decision 4; RULING 3 boundary
+    /// correction (architect ruling, phase-5): restores every captured
+    /// pre-image at turn indices STRICTLY GREATER THAN `target_turn`
+    /// (previously `>=`), in reverse-chronological order (highest turn_index
+    /// first), so that for a path snapshotted at multiple qualifying turns the
+    /// FINAL restored content on disk is the EARLIEST qualifying one (the
+    /// pre-image of the first turn AFTER `target_turn`) -- which is exactly
+    /// the state the path was in at the END of `target_turn`. Semantics:
+    /// "rollback to N = world as of END of turn N", so turn N's OWN file
+    /// mutation is LEFT IN PLACE; only turns strictly after N are undone. A
+    /// snapshot captured with no pre-image (a `.absent` marker -- a
     /// brand-new file at capture time) deletes the path instead of writing
     /// content (a missing path at delete time is not an error -- it may
     /// already be gone). Returns the distinct, sorted set of paths actually
@@ -701,7 +824,7 @@ impl CheckpointStore {
             .filter_map(|entry| {
                 Self::parse_turn_index(&entry.snapshot_id).map(|turn_index| (turn_index, entry))
             })
-            .filter(|(turn_index, _)| *turn_index >= target_turn)
+            .filter(|(turn_index, _)| *turn_index > target_turn)
             .collect();
 
         // Reverse-chronological: highest turn_index restored first, so a
@@ -1019,11 +1142,18 @@ fn compute_initial_index_state(
                     state.last_model = model;
                 }
                 SessionRecord::Turn {
-                    message, timestamp, ..
+                    messages,
+                    timestamp,
+                    ..
                 } => {
                     state.turn_count += 1;
                     if state.title.is_none() {
-                        state.title = Some(derive_title(&message));
+                        // Title is the first user prompt: schema v2's first
+                        // message in a Turn is that prompt (submit pushes the
+                        // user message first, then the exchange).
+                        if let Some(first) = messages.first() {
+                            state.title = Some(derive_title(first));
+                        }
                     }
                     state.updated_at = timestamp;
                 }
@@ -1100,11 +1230,15 @@ async fn run_writer(
                         true
                     }
                     SessionRecord::Turn {
-                        message, timestamp, ..
+                        messages,
+                        timestamp,
+                        ..
                     } => {
                         index_state.turn_count += 1;
                         if index_state.title.is_none() {
-                            index_state.title = Some(derive_title(message));
+                            if let Some(first) = messages.first() {
+                                index_state.title = Some(derive_title(first));
+                            }
                         }
                         index_state.updated_at = timestamp.clone();
                         true
@@ -1167,7 +1301,7 @@ mod tests {
             model: "claude-sonnet-5".to_string(),
         };
         let turn = SessionRecord::Turn {
-            message: Message::user_text("hello world"),
+            messages: vec![Message::user_text("hello world")],
             usage: UsageRecord {
                 input_tokens: 10,
                 output_tokens: 20,
@@ -1207,17 +1341,17 @@ mod tests {
     fn fold_of_turn_only_sequence_matches_appended_messages() {
         let records = vec![
             SessionRecord::Turn {
-                message: Message::user_text("first"),
+                messages: vec![Message::user_text("first")],
                 usage: usage(1),
                 timestamp: "t0".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("second"),
+                messages: vec![Message::assistant_text("second")],
                 usage: usage(2),
                 timestamp: "t1".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::user_text("third"),
+                messages: vec![Message::user_text("third")],
                 usage: usage(3),
                 timestamp: "t2".to_string(),
             },
@@ -1240,17 +1374,17 @@ mod tests {
     fn fold_collapses_records_before_compaction_replaced_through_index() {
         let records = vec![
             SessionRecord::Turn {
-                message: Message::user_text("turn0"),
+                messages: vec![Message::user_text("turn0")],
                 usage: usage(0),
                 timestamp: "t0".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn1"),
+                messages: vec![Message::assistant_text("turn1")],
                 usage: usage(1),
                 timestamp: "t1".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::user_text("turn2"),
+                messages: vec![Message::user_text("turn2")],
                 usage: usage(2),
                 timestamp: "t2".to_string(),
             },
@@ -1259,12 +1393,12 @@ mod tests {
                 replaced_through: 2,
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn3"),
+                messages: vec![Message::assistant_text("turn3")],
                 usage: usage(3),
                 timestamp: "t3".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::user_text("turn4"),
+                messages: vec![Message::user_text("turn4")],
                 usage: usage(4),
                 timestamp: "t4".to_string(),
             },
@@ -1289,22 +1423,22 @@ mod tests {
     fn fold_truncates_output_at_rollback_target_index_discarding_later_turns() {
         let records = vec![
             SessionRecord::Turn {
-                message: Message::user_text("turn0"),
+                messages: vec![Message::user_text("turn0")],
                 usage: usage(0),
                 timestamp: "t0".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn1"),
+                messages: vec![Message::assistant_text("turn1")],
                 usage: usage(1),
                 timestamp: "t1".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::user_text("turn2"),
+                messages: vec![Message::user_text("turn2")],
                 usage: usage(2),
                 timestamp: "t2".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn3"),
+                messages: vec![Message::assistant_text("turn3")],
                 usage: usage(3),
                 timestamp: "t3".to_string(),
             },
@@ -1328,12 +1462,12 @@ mod tests {
     fn fold_handles_compaction_followed_by_rollback_together() {
         let records = vec![
             SessionRecord::Turn {
-                message: Message::user_text("turn0"),
+                messages: vec![Message::user_text("turn0")],
                 usage: usage(0),
                 timestamp: "t0".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn1"),
+                messages: vec![Message::assistant_text("turn1")],
                 usage: usage(1),
                 timestamp: "t1".to_string(),
             },
@@ -1342,17 +1476,17 @@ mod tests {
                 replaced_through: 1,
             },
             SessionRecord::Turn {
-                message: Message::user_text("turn2"),
+                messages: vec![Message::user_text("turn2")],
                 usage: usage(2),
                 timestamp: "t2".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn3"),
+                messages: vec![Message::assistant_text("turn3")],
                 usage: usage(3),
                 timestamp: "t3".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::user_text("turn4"),
+                messages: vec![Message::user_text("turn4")],
                 usage: usage(4),
                 timestamp: "t4".to_string(),
             },
@@ -1372,6 +1506,328 @@ mod tests {
             ]
         );
         assert_eq!(last_usage, Some(rokr_core::Usage::from(usage(4))));
+    }
+
+    /// RULING 1 (schema v2): a single `Turn` record now carries a whole
+    /// exchange (`Vec<Message>` -- user prompt PLUS assistant/tool messages).
+    /// `fold` must flatten ALL of a Turn's messages into the output in order,
+    /// not just the first. Proves the user prompt and its assistant reply
+    /// from the same submit both survive the fold, in order.
+    #[test]
+    fn fold_flattens_all_messages_of_a_multi_message_turn_in_order() {
+        let records = vec![
+            SessionRecord::Turn {
+                messages: vec![
+                    Message::user_text("user asks"),
+                    Message::assistant_text("assistant replies"),
+                ],
+                usage: usage(1),
+                timestamp: "t0".to_string(),
+            },
+            SessionRecord::Turn {
+                messages: vec![
+                    Message::user_text("user asks again"),
+                    Message::assistant_text("assistant replies again"),
+                ],
+                usage: usage(2),
+                timestamp: "t1".to_string(),
+            },
+        ];
+
+        let (messages, _last_usage, next_turn_index) = fold(&records);
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::user_text("user asks"),
+                Message::assistant_text("assistant replies"),
+                Message::user_text("user asks again"),
+                Message::assistant_text("assistant replies again"),
+            ],
+            "expected fold to flatten every message of each Turn in order"
+        );
+        // Two Turn records -> next_turn_index is 2 (one per SUBMIT, not one
+        // per message), proving the whole exchange is tagged as one turn.
+        assert_eq!(next_turn_index, 2);
+    }
+
+    /// RULING 1 (schema v2): every message of a Turn shares that Turn's OWN
+    /// raw index (not one incrementing index per message), so a `Rollback`
+    /// treats the whole exchange atomically. A naive "one index per message"
+    /// implementation would give the assistant reply of turn 0 index 1 and
+    /// `Rollback { target: 0 }` would wrongly drop it -- this asserts it
+    /// survives.
+    #[test]
+    fn fold_tags_every_message_of_a_turn_with_that_turns_index_so_rollback_is_atomic() {
+        let records = vec![
+            SessionRecord::Turn {
+                messages: vec![
+                    Message::user_text("turn0 user"),
+                    Message::assistant_text("turn0 assistant"),
+                ],
+                usage: usage(0),
+                timestamp: "t0".to_string(),
+            },
+            SessionRecord::Turn {
+                messages: vec![
+                    Message::user_text("turn1 user"),
+                    Message::assistant_text("turn1 assistant"),
+                ],
+                usage: usage(1),
+                timestamp: "t1".to_string(),
+            },
+            SessionRecord::Rollback { target: 0 },
+        ];
+
+        let (messages, _last_usage, _next_turn_index) = fold(&records);
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::user_text("turn0 user"),
+                Message::assistant_text("turn0 assistant"),
+            ],
+            "expected rollback to target 0 to keep BOTH of turn 0's messages (atomic turn) and \
+             drop all of turn 1's"
+        );
+    }
+
+    /// RULING 3: `last_compaction_replaced_through` returns the
+    /// `replaced_through` of the LAST `Compaction` record in file order (or
+    /// `None` for a session that was never compacted).
+    #[test]
+    fn last_compaction_replaced_through_returns_the_last_compaction_or_none() {
+        let dir = unique_temp_dir("last-compaction");
+
+        // Never-compacted session -> None.
+        let plain_id = "plain-session".to_string();
+        write_session_fixture(
+            &dir,
+            &plain_id,
+            &[SessionRecord::Turn {
+                messages: vec![Message::user_text("hi")],
+                usage: usage(0),
+                timestamp: "t0".to_string(),
+            }],
+        );
+
+        // Two compactions -> the LAST one's replaced_through wins.
+        let compacted_id = "compacted-session".to_string();
+        write_session_fixture(
+            &dir,
+            &compacted_id,
+            &[
+                SessionRecord::Turn {
+                    messages: vec![Message::user_text("turn0")],
+                    usage: usage(0),
+                    timestamp: "t0".to_string(),
+                },
+                SessionRecord::Compaction {
+                    summary: "first".to_string(),
+                    replaced_through: 0,
+                },
+                SessionRecord::Turn {
+                    messages: vec![Message::user_text("turn1")],
+                    usage: usage(1),
+                    timestamp: "t1".to_string(),
+                },
+                SessionRecord::Compaction {
+                    summary: "second".to_string(),
+                    replaced_through: 2,
+                },
+            ],
+        );
+
+        let store = SessionStore::open(&dir);
+        assert_eq!(store.last_compaction_replaced_through(&plain_id).unwrap(), None);
+        assert_eq!(
+            store.last_compaction_replaced_through(&compacted_id).unwrap(),
+            Some(2),
+            "expected the LAST compaction's replaced_through (2), not the first (0)"
+        );
+        assert_eq!(
+            store.last_compaction_replaced_through("nonexistent").unwrap(),
+            None,
+            "a session with no log yet must return None, not an error"
+        );
+    }
+
+    /// RULING 2 done-when #3: folding a `Turn... Compaction Turn...`
+    /// sequence yields `[summary, retained-tail-turns-in-order..., later
+    /// turns...]` with the summary at the FRONT. Turn 2 survives the
+    /// compaction (its index > `replaced_through`) and stays ahead of the
+    /// later turn 3.
+    #[test]
+    fn fold_places_compaction_summary_at_front_followed_by_retained_and_later_turns() {
+        let records = vec![
+            SessionRecord::Turn {
+                messages: vec![Message::user_text("turn0")],
+                usage: usage(0),
+                timestamp: "t0".to_string(),
+            },
+            SessionRecord::Turn {
+                messages: vec![Message::assistant_text("turn1")],
+                usage: usage(1),
+                timestamp: "t1".to_string(),
+            },
+            SessionRecord::Turn {
+                messages: vec![Message::user_text("turn2")],
+                usage: usage(2),
+                timestamp: "t2".to_string(),
+            },
+            SessionRecord::Compaction {
+                summary: "summary through turn1".to_string(),
+                replaced_through: 1,
+            },
+            SessionRecord::Turn {
+                messages: vec![Message::user_text("turn3")],
+                usage: usage(3),
+                timestamp: "t3".to_string(),
+            },
+        ];
+
+        let (messages, _last_usage, _next) = fold(&records);
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::user_text(
+                    "[Earlier conversation summary — compacted to save context]\n\nsummary through turn1"
+                ),
+                Message::user_text("turn2"),
+                Message::user_text("turn3"),
+            ],
+            "expected [summary, retained turn2, later turn3] with the summary at the FRONT"
+        );
+    }
+
+    /// RULING 2 done-when #4 (regression): the OLD fold computed the summary's
+    /// insert position by finding the first buffered `(idx, _)` with `idx <=
+    /// replaced_through`, falling back to the END if none matched -- so a
+    /// `Compaction` whose `replaced_through` is below EVERY currently-buffered
+    /// index would silently append the summary at the END of the transcript.
+    /// This fixture makes that edge fire: a SECOND compaction whose
+    /// `replaced_through` (1) is below the only surviving buffered turn (index
+    /// 3, retained by the first compaction). The fix must put the summary at
+    /// the FRONT, and (newest-wins) it must be the SECOND summary's text, not
+    /// the first's.
+    #[test]
+    fn fold_keeps_summary_leading_not_trailing_when_replaced_through_matches_no_buffered_index() {
+        let records = vec![
+            SessionRecord::Turn {
+                messages: vec![Message::user_text("turn0")],
+                usage: usage(0),
+                timestamp: "t0".to_string(),
+            },
+            SessionRecord::Turn {
+                messages: vec![Message::user_text("turn1")],
+                usage: usage(1),
+                timestamp: "t1".to_string(),
+            },
+            SessionRecord::Turn {
+                messages: vec![Message::user_text("turn2")],
+                usage: usage(2),
+                timestamp: "t2".to_string(),
+            },
+            SessionRecord::Turn {
+                messages: vec![Message::user_text("turn3")],
+                usage: usage(3),
+                timestamp: "t3".to_string(),
+            },
+            // First compaction retains only turn 3 (index > 2).
+            SessionRecord::Compaction {
+                summary: "SUMMARY_ALPHA".to_string(),
+                replaced_through: 2,
+            },
+            // Second compaction: replaced_through 1 is BELOW the only
+            // surviving buffered index (3) -- the OLD code's `position()`
+            // lookup finds no match and appends at the END.
+            SessionRecord::Compaction {
+                summary: "SUMMARY_BETA".to_string(),
+                replaced_through: 1,
+            },
+        ];
+
+        let (messages, _last_usage, _next) = fold(&records);
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::user_text(
+                    "[Earlier conversation summary — compacted to save context]\n\nSUMMARY_BETA"
+                ),
+                Message::user_text("turn3"),
+            ],
+            "expected the (newest) summary at the FRONT followed by the retained turn3, not the \
+             old buggy trailing-append"
+        );
+        // Explicit leading-not-trailing guard: the last message must be the
+        // retained turn, never the summary.
+        assert_eq!(messages.last().unwrap().text(), "turn3");
+    }
+
+    /// RULING 1 done-when #3 (v1 compat, READ SHIM ONLY): a v1 log -- Header
+    /// `schema_version: 1` and a Turn written in the OLD singular shape
+    /// (`{"type":"Turn","message":{...},...}`, a bare object under the
+    /// `message` key, not a `messages` array) -- must still fold correctly
+    /// with its message intact, AND the on-disk file must be byte-identical
+    /// before and after resume (resume only reads; it never rewrites a v1
+    /// file). Deliberately hand-builds the v1 JSON line (the `message` key no
+    /// longer exists on the current `SessionRecord::Turn`, which serializes
+    /// `messages`) to exercise the real read shim.
+    #[test]
+    fn v1_log_with_singular_message_turn_resumes_intact_and_is_never_rewritten() {
+        let dir = unique_temp_dir("v1-compat-resume");
+        let session_id = "01V1COMPATSESSION".to_string();
+        let session_dir = dir.join("sessions").join(&session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // A real Header (schema_version 1) plus a hand-built v1-shape Turn
+        // line carrying a singular `message` object (the pre-v2 wire shape).
+        let header = SessionRecord::Header {
+            schema_version: 1,
+            session_id: session_id.clone(),
+            created_at: "2026-07-20T00:00:00Z".to_string(),
+            project_path: "/projects/v1".to_string(),
+            agent_tier: "build".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+        };
+        let v1_message_json =
+            serde_json::to_string(&Message::user_text("v1 prompt text")).unwrap();
+        let v1_usage_json = serde_json::to_string(&usage(7)).unwrap();
+        let v1_turn_line = format!(
+            "{{\"type\":\"Turn\",\"message\":{v1_message_json},\"usage\":{v1_usage_json},\"timestamp\":\"t0\"}}"
+        );
+        let contents = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            v1_turn_line
+        );
+        let session_jsonl_path = session_dir.join("session.jsonl");
+        std::fs::write(&session_jsonl_path, &contents).unwrap();
+
+        let bytes_before = std::fs::read(&session_jsonl_path).unwrap();
+
+        let store = SessionStore::open(&dir);
+        let (messages, meta, resume_state) = store
+            .resume_session(&session_id)
+            .expect("resuming a v1 log via the read shim should succeed");
+
+        assert_eq!(
+            messages,
+            vec![Message::user_text("v1 prompt text")],
+            "the v1 singular-message Turn must fold into exactly its one message"
+        );
+        assert_eq!(meta.session_id, session_id);
+        assert_eq!(resume_state.next_turn_index, 1);
+        assert_eq!(resume_state.last_known_usage, Some(rokr_core::Usage::from(usage(7))));
+
+        let bytes_after = std::fs::read(&session_jsonl_path).unwrap();
+        assert_eq!(
+            bytes_before, bytes_after,
+            "resuming a v1 log must never rewrite it -- the file must be byte-identical"
+        );
     }
 
     /// Ticket 34 (persist-new-sessions): proves the writer task actually
@@ -1400,7 +1856,7 @@ mod tests {
             "claude-test".to_string(),
         );
         handle.append_turn(
-            Message::user_text("hello session store"),
+            vec![Message::user_text("hello session store")],
             UsageRecord {
                 input_tokens: 1,
                 output_tokens: 2,
@@ -1435,8 +1891,9 @@ mod tests {
             "expected first record to be Header, got: {first:?}"
         );
         match second {
-            SessionRecord::Turn { message, .. } => {
-                assert_eq!(message.text(), "hello session store");
+            SessionRecord::Turn { messages, .. } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].text(), "hello session store");
             }
             other => panic!("expected second record to be Turn, got: {other:?}"),
         }
@@ -1486,12 +1943,12 @@ mod tests {
         let records = vec![
             header.clone(),
             SessionRecord::Turn {
-                message: Message::user_text("turn0"),
+                messages: vec![Message::user_text("turn0")],
                 usage: usage(0),
                 timestamp: "t0".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn1"),
+                messages: vec![Message::assistant_text("turn1")],
                 usage: usage(1),
                 timestamp: "t1".to_string(),
             },
@@ -1500,17 +1957,17 @@ mod tests {
                 replaced_through: 1,
             },
             SessionRecord::Turn {
-                message: Message::user_text("turn2"),
+                messages: vec![Message::user_text("turn2")],
                 usage: usage(2),
                 timestamp: "t2".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::assistant_text("turn3"),
+                messages: vec![Message::assistant_text("turn3")],
                 usage: usage(3),
                 timestamp: "t3".to_string(),
             },
             SessionRecord::Turn {
-                message: Message::user_text("turn4"),
+                messages: vec![Message::user_text("turn4")],
                 usage: usage(4),
                 timestamp: "t4".to_string(),
             },
@@ -1581,12 +2038,12 @@ mod tests {
             "claude-test".to_string(),
         );
         handle_a.append_turn(
-            Message::user_text("first prompt in session alpha"),
+            vec![Message::user_text("first prompt in session alpha")],
             usage(1),
             "2026-07-20T00:00:01Z".to_string(),
         );
         handle_a.append_turn(
-            Message::assistant_text("reply in session alpha"),
+            vec![Message::assistant_text("reply in session alpha")],
             usage(2),
             "2026-07-20T00:00:02Z".to_string(),
         );
@@ -1606,7 +2063,7 @@ mod tests {
             "gpt-test".to_string(),
         );
         handle_b.append_turn(
-            Message::user_text("first prompt in session beta"),
+            vec![Message::user_text("first prompt in session beta")],
             usage(3),
             "2026-07-20T01:00:01Z".to_string(),
         );
@@ -1670,7 +2127,7 @@ mod tests {
                     model: "claude-test".to_string(),
                 },
                 SessionRecord::Turn {
-                    message: Message::user_text("please find zzyzxfindableterm in here"),
+                    messages: vec![Message::user_text("please find zzyzxfindableterm in here")],
                     usage: usage(0),
                     timestamp: "t0".to_string(),
                 },
@@ -1692,7 +2149,7 @@ mod tests {
                     model: "claude-test".to_string(),
                 },
                 SessionRecord::Turn {
-                    message: Message::user_text("unrelated live turn content"),
+                    messages: vec![Message::user_text("unrelated live turn content")],
                     usage: usage(0),
                     timestamp: "t0".to_string(),
                 },
@@ -1719,7 +2176,7 @@ mod tests {
                     model: "claude-test".to_string(),
                 },
                 SessionRecord::Turn {
-                    message: Message::user_text("completely unrelated content"),
+                    messages: vec![Message::user_text("completely unrelated content")],
                     usage: usage(0),
                     timestamp: "t0".to_string(),
                 },
@@ -1934,20 +2391,28 @@ mod tests {
         );
     }
 
-    /// Ticket 39 (rollback-command): `CheckpointStore::rollback_to(target)`
-    /// restores every captured pre-image at turn indices >= `target`, in
-    /// reverse-chronological order, so that for a path snapshotted at
-    /// multiple qualifying turns the FINAL on-disk content is the EARLIEST
-    /// one (closest to `target`) -- proves this against four real files on
-    /// disk: one snapshotted at three turns spanning the target (must land
-    /// on the closest-to-target content), one snapshotted only at a turn
-    /// before the target (must be left untouched), one snapshotted at a
-    /// turn at-or-after the target with an ABSENT pre-image (must be
-    /// deleted), and one snapshotted only at a turn before the target as a
-    /// second untouched control. Also asserts the returned touched-paths
-    /// set is exactly the two paths actually restored.
+    /// RULING 3 (architect ruling, phase-5): "rollback to N = world as of
+    /// END of turn N". `CheckpointStore::rollback_to(target)` restores every
+    /// captured pre-image at turn indices STRICTLY GREATER THAN `target`
+    /// (previously `>=`), in reverse-chronological order, so a turn's OWN file
+    /// mutation survives a rollback TO that turn; only turns strictly after it
+    /// are undone. Proves this against five real files on disk:
+    /// - path_a: snapshotted at turns 0, 2, and 4 -- target is 2, so only the
+    ///   turn-4 pre-image qualifies (turn 2's own mutation is LEFT ALONE), and
+    ///   turn 4's pre-image IS turn 2's post-write state (world as of end of
+    ///   turn 2).
+    /// - path_e: snapshotted ONLY at the target turn 2 -- under the NEW `>`
+    ///   boundary its own mutation must SURVIVE untouched (under the old `>=`
+    ///   boundary it would have been wrongly reverted); this is the direct
+    ///   boundary proof.
+    /// - path_b / path_d: snapshotted only before the target -- untouched.
+    /// - path_c: a brand-new file created strictly after the target (turn 3,
+    ///   ABSENT pre-image) -- must be DELETED.
+    ///
+    /// Also asserts the returned touched-paths set is exactly the paths
+    /// actually restored/deleted (path_a and path_c), NOT path_e.
     #[test]
-    fn rollback_to_restores_pre_images_at_or_after_target_turn_in_reverse_order() {
+    fn rollback_to_restores_pre_images_strictly_after_target_leaving_target_turn_mutations_intact() {
         let dir = unique_temp_dir("rollback-to");
         let store = CheckpointStore::open(&dir, "sess-rollback-1");
 
@@ -1955,10 +2420,13 @@ mod tests {
         let path_b = dir.join("b.txt").to_string_lossy().into_owned();
         let path_c = dir.join("c.txt").to_string_lossy().into_owned();
         let path_d = dir.join("d.txt").to_string_lossy().into_owned();
+        let path_e = dir.join("e.txt").to_string_lossy().into_owned();
 
-        // path_a: mutated at turns 0, 2, and 4 -- target is 2, so only the
-        // turn-2 and turn-4 pre-images qualify, and the turn-2 one (closest
-        // to target) must be the one that survives on disk.
+        // path_a: mutated at turns 0, 2, and 4 -- target is 2, so under the
+        // NEW `> target` boundary only the turn-4 pre-image qualifies. Turn
+        // 2's own pre-image is NOT restored (its mutation stays), and turn 4's
+        // pre-image ("a-pre-turn4") is exactly turn 2's post-write state --
+        // the world as of the END of turn 2.
         store.snapshot(0, &path_a, Some("a-pre-turn0")).unwrap();
         store.snapshot(2, &path_a, Some("a-pre-turn2")).unwrap();
         store.snapshot(4, &path_a, Some("a-pre-turn4")).unwrap();
@@ -1969,7 +2437,7 @@ mod tests {
         store.snapshot(1, &path_b, Some("b-pre-turn1")).unwrap();
         std::fs::write(&path_b, "b-current-post-turn1").unwrap();
 
-        // path_c: a brand-new file created at turn 3 (>= target) -- its
+        // path_c: a brand-new file created at turn 3 (> target) -- its
         // pre-image is "absent", so rollback must DELETE it.
         store.snapshot(3, &path_c, None).unwrap();
         std::fs::write(&path_c, "c-current-post-turn3").unwrap();
@@ -1980,13 +2448,20 @@ mod tests {
         store.snapshot(0, &path_d, Some("d-pre-turn0")).unwrap();
         std::fs::write(&path_d, "d-current-post-turn0").unwrap();
 
+        // path_e: mutated ONLY at the target turn 2, never after -- the direct
+        // boundary proof. Under the NEW `> target` semantics its own mutation
+        // must SURVIVE (its turn-2 pre-image must NOT be restored).
+        store.snapshot(2, &path_e, Some("e-pre-turn2")).unwrap();
+        std::fs::write(&path_e, "e-current-post-turn2").unwrap();
+
         let mut touched = store.rollback_to(2).expect("rollback_to should succeed");
         touched.sort();
 
         assert_eq!(
             std::fs::read_to_string(&path_a).unwrap(),
-            "a-pre-turn2",
-            "expected path_a to land on its turn-2 pre-image (closest to target), not turn-4's"
+            "a-pre-turn4",
+            "expected path_a to land on turn-4's pre-image (world as of END of turn 2); turn 2's \
+             own mutation must be left alone, so turn-2's pre-image is NOT restored"
         );
         assert_eq!(
             std::fs::read_to_string(&path_b).unwrap(),
@@ -1995,19 +2470,26 @@ mod tests {
         );
         assert!(
             !std::path::Path::new(&path_c).exists(),
-            "expected path_c (absent pre-image at or after target) to be deleted"
+            "expected path_c (absent pre-image strictly after target) to be deleted"
         );
         assert_eq!(
             std::fs::read_to_string(&path_d).unwrap(),
             "d-current-post-turn0",
             "expected path_d (only touched before target) to be left untouched"
         );
+        assert_eq!(
+            std::fs::read_to_string(&path_e).unwrap(),
+            "e-current-post-turn2",
+            "expected path_e (mutated AT the target turn 2) to KEEP its own mutation under the \
+             new `> target` boundary -- turn 2's own write survives a rollback to turn 2"
+        );
 
         let mut expected_touched = vec![path_a.clone(), path_c.clone()];
         expected_touched.sort();
         assert_eq!(
             touched, expected_touched,
-            "expected rollback_to to report exactly the paths it actually restored"
+            "expected rollback_to to report exactly the paths strictly after the target it \
+             actually restored/deleted (path_a, path_c) -- NOT path_e (target turn itself)"
         );
     }
 
@@ -2025,9 +2507,12 @@ mod tests {
         let path_dash = dir.join("foo-bar.txt").to_string_lossy().into_owned();
         let path_underscore = dir.join("foo_bar.txt").to_string_lossy().into_owned();
 
-        let (id_dash, newly_dash) = store.snapshot(0, &path_dash, Some("dash-content")).unwrap();
+        // Captured at turn 1 so a rollback to target 0 (RULING 3's `> target`
+        // boundary) actually restores them -- the F-006 no-collision proof is
+        // orthogonal to which turn index is used.
+        let (id_dash, newly_dash) = store.snapshot(1, &path_dash, Some("dash-content")).unwrap();
         let (id_underscore, newly_underscore) =
-            store.snapshot(0, &path_underscore, Some("underscore-content")).unwrap();
+            store.snapshot(1, &path_underscore, Some("underscore-content")).unwrap();
 
         assert!(newly_dash && newly_underscore);
         assert_ne!(
@@ -2185,7 +2670,7 @@ mod tests {
         // swallowed with no diagnostic; post-fix it additionally logs a
         // warning, but either way the writer task must not panic.
         tx.send(WriterCommand::Append(SessionRecord::Turn {
-            message: Message::user_text("this write is doomed to fail"),
+            messages: vec![Message::user_text("this write is doomed to fail")],
             usage: UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,

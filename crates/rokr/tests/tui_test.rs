@@ -467,11 +467,14 @@ async fn submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl()
     let turn_record: rokr_session::SessionRecord = serde_json::from_str(lines[1])
         .expect("failed to parse second session.jsonl line as a SessionRecord");
     match turn_record {
-        rokr_session::SessionRecord::Turn { message, .. } => {
+        rokr_session::SessionRecord::Turn { messages, .. } => {
+            // Schema v2 (architect ruling, phase-5): a Turn now carries the
+            // whole exchange -- the user prompt is the FIRST message, followed
+            // by the assistant reply. Assert the first message is the prompt.
             assert_eq!(
-                message.text(),
+                messages[0].text(),
                 "persisttestprompt",
-                "expected the persisted Turn record's message text to exactly match the \
+                "expected the persisted Turn record's first message text to exactly match the \
                  submitted prompt"
             );
         }
@@ -558,7 +561,7 @@ async fn resuming_a_session_includes_prior_turn_in_next_outgoing_request() {
         model: "gpt-4o-mini".to_string(),
     };
     let fixture_turn = rokr_session::SessionRecord::Turn {
-        message: rokr_core::Message::user_text("priorturnuniquetoken"),
+        messages: vec![rokr_core::Message::user_text("priorturnuniquetoken")],
         usage: rokr_session::UsageRecord {
             input_tokens: 5,
             output_tokens: 7,
@@ -711,6 +714,236 @@ async fn resuming_a_session_includes_prior_turn_in_next_outgoing_request() {
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
 
+/// RULING 1 done-when #1 (schema v2) acceptance test: proves an ASSISTANT
+/// reply from a PRIOR turn survives resume and is actually SENT back to the
+/// provider on the next turn -- not merely that it sits in some in-memory
+/// Vec. Under the pre-v2 schema only the user prompt was persisted per turn,
+/// so an assistant reply could never reappear in a resumed session's
+/// outgoing request; this test would fail against that old code. Runs TWO
+/// real rokr processes sharing one `XDG_DATA_HOME`: process 1 submits two
+/// turns (each yielding a uniquely-tokened assistant reply) then quits;
+/// process 2 resumes via `--continue`, submits a third turn, and the third
+/// turn's outgoing request body must contain the prior assistant reply
+/// token.
+#[tokio::test]
+async fn resuming_a_session_resends_prior_assistant_reply_in_next_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    // Single-token (no spaces) assistant reply, distinct enough to search for
+    // in the raw request body. Every turn gets this same reply.
+    let assistant_reply_token = "AssistantReplyTokenThatMustSurviveResume";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-assistant-survives",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": assistant_reply_token
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-assistant-survives");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-assistant-survives");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-assistant-survives");
+
+    // Drives one rokr PTY process: spawns it (optionally with `--continue`),
+    // submits each prompt in `prompts` waiting for the assistant reply token
+    // between them, then quits with `q`. Returns nothing -- side effects land
+    // in the shared session log / mock server.
+    let run_session = |continue_flag: bool, prompts: Vec<&'static str>| {
+        let home = home.clone();
+        let xdg_config_home = xdg_config_home.clone();
+        let xdg_data_home = xdg_data_home.clone();
+        let uri = mock_server.uri();
+        move || {
+            let pty_system = native_pty_system();
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("failed to open pty");
+
+            let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+            cmd.env("HOME", &home);
+            cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+            cmd.env("XDG_DATA_HOME", &xdg_data_home);
+            cmd.env("ROKR_OPENAI_BASE_URL", &uri);
+            cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+            cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+            if continue_flag {
+                cmd.arg("--continue");
+            }
+
+            let mut child = pair
+                .slave
+                .spawn_command(cmd)
+                .expect("failed to spawn rokr in pty");
+            drop(pair.slave);
+
+            let mut reader = pair
+                .master
+                .try_clone_reader()
+                .expect("failed to clone pty reader");
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let mut writer = pair
+                .master
+                .take_writer()
+                .expect("failed to take pty writer");
+
+            let mut output = String::new();
+            let render_deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < render_deadline {
+                while let Ok(chunk) = rx.try_recv() {
+                    output.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                if output.contains("Header") && output.contains("Prompt") {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                output.contains("Header"),
+                "expected pty output to contain Header, got: {output:?}"
+            );
+
+            for prompt in prompts {
+                let mut line = prompt.as_bytes().to_vec();
+                line.push(b'\r');
+                writer.write_all(&line).expect("failed to write prompt to pty");
+
+                // Wait for the prompt to be echoed AND at least the reply to
+                // land before submitting the next prompt, so turns don't race.
+                let reply_deadline = Instant::now() + Duration::from_secs(10);
+                let mut seen_prompt = false;
+                while Instant::now() < reply_deadline {
+                    while let Ok(chunk) = rx.try_recv() {
+                        output.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                    if output.contains(prompt) {
+                        seen_prompt = true;
+                    }
+                    // Count replies loosely by requiring the token to appear;
+                    // between turns it will appear at least as many times as
+                    // turns submitted so far. Just require it's present.
+                    if seen_prompt && output.contains(assistant_reply_token) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                assert!(
+                    output.contains(prompt),
+                    "expected pty output to echo prompt {prompt:?}, got: {output:?}"
+                );
+                // Small settle so the session-writer append for this turn is
+                // enqueued before the next prompt (and before quit).
+                thread::sleep(Duration::from_millis(200));
+            }
+
+            writer.write_all(b"q").expect("failed to write q to pty");
+            let exit_deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+                    break status;
+                }
+                if Instant::now() > exit_deadline {
+                    let _ = child.kill();
+                    panic!("rokr did not exit within timeout; output so far: {output:?}");
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            assert!(status.success(), "expected rokr to exit cleanly, got: {status:?}");
+        }
+    };
+
+    // Process 1: two turns, then quit. Run on a blocking thread since the PTY
+    // driving loop is synchronous.
+    let session1 = run_session(false, vec!["firstpromptalpha", "secondpromptbeta"]);
+    tokio::task::spawn_blocking(session1)
+        .await
+        .expect("session 1 blocking task panicked");
+
+    // Sanity: exactly one session directory now exists, and its log holds the
+    // assistant reply token (proving assistant messages are now persisted).
+    let sessions_dir = xdg_data_home.join("rokr").join("sessions");
+    let session_dirs: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .expect("sessions dir should exist")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(session_dirs.len(), 1, "expected exactly one session dir");
+    let log = std::fs::read_to_string(session_dirs[0].path().join("session.jsonl"))
+        .expect("session.jsonl should exist");
+    assert!(
+        log.contains(assistant_reply_token),
+        "expected the persisted session log to contain the assistant reply token (proving \
+         schema v2 persists assistant messages), got: {log:?}"
+    );
+
+    // Process 2: resume via --continue, submit a third turn.
+    let session2 = run_session(true, vec!["thirdpromptgamma"]);
+    tokio::task::spawn_blocking(session2)
+        .await
+        .expect("session 2 blocking task panicked");
+
+    // The LAST outgoing request (process 2's third turn) must carry the prior
+    // assistant reply token -- proving it survived resume and was actually
+    // sent back to the provider.
+    let received = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled");
+    assert!(
+        !received.is_empty(),
+        "expected at least one outgoing request across both processes"
+    );
+    let last_body = String::from_utf8_lossy(&received[received.len() - 1].body).into_owned();
+    assert!(
+        last_body.contains("thirdpromptgamma"),
+        "sanity: the last request should be the third turn's, got: {last_body}"
+    );
+    assert!(
+        last_body.contains(assistant_reply_token),
+        "expected the resumed session's next outgoing request to contain the PRIOR assistant \
+         reply token (proving the assistant reply survived resume and was re-sent to the \
+         provider), got: {last_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+}
+
 /// Ticket 36 (session-index-list-jump) acceptance test, per the architect
 /// scope-amendment ruling: end-to-end PTY proof that `/resume <id>` (no
 /// `--yes`) warns without mutating, and `/resume <id> --yes` swaps the
@@ -759,7 +992,7 @@ async fn resume_without_confirm_warns_and_confirm_swaps_transcript_and_writer() 
         model: "gpt-fixture-target".to_string(),
     };
     let target_turn0 = rokr_session::SessionRecord::Turn {
-        message: rokr_core::Message::user_text("targetjumpturnzero"),
+        messages: vec![rokr_core::Message::user_text("targetjumpturnzero")],
         usage: rokr_session::UsageRecord {
             input_tokens: 1,
             output_tokens: 1,
@@ -769,7 +1002,7 @@ async fn resume_without_confirm_warns_and_confirm_swaps_transcript_and_writer() 
         timestamp: "2026-07-20T01:00:01Z".to_string(),
     };
     let target_turn1 = rokr_session::SessionRecord::Turn {
-        message: rokr_core::Message::assistant_text("targetjumpturnone"),
+        messages: vec![rokr_core::Message::assistant_text("targetjumpturnone")],
         usage: rokr_session::UsageRecord {
             input_tokens: 2,
             output_tokens: 2,
@@ -783,7 +1016,7 @@ async fn resume_without_confirm_warns_and_confirm_swaps_transcript_and_writer() 
         replaced_through: 1,
     };
     let target_turn2 = rokr_session::SessionRecord::Turn {
-        message: rokr_core::Message::user_text("targetjumpturntwo"),
+        messages: vec![rokr_core::Message::user_text("targetjumpturntwo")],
         usage: rokr_session::UsageRecord {
             input_tokens: 3,
             output_tokens: 3,
@@ -3381,12 +3614,12 @@ async fn write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_reco
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
-/// Ticket 39 (rollback-command) acceptance test: `/rollback [turn]` restores
-/// every file snapshot captured at or after the target turn index to its
-/// pre-image content (verified against the real filesystem), truncates the
-/// running transcript to that turn's boundary (verified by inspecting the
-/// NEXT turn's actual outgoing request body via
-/// `mock_server.received_requests()`, mirroring
+/// Ticket 39 (rollback-command) acceptance test, updated for RULING 3's
+/// `> target` boundary: `/rollback [turn]` restores every file snapshot
+/// captured STRICTLY AFTER the target turn index to its pre-image content
+/// (verified against the real filesystem), truncates the running transcript
+/// to that turn's boundary (verified by inspecting the NEXT turn's actual
+/// outgoing request body via `mock_server.received_requests()`, mirroring
 /// `auto_compaction_triggers_once_usage_crosses_threshold_and_preserves_recent_turn`'s
 /// exact technique for proving transcript content), and appends a
 /// `SessionRecord::Rollback` record to `session.jsonl`. Three turns are
@@ -3394,11 +3627,11 @@ async fn write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_reco
 /// against the same real temp file (mirroring
 /// `write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_record`'s
 /// exact write/diff/accept PTY sequence), and turn 2 is a plain
-/// tool-call-free chat turn. `/rollback 1` should then restore the file to
-/// turn 1's pre-image (the state right before turn 1's write ran, i.e.
-/// turn 0's post-write content) and truncate the transcript back to
-/// turn_index <= 1, discarding turn 2. A fourth turn is submitted
-/// afterward to inspect what actually goes out on the wire.
+/// tool-call-free chat turn. `/rollback 1` = "world as of END of turn 1", so
+/// turn 1's OWN written content must SURVIVE on disk (only turns strictly
+/// after 1 are undone -- and turn 2 wrote nothing), while the transcript is
+/// still truncated back to turn_index <= 1, discarding turn 2. A fourth turn
+/// is submitted afterward to inspect what actually goes out on the wire.
 #[tokio::test]
 async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn() {
     use wiremock::matchers::{method, path};
@@ -3734,9 +3967,10 @@ async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn(
         "expected pty output to contain turn 2's final reply, got: {output:?}"
     );
 
-    // Roll back to turn 1: should restore the file to turn 1's pre-image
-    // (turn 0's post-write content) and truncate the transcript to discard
-    // turn 2.
+    // Roll back to turn 1: RULING 3's `> target` boundary means "world as of
+    // END of turn 1", so turn 1's OWN write must SURVIVE on disk (only turns
+    // strictly after 1 are undone -- and turn 2 did no file mutation). The
+    // transcript is still truncated to discard turn 2.
     writer
         .write_all(b"/rollback 1\r")
         .expect("failed to write /rollback command to pty");
@@ -3756,9 +3990,9 @@ async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn(
     );
     assert_eq!(
         std::fs::read_to_string(&target_file).unwrap(),
-        turn0_content,
-        "expected the file to be restored to turn 1's pre-image (turn 0's post-write content) \
-         after rolling back to turn 1"
+        turn1_content,
+        "expected the file to STILL hold turn 1's own written content after rolling back to \
+         turn 1 (RULING 3: turn N's own mutation survives a rollback to N)"
     );
 
     // Turn 3 (post-rollback): submitted so its OUTGOING request body can be
@@ -3803,9 +4037,9 @@ async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn(
     // (1) Filesystem proof.
     assert_eq!(
         std::fs::read_to_string(&target_file).unwrap(),
-        turn0_content,
+        turn1_content,
         "expected the file's final on-disk content (after process exit) to still be turn 1's \
-         pre-image"
+         own written content (RULING 3: turn N's own mutation survives a rollback to N)"
     );
 
     // (2) session.jsonl proof: exactly one Rollback { target: 1 } record.
@@ -5423,6 +5657,53 @@ async fn auto_compaction_triggers_once_usage_crosses_threshold_and_preserves_rec
          turn3: {turn3_static_prefix:?}"
     );
 
+    // RULING 2 done-when #1 (real PTY/integration path): the auto-compaction
+    // that fired after turn 1 (raw_turn_count == 2 -> replaced_through == 0,
+    // tail turn 1 retained) must have persisted exactly one Compaction record
+    // carrying the RAW summary text (wrapper stripped).
+    // This test doesn't set XDG_DATA_HOME, so session data lives under
+    // $HOME/.local/share/rokr (default_data_dir's fallback).
+    let sessions_dir = home.join(".local/share/rokr").join("sessions");
+    let session_dir = std::fs::read_dir(&sessions_dir)
+        .expect("sessions dir should exist")
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_dir())
+        .expect("expected one session directory")
+        .path();
+    let session_log = std::fs::read_to_string(session_dir.join("session.jsonl"))
+        .expect("session.jsonl should exist");
+    let compaction_records: Vec<rokr_session::SessionRecord> = session_log
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+        .filter(|record| matches!(record, rokr_session::SessionRecord::Compaction { .. }))
+        .collect();
+    // At least one Compaction record must have been persisted; the FIRST one
+    // is the auto-compaction that fired after turn 1 (raw_turn_count == 2 ->
+    // replaced_through == 0) carrying the RAW summary (wrapper stripped). A
+    // subsequent turn may legitimately trigger a further compaction, so this
+    // does not assert an exact count.
+    assert!(
+        !compaction_records.is_empty(),
+        "expected at least one Compaction record persisted by auto-compaction"
+    );
+    match &compaction_records[0] {
+        rokr_session::SessionRecord::Compaction {
+            summary,
+            replaced_through,
+        } => {
+            assert_eq!(
+                *replaced_through, 0,
+                "the first auto-compaction (after turn 1, raw_turn_count 2) -> replaced_through 0"
+            );
+            assert_eq!(
+                summary, compaction_summary_text,
+                "the persisted Compaction summary must be the RAW summary (wrapper stripped)"
+            );
+        }
+        other => panic!("expected a Compaction record, got: {other:?}"),
+    }
+
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
@@ -6485,7 +6766,7 @@ fn search_command_returns_matching_session_ids_for_content_substring() {
             model: "claude-fixture".to_string(),
         },
         rokr_session::SessionRecord::Turn {
-            message: rokr_core::Message::user_text("please find zzyzxfindableterm in here"),
+            messages: vec![rokr_core::Message::user_text("please find zzyzxfindableterm in here")],
             usage: rokr_session::UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -6519,7 +6800,7 @@ fn search_command_returns_matching_session_ids_for_content_substring() {
             model: "claude-fixture".to_string(),
         },
         rokr_session::SessionRecord::Turn {
-            message: rokr_core::Message::user_text("unrelated live turn content"),
+            messages: vec![rokr_core::Message::user_text("unrelated live turn content")],
             usage: rokr_session::UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -6559,7 +6840,7 @@ fn search_command_returns_matching_session_ids_for_content_substring() {
             model: "claude-fixture".to_string(),
         },
         rokr_session::SessionRecord::Turn {
-            message: rokr_core::Message::user_text("completely unrelated content"),
+            messages: vec![rokr_core::Message::user_text("completely unrelated content")],
             usage: rokr_session::UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,
