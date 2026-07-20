@@ -2,9 +2,10 @@
 
 use std::future::Future;
 use std::io::{self, IsTerminal, Stdout};
+use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -189,7 +190,22 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         .block(Block::default().borders(Borders::ALL).title(VIEW_TITLE));
     frame.render_widget(view, chunks[1]);
 
+    // Ticket 42 (editor-integration) fix: bottom-anchor the Prompt pane the
+    // same way the View pane already does above, so a multi-line buffer
+    // (composed via Alt/Shift+Enter per ticket 41, or loaded back from
+    // `$EDITOR` per ticket 42) shows its tail -- where the cursor
+    // conceptually is -- once the buffer grows past the Prompt box's single
+    // inner row, instead of leaving line 2+ unrendered and invisible. Without
+    // this, editing a multi-line buffer in `$EDITOR` produced no visible
+    // feedback in the Prompt box at all: `Paragraph` with no scroll always
+    // draws starting at line 0, so anything past the first line was silently
+    // clipped.
+    let prompt_inner_height = chunks[2].height.saturating_sub(2); // top/bottom border
+    let prompt_line_count = state.prompt_input.split('\n').count() as u16;
+    let prompt_scroll_y = prompt_line_count.saturating_sub(prompt_inner_height);
     let prompt = Paragraph::new(state.prompt_input.as_str())
+        .wrap(Wrap { trim: false })
+        .scroll((prompt_scroll_y, 0))
         .block(Block::default().borders(Borders::ALL).title(PROMPT_TITLE));
     frame.render_widget(prompt, chunks[2]);
 }
@@ -231,6 +247,24 @@ impl TerminalGuard {
         execute!(io::stdout(), EnterAlternateScreen)?;
         Ok(guard)
     }
+
+    /// Ticket 42 ($EDITOR integration): temporarily leaves raw mode and the
+    /// alternate screen so a suspended `$EDITOR` subprocess can use the
+    /// terminal normally, mirroring `restore_terminal`'s best-effort
+    /// semantics -- the guard's own `Drop` still restores the terminal on
+    /// the way out of `run_blocking` regardless of whether `resume` below
+    /// is ever reached.
+    fn suspend(&self) {
+        restore_terminal();
+    }
+
+    /// Re-enters raw mode and the alternate screen after `suspend`, so the
+    /// render loop can keep drawing.
+    fn resume(&self) -> io::Result<()> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(())
+    }
 }
 
 impl Drop for TerminalGuard {
@@ -255,6 +289,107 @@ fn install_panic_hook() {
         restore_terminal();
         previous(panic_info);
     }));
+}
+
+/// Errors from an `$EDITOR` invocation (ticket 42, editor-integration).
+/// Distinct from [`TuiError`] since these can occur independent of terminal
+/// setup -- e.g. in the unit test, which exercises
+/// [`edit_buffer_with_editor`] directly without a live terminal.
+#[derive(Debug, thiserror::Error)]
+enum EditorError {
+    /// The resolved editor command was empty (e.g. `$EDITOR` set to
+    /// whitespace only).
+    #[error("no editor command to run")]
+    NotSet,
+    /// The editor process could not be spawned at all (e.g. command not
+    /// found).
+    #[error("failed to spawn editor: {0}")]
+    Spawn(#[source] io::Error),
+    /// The editor process ran but exited with a non-zero status.
+    #[error("editor exited with non-zero status: {0}")]
+    NonZeroExit(ExitStatus),
+    /// Writing the buffer to, or reading it back from, the temp file
+    /// failed.
+    #[error("editor temp file io error: {0}")]
+    Io(#[source] io::Error),
+}
+
+/// Writes `buffer` to a fresh temp file, spawns `editor_command` against
+/// that file, waits for it to exit, and on success reads the file back.
+///
+/// `editor_command` is parsed as a whitespace-separated program plus
+/// arguments (the common `$EDITOR="code --wait"` convention), with the temp
+/// file's path appended as the final argument. Takes the command as a plain
+/// string rather than reading `$EDITOR` itself, so it's unit-testable
+/// against a scripted stand-in without mutating process-wide environment
+/// state.
+///
+/// A single trailing `\n`, if present, is trimmed from the file's contents
+/// before returning: virtually every text editor appends a final newline on
+/// save, and the prompt buffer's existing contract (ticket 41,
+/// multiline-input: append-only, no forced trailing newline) shouldn't gain
+/// one merely from a round trip through `$EDITOR`.
+fn edit_buffer_with_editor(buffer: &str, editor_command: &str) -> Result<String, EditorError> {
+    let mut parts = editor_command.split_whitespace();
+    let program = parts.next().ok_or(EditorError::NotSet)?;
+    let args: Vec<&str> = parts.collect();
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_path = std::env::temp_dir().join(format!("rokr-editor-{}-{nanos}.txt", std::process::id()));
+    std::fs::write(&temp_path, buffer).map_err(EditorError::Io)?;
+
+    let status = match Command::new(program).args(&args).arg(&temp_path).status() {
+        Ok(status) => status,
+        Err(io_err) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(EditorError::Spawn(io_err));
+        }
+    };
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(EditorError::NonZeroExit(status));
+    }
+
+    let mut contents = std::fs::read_to_string(&temp_path).map_err(EditorError::Io)?;
+    let _ = std::fs::remove_file(&temp_path);
+    if contents.ends_with('\n') {
+        contents.pop();
+    }
+    Ok(contents)
+}
+
+/// Handles the editor keybinding (ticket 42, editor-integration): reads
+/// `$EDITOR` (falling back to `vi` if unset or empty), suspends the
+/// terminal via `guard`, runs [`edit_buffer_with_editor`] against the
+/// current prompt buffer, and resumes the terminal -- regardless of whether
+/// the editor invocation succeeded, so a spawn failure or non-zero exit
+/// can't strand the terminal in a suspended state. On success,
+/// `state.prompt_input` is replaced with the edited contents; on failure,
+/// the buffer is left untouched and an error is appended to
+/// `state.view_lines` for visibility. `terminal.clear()` forces a full
+/// repaint on the next draw, since the alternate-screen round trip through
+/// the suspended editor leaves ratatui's cached buffer stale.
+fn run_editor_keybinding(
+    state: &mut AppState,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    guard: &TerminalGuard,
+) -> io::Result<()> {
+    let editor_command = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    guard.suspend();
+    let result = edit_buffer_with_editor(&state.prompt_input, &editor_command);
+    guard.resume()?;
+    terminal.clear()?;
+
+    match result {
+        Ok(edited) => state.prompt_input = edited,
+        Err(err) => state.view_lines.push(format!("$EDITOR failed: {err}")),
+    }
+    Ok(())
 }
 
 /// Runs the TUI event loop: draws `Header`/`View`/`Prompt`, and exits on
@@ -329,7 +464,7 @@ where
     Fut2: Future<Output = String> + Send + 'static,
 {
     install_panic_hook();
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -338,7 +473,7 @@ where
         ..AppState::default()
     };
 
-    event_loop(&mut terminal, &mut state, &handle, &submit, &command, &on_history_append)
+    event_loop(&mut terminal, &mut state, &handle, &submit, &command, &on_history_append, &guard)
 }
 
 fn event_loop<F, Fut, C, Fut2>(
@@ -348,6 +483,7 @@ fn event_loop<F, Fut, C, Fut2>(
     submit: &F,
     command: &C,
     on_history_append: &Arc<dyn Fn(String) + Send + Sync>,
+    guard: &TerminalGuard,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -506,6 +642,16 @@ where
                                     });
                                 }
                             }
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ticket 42 (editor-integration): like
+                            // Enter/Char/Backspace above, exits any history
+                            // walk in progress since the buffer is about to
+                            // be replaced wholesale by whatever the editor
+                            // saves.
+                            history_cursor = None;
+                            run_editor_keybinding(state, terminal, guard)?;
+                            dirty = true;
                         }
                         KeyCode::Char(c) => {
                             // Ticket 40: typing breaks a history walk in
@@ -1033,5 +1179,51 @@ mod tests {
         let inserted_plain = handle_enter_key(&mut state, KeyModifiers::NONE);
         assert!(!inserted_plain, "expected plain Enter not to insert a newline");
         assert_eq!(state.prompt_input, "line one\n\n", "plain Enter must not modify the buffer");
+    }
+
+    /// Ticket 42 (editor-integration) unit test: `edit_buffer_with_editor`
+    /// writes the given buffer to a temp file, runs the given (scripted, for
+    /// this test) editor command against it, and reads the edited contents
+    /// back once the process exits -- exercised here with a tiny
+    /// non-interactive shell script standing in for a real interactive
+    /// `$EDITOR`, since this unit test (unlike the PTY acceptance test in
+    /// `crates/rokr/tests/tui_test.rs`) has no live terminal to
+    /// suspend/resume.
+    #[test]
+    fn editor_suspend_writes_buffer_to_temp_file_and_reloads_edited_contents_on_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_dir = std::env::temp_dir().join(format!(
+            "rokr-tui-editor-unit-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&script_dir).expect("failed to create script dir");
+        let script_path = script_dir.join("fake_editor.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf '\\nedited by script\\n' >> \"$1\"\n")
+            .expect("failed to write fake editor script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("failed to stat fake editor script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)
+            .expect("failed to make fake editor script executable");
+
+        let result = edit_buffer_with_editor(
+            "original line",
+            script_path.to_str().expect("script path should be valid utf-8"),
+        )
+        .expect("scripted editor should succeed");
+
+        assert_eq!(
+            result, "original line\nedited by script",
+            "expected the buffer written to the temp file, plus the scripted editor's \
+             appended line, read back with the trailing newline trimmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&script_dir);
     }
 }

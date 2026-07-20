@@ -7141,3 +7141,211 @@ async fn multiline_prompt_composed_with_shift_enter_submits_as_single_prompt_on_
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
+
+/// Ticket 42 (editor-integration) acceptance test: pressing the editor
+/// keybinding (Ctrl+E) suspends the TUI, spawns the scripted `$EDITOR`
+/// stand-in against a temp file containing the current prompt buffer, and
+/// on the script's exit restores the terminal and loads the edited file's
+/// contents back into the prompt buffer -- verified by submitting the
+/// resulting buffer and checking the single outgoing request body contains
+/// both the original typed text and the script's appended text, joined by
+/// the newline the script inserts.
+#[tokio::test]
+async fn pressing_editor_keybinding_with_scripted_editor_command_updates_prompt_buffer_from_edited_file() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock_server = MockServer::start().await;
+
+    let canned_response = "MockedAssistantReplyForEditorIntegrationTesting";
+    let typed_line = "linetypedbeforeeditoruniquetoken";
+    let edited_line = "lineappendedbyscriptedituniquetoken";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-editor",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-editor");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-editor");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-editor");
+
+    // Scripted `$EDITOR` stand-in: a tiny non-interactive shell script that
+    // appends a known, unique line to whatever file path it's given (`$1`,
+    // the temp file rokr-tui writes the current prompt buffer to), then
+    // exits 0 immediately -- standing in for a real interactive editor
+    // process without requiring one in CI.
+    let editor_script_dir = unique_temp_dir("editor-script-editor");
+    let editor_script_path = editor_script_dir.join("fake_editor.sh");
+    std::fs::write(
+        &editor_script_path,
+        format!("#!/bin/sh\nprintf '\\n{edited_line}\\n' >> \"$1\"\n"),
+    )
+    .expect("failed to write fake editor script");
+    let mut perms = std::fs::metadata(&editor_script_path)
+        .expect("failed to stat fake editor script")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&editor_script_path, perms)
+        .expect("failed to make fake editor script executable");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.env("EDITOR", editor_script_path.to_str().expect("script path should be valid utf-8"));
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(typed_line.as_bytes())
+        .expect("failed to write typed line to pty");
+    writer
+        .write_all(b"\x05") // Ctrl+E
+        .expect("failed to write Ctrl+E to pty");
+
+    let edit_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < edit_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(edited_line) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(edited_line),
+        "expected the prompt buffer to reflect the scripted editor's appended line after \
+         Ctrl+E, got pty output: {output:?}"
+    );
+
+    writer.write_all(b"\r").expect("failed to write Enter to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert_eq!(received_requests.len(), 1, "expected exactly one outgoing request");
+
+    let request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    let expected_joined_content = format!("{typed_line}\\n{edited_line}");
+    assert!(
+        request_body.contains(&expected_joined_content),
+        "expected the outgoing request body to contain the typed line and the scripted \
+         editor's appended line joined by a literal newline (JSON-escaped as \
+         {expected_joined_content:?}), proving the edited file's contents were loaded back \
+         into the prompt buffer; got body: {request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&editor_script_dir);
+}
