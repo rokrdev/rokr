@@ -125,6 +125,14 @@ impl_executable_tool!(rokr_tools::read::ReadTool);
 impl_executable_tool!(rokr_tools::glob::GlobTool);
 impl_executable_tool!(rokr_tools::grep::GrepTool);
 impl_executable_tool!(rokr_tools::ls::LsTool);
+// `websearch` is a plain (non-gated) tool like the four above — it performs
+// no local side effect for the user to approve, it only delegates to the
+// provider (see `rokr_tools::websearch`'s doc comment) — so it uses the
+// plain-tool macro, not `impl_executable_tool_gated!`. `WebsearchTool` is a
+// concrete, non-generic type (its `Arc<dyn NativeSearchCapability>` field
+// doesn't make the type itself generic), so the macro's bare `$ty:ty`
+// pattern applies unchanged.
+impl_executable_tool!(rokr_tools::websearch::WebsearchTool);
 
 /// Like [`impl_executable_tool`], but for a `rokr_tools::PreviewableTool`:
 /// also implements [`ExecutableTool::preview`] by delegating to
@@ -178,6 +186,7 @@ macro_rules! impl_executable_tool_gated {
 impl_executable_tool_gated!(rokr_tools::bash::BashTool);
 impl_executable_tool_gated!(rokr_tools::write::WriteTool);
 impl_executable_tool_gated!(rokr_tools::edit::EditTool);
+impl_executable_tool_gated!(rokr_tools::webfetch::WebfetchTool);
 
 /// Runs the agent tool loop (ADR 0004) against the running conversation
 /// `transcript`, and for as long as the reply contains `ToolUse` blocks,
@@ -329,6 +338,26 @@ pub trait Provider {
         messages: &[Message],
         tools: &[ToolSpec],
     ) -> Result<(Message, Usage), Self::Error>;
+
+    /// Whether this provider exposes a native, server-side search capability
+    /// (e.g. Anthropic's web-search server tool) that the `websearch` tool
+    /// (`rokr_tools::websearch`) can delegate queries to. `main.rs` queries
+    /// this to decide whether `websearch` belongs in a session's tool set:
+    /// per the PRD, the tool is omitted entirely — not replaced with a
+    /// degraded client-side implementation — when this reports `false`.
+    /// Defaults to `false`, since most providers have no such capability.
+    ///
+    /// This is deliberately a thin `bool` signal rather than handing back an
+    /// instance of `rokr_tools::websearch`'s local `NativeSearchCapability`
+    /// trait: `rokr-tools` does not depend on `rokr-core` (a one-way edge —
+    /// `rokr-core` depends on `rokr-tools`, never the reverse), so this trait
+    /// structurally cannot name that type. Wiring a real adapter override
+    /// (e.g. on the Anthropic provider) that also bridges an actual
+    /// capability object is out of scope for this ticket (ticket 28:
+    /// websearch-tool) — no adapter overrides this today.
+    fn native_search_capable(&self) -> bool {
+        false
+    }
 }
 
 /// Provider-reported token accounting for a single [`Provider::send`] call

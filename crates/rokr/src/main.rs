@@ -1,7 +1,11 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>]";
+use rokr_core::Provider;
+
+mod subagent;
+
+const USAGE: &str = "Usage: rokr [--version] [--agent <plan|build>] [auth login]";
 
 /// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
 /// when no flag is given. `Plan` is read-only: read/glob/grep/ls only, so
@@ -24,6 +28,22 @@ impl AgentTier {
         }
     }
 }
+
+/// F-003: the real send path (`run_tool_loop`, `compact_transcript`) AND
+/// `subagent::SubagentTool` (ticket 30, F-004) share this SINGLE
+/// resilience-wrapped provider — previously this was two separate locks (a
+/// resilience-wrapped one for the send path, a bare unwrapped one for
+/// subagents), written and read non-atomically, so a `/model` switch racing
+/// `submit`'s two reads could split the parent and a subagent onto
+/// different backends. `ResilientProvider<AnyProvider>` is `Clone` (see
+/// `resilience.rs`), so a single `Arc<RwLock<..>>` is enough: ticket 29's
+/// read-clone-drop-guard pattern (clone the current provider out from
+/// behind a read lock and drop the guard immediately, so `/model` never
+/// blocks on an in-flight request's `.await`, which can legitimately run as
+/// long as the retry policy's `max_elapsed`) clones the whole
+/// `ResilientProvider<AnyProvider>` value directly rather than an inner
+/// `Arc`.
+type SharedProvider = Arc<tokio::sync::RwLock<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>>;
 
 /// Parses the raw CLI args (already stripped of argv[0]) into an
 /// `AgentTier`. No args at all defaults to `Plan`; `--agent plan` and
@@ -49,6 +69,21 @@ async fn main() -> ExitCode {
             println!("rokr {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        // Ticket 31 (oauth-pkce-login): runs the PKCE login flow and exits
+        // rather than entering the TUI. Parallel to the `--version` arm
+        // above -- there's no clap/subcommand framework in this binary yet,
+        // so this is a second explicit match arm, same as that one.
+        [a, b] if a == "auth" && b == "login" => {
+            let config_dir = rokr_config::default_config_dir();
+            let token_store = rokr_provider::auth::default_token_store(&config_dir);
+            match rokr_provider::auth::login(token_store.as_ref()).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("login failed: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             let agent = match parse_agent_tier(&args) {
                 Ok(agent) => agent,
@@ -66,8 +101,15 @@ async fn main() -> ExitCode {
                 }
             };
 
+            // Ticket 30 (subagent-tool): named so it can be cloned into
+            // `submit`'s closure below and reused there to load a *named
+            // subagent's* own prompt (`{config_dir}/agents/{name}.md`) via
+            // the same `rokr_config::read_agent_prompt` call this crate
+            // already makes for the top-level agent tier's prompt.
+            let config_dir = rokr_config::default_config_dir();
+
             let mut system_prompt = match rokr_config::read_agent_prompt(
-                &rokr_config::default_config_dir(),
+                &config_dir,
                 agent.prompt_name(),
             ) {
                 Ok(prompt) => prompt,
@@ -109,13 +151,57 @@ async fn main() -> ExitCode {
 
             // Constructed once at startup (so a missing/invalid env var
             // doesn't crash the TUI — it's reported the first time the
-            // user submits a prompt instead) and wired through
+            // user submits a prompt instead) via `rokr_provider::build_provider`
+            // (ticket 32: provider-factory-seam) and wired through
             // `rokr_core::run_tool_loop`. `rokr-tui` stays decoupled from
             // `rokr-core`/`rokr-provider`, so this closure is where the
             // message model and provider abstraction meet the TUI.
-            let provider = rokr_provider::OpenAiProvider::from_env()
-                .map(Arc::new)
-                .map_err(|err| err.to_string());
+            //
+            // Ticket 29 (model-session-switch): held behind a
+            // `tokio::sync::RwLock` (never written to `rokr_config::Config`
+            // or disk — there is no field for it in the config schema) so
+            // `/model <name>` can swap the active provider at runtime.
+            // Readers (`submit`, `/compact`) clone the provider out from
+            // behind the read lock and drop the guard before any `.await`
+            // that uses it.
+            // Ticket 31 (oauth-pkce-login): auth is resolved (config auth
+            // block -- always `None` today, no field for it in
+            // `rokr_config::Config` yet -- then a stored keychain/file
+            // OAuth token, then the existing `ROKR_ANTHROPIC_API_KEY` env
+            // var) before falling through to the unchanged
+            // `AnyProvider::from_env()` path when nothing is stored. This
+            // preserves today's behavior exactly for anyone who has never
+            // run `rokr auth login`.
+            //
+            // F-003: a SINGLE piece of shared state comes out of the
+            // `build_provider` call now, backing both the real send path
+            // (`run_tool_loop`, `compact_transcript`) and
+            // `subagent::SubagentTool` (F-004: also resilience-wrapped now,
+            // see `subagent.rs`'s doc comment). Previously this was two
+            // separate `Arc<RwLock<..>>`s (`SharedProvider` +
+            // `SharedSubagentProvider`) written and read non-atomically —
+            // a `/model` switch racing `submit`'s two reads could split the
+            // parent and a subagent onto different backends. Collapsing to
+            // one lock, made possible by `ResilientProvider<P>` now being
+            // `Clone` (see `resilience.rs`), removes that race entirely:
+            // there is exactly one write in `set_active_provider` and
+            // exactly one read in `submit`.
+            let token_store = rokr_provider::auth::default_token_store(&config_dir);
+            let resolved_auth = rokr_provider::auth::resolve_auth(
+                None,
+                token_store.as_ref(),
+                rokr_provider::anthropic::ENV_API_KEY,
+            );
+            let built = rokr_provider::build_provider(
+                None,
+                resolved_auth,
+                rokr_provider::RetryPolicy::default(),
+            );
+
+            let provider: Result<SharedProvider, String> = match built {
+                Ok(built) => Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
+                Err(err) => Err(err),
+            };
 
             // In-memory only (no persistence, per the PRD): accumulates
             // every turn across submits for the lifetime of the process, so
@@ -147,14 +233,23 @@ async fn main() -> ExitCode {
             // Ticket 21 (manual-compact-command): cloned here, before
             // `submit`'s `move` closure below takes ownership of the
             // original `provider`/`transcript` bindings, so `command` can
-            // independently share the same provider and running transcript.
-            // `command_cwd`/`command_repo_map` (F-001 fix) let the
-            // `/compact` handler regenerate the repo map in the same
-            // shared state `submit` reads from.
+            // independently share the same provider lock and running
+            // transcript. `command_cwd`/`command_repo_map` (F-001 fix) let
+            // the `/compact` handler regenerate the repo map in the same
+            // shared state `submit` reads from. Ticket 29
+            // (model-session-switch): `command_provider` is also how
+            // `/model` writes a newly selected provider into the same
+            // `SharedProvider` that `submit` reads.
             let command_provider = provider.clone();
             let command_transcript = transcript.clone();
             let command_cwd = cwd.clone();
             let command_repo_map = repo_map.clone();
+            // F-005: `/model`'s handler in `command` below needs its own
+            // clone of `config_dir` (to resolve auth for the requested
+            // backend) -- cloned here, before `submit`'s `move` closure
+            // takes ownership of the original binding, same reasoning as
+            // `command_provider` above.
+            let command_config_dir = config_dir.clone();
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
@@ -162,16 +257,27 @@ async fn main() -> ExitCode {
                 let system_prompt = system_prompt.clone();
                 let repo_map = repo_map.clone();
                 let last_known_usage = last_known_usage.clone();
+                let config_dir = config_dir.clone();
                 async move {
                     let provider = provider?;
+                    // F-003: ONE read lock, ONE clone of the current
+                    // resilience-wrapped provider snapshot, shared by both
+                    // the send path below and `SubagentTool` (F-004) --
+                    // guard dropped immediately, never held across an
+                    // `.await`, so `/model` never blocks on an in-flight
+                    // request's `.await` (which can legitimately run as
+                    // long as the retry policy's `max_elapsed`).
+                    let provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider> =
+                        provider.read().await.clone();
 
-                    // All seven tools are constructed unconditionally
+                    // All eight tools are constructed unconditionally
                     // (they're cheap zero-sized unit structs); which ones
                     // actually land in `tools` depends on the agent tier.
                     // read/glob/grep/ls auto-approve (ADR 0005: none are
-                    // `PreviewableTool`s); bash, write, and edit are gated
-                    // and round-trip through the permission callback below,
-                    // and only exist in the tool set for the `Build` tier.
+                    // `PreviewableTool`s); bash, write, edit, and webfetch
+                    // are gated and round-trip through the permission
+                    // callback below, and only exist in the tool set for
+                    // the `Build` tier.
                     let read = rokr_tools::read::ReadTool;
                     let glob = rokr_tools::glob::GlobTool;
                     let grep = rokr_tools::grep::GrepTool;
@@ -179,10 +285,39 @@ async fn main() -> ExitCode {
                     let bash = rokr_tools::bash::BashTool;
                     let write = rokr_tools::write::WriteTool;
                     let edit = rokr_tools::edit::EditTool;
-                    let tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
-                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
-                        AgentTier::Build => vec![&read, &glob, &grep, &ls, &bash, &write, &edit],
+                    let webfetch = rokr_tools::webfetch::WebfetchTool;
+
+                    // Ticket 28 (websearch-tool): `websearch` needs an
+                    // actual `rokr_tools::websearch::NativeSearchCapability`
+                    // object to delegate to — `provider.native_search_capable()`
+                    // alone is just a thin bool signal (see that method's
+                    // doc comment on why `rokr-core` can't hand back more
+                    // than that). No adapter in this codebase constructs a
+                    // real capability object yet (`rokr-provider` doesn't
+                    // depend on `rokr-tools`, and bridging a real
+                    // Anthropic-backed capability through here is out of
+                    // scope for this ticket), so `native_search_capability`
+                    // is provably `None` today. The `native_search_capable()`
+                    // query below is still real, not hardcoded, so a
+                    // follow-up ticket that supplies a genuine capability
+                    // object lights `websearch` up without touching this
+                    // gating logic again.
+                    let native_search_capability: Option<
+                        Arc<dyn rokr_tools::websearch::NativeSearchCapability>,
+                    > = None;
+                    let websearch = if provider.native_search_capable() {
+                        rokr_tools::websearch::for_capability(native_search_capability)
+                    } else {
+                        None
                     };
+
+                    // Ticket 30 (subagent-tool): cloned before
+                    // `request_permission` below moves `permission` into
+                    // its own closure -- the subagent tool's callback needs
+                    // its own clone of the SAME handle so a subagent's
+                    // gated tool calls round-trip through the identical
+                    // channel the parent's own gated tool calls do.
+                    let subagent_permission = permission.clone();
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
@@ -211,6 +346,55 @@ async fn main() -> ExitCode {
                         }
                     };
 
+                    // Ticket 30 (subagent-tool): bridges rokr-core's
+                    // PermissionRequest to the SAME rokr_tui::PermissionHandle
+                    // the parent's own request_permission above uses (PRD
+                    // Phase 4 "Subagents": "Permission inheritance").
+                    // Tagging with the subagent's name happens inside
+                    // `subagent::run_subagent`, not here -- this closure
+                    // only forwards the (already-tagged) request.
+                    let subagent_request_permission: subagent::PermissionCallback =
+                        Box::new(move |request: rokr_core::PermissionRequest| {
+                            let permission = subagent_permission.clone();
+                            Box::pin(async move {
+                                let detail = match request.payload {
+                                    rokr_core::PermissionPayload::Command(command) => {
+                                        rokr_tui::PermissionDetail::Text(command)
+                                    }
+                                    rokr_core::PermissionPayload::Diff { old, new } => {
+                                        rokr_tui::PermissionDetail::Diff { old, new }
+                                    }
+                                };
+                                permission
+                                    .request(rokr_tui::PermissionRequest {
+                                        tool_name: request.tool_name,
+                                        detail,
+                                    })
+                                    .await
+                            })
+                        });
+                    // F-003/F-004: the SAME single provider snapshot the
+                    // send path below uses, resilience-wrapped -- no longer
+                    // a separately-tracked bare `AnyProvider`.
+                    let subagent_tool = subagent::SubagentTool::new(
+                        provider.clone(),
+                        config_dir.clone(),
+                        subagent_request_permission,
+                    );
+
+                    let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
+                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
+                        AgentTier::Build => {
+                            vec![
+                                &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
+                                &subagent_tool,
+                            ]
+                        }
+                    };
+                    if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
+                        tools.push(websearch);
+                    }
+
                     // Expand any `@path` mentions in the raw input BEFORE it
                     // joins the transcript, so resolved file contents (or a
                     // not-found note) land in the same user-role message
@@ -237,7 +421,7 @@ async fn main() -> ExitCode {
                     let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
 
                     let (reply, usage) = rokr_core::run_tool_loop(
-                        provider.as_ref(),
+                        &provider,
                         &system_prompt,
                         repo_map_snapshot.as_deref(),
                         &mut transcript,
@@ -270,7 +454,7 @@ async fn main() -> ExitCode {
                         context_window_size,
                         auto_compact_threshold,
                     ) {
-                        match rokr_core::compact_transcript(provider.as_ref(), &transcript).await {
+                        match rokr_core::compact_transcript(&provider, &transcript).await {
                             Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
                                 *transcript = compacted;
                                 None
@@ -296,17 +480,43 @@ async fn main() -> ExitCode {
             // this closure is where a literal command string like
             // `/compact` gets meaning. Deliberately a single minimal match
             // arm, not a registry/parser framework (a later phase extends
-            // this seam).
+            // this seam). Ticket 29 (model-session-switch) adds `/model
+            // <name>` ahead of that match: it performs provider
+            // *selection* ("openai" or "anthropic"), not per-field
+            // model-string editing. F-003: the switch now writes through
+            // `set_active_provider` into the SINGLE `SharedProvider` lock
+            // (see that type's doc comment) — no second lock to keep in
+            // sync, so a `/model` switch can no longer split the parent and
+            // a subagent onto different backends. F-005: name resolution
+            // itself routes through `resolve_auth` + `build_provider` (see
+            // `set_active_provider`'s doc comment) rather than
+            // `AnyProvider::from_name`, so an OAuth-only user (no
+            // `ROKR_ANTHROPIC_API_KEY` env var) can still switch to
+            // anthropic.
             let command = move |input: String| {
                 let provider = command_provider.clone();
+                let config_dir = command_config_dir.clone();
                 let transcript = command_transcript.clone();
                 let cwd = command_cwd.clone();
                 let repo_map = command_repo_map.clone();
                 async move {
+                    if let Some(name) = input.strip_prefix("/model ") {
+                        let name = name.trim();
+                        return match &provider {
+                            Ok(lock) => match set_active_provider(lock, &config_dir, name).await {
+                                Ok(()) => "Active provider switched.".to_string(),
+                                Err(err) => format!("failed to switch provider: {err}"),
+                            },
+                            Err(err) => {
+                                format!("cannot switch provider: {err}")
+                            }
+                        };
+                    }
+
                     match input.as_str() {
                         "/compact" => {
-                            let provider = match provider {
-                                Ok(provider) => provider,
+                            let provider_snapshot = match &provider {
+                                Ok(lock) => lock.read().await.clone(),
                                 Err(err) => {
                                     return format!(
                                         "compaction failed, transcript left intact: {err}"
@@ -314,8 +524,11 @@ async fn main() -> ExitCode {
                                 }
                             };
                             let mut transcript = transcript.lock().await;
-                            match rokr_core::compact_transcript(provider.as_ref(), &transcript)
-                                .await
+                            match rokr_core::compact_transcript(
+                                &provider_snapshot,
+                                &transcript,
+                            )
+                            .await
                             {
                                 Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
                                     *transcript = compacted;
@@ -365,10 +578,72 @@ fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String)
     transcript.push(rokr_core::Message::user_text(input));
 }
 
+/// Resolves `name` to a concrete backend and writes it into the shared
+/// active-provider state under a single write lock (ticket 29: `/model`;
+/// F-003: one lock, one write, no second lock to keep in sync -- see
+/// `SharedProvider`'s doc comment).
+///
+/// F-005: resolution itself now routes through the SAME
+/// `auth::resolve_auth` + `factory::build_provider` path startup uses,
+/// rather than `AnyProvider::from_name` -- `from_name` can only ever
+/// construct an API-key-backed provider from env vars, so a user
+/// authenticated only via a stored OAuth token (no
+/// `ROKR_ANTHROPIC_API_KEY` env var) could never switch to the anthropic
+/// backend via `/model` under the old code. Also preserves the
+/// currently-active `RetryPolicy` (read off the current provider snapshot
+/// before the switch) instead of resetting to `RetryPolicy::default()` on
+/// every switch.
+async fn set_active_provider(
+    active_provider: &tokio::sync::RwLock<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>,
+    config_dir: &std::path::Path,
+    name: &str,
+) -> Result<(), String> {
+    let current_policy = active_provider.read().await.policy();
+
+    // Scoped so `token_store` (a `Box<dyn TokenStore>`, not `Send`) is
+    // dropped before the `.write().await` below -- otherwise it would stay
+    // live across that await point and make this whole future not `Send`,
+    // which `rokr_tui::run`'s `command` bound requires.
+    let resolved_auth = {
+        let token_store = rokr_provider::auth::default_token_store(config_dir);
+        rokr_provider::auth::resolve_auth(
+            None,
+            token_store.as_ref(),
+            rokr_provider::anthropic::ENV_API_KEY,
+        )
+    };
+
+    let built = rokr_provider::build_provider(Some(name), resolved_auth, current_policy)?;
+
+    *active_provider.write().await = built.resilient;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rokr_core::{Message, Role};
+    use rokr_core::{Message, Provider, Role};
+
+    /// Serializes tests below that mutate process-global env vars
+    /// (`ROKR_ANTHROPIC_*`, `ROKR_AUTH_FORCE_FILE_STORE`), mirroring the
+    /// same `ENV_GUARD` convention already used in `rokr-provider`'s own
+    /// test modules (`lib.rs`, `factory.rs`).
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Creates a fresh, uniquely-named directory under the system temp dir,
+    /// mirroring `subagent.rs`'s own `unique_temp_dir` test helper.
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rokr-main-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn running_transcript_accumulates_turns() {
@@ -393,5 +668,137 @@ mod tests {
 
         assert_eq!(transcript[3].role, Role::Assistant);
         assert_eq!(transcript[3].text(), "second reply");
+    }
+
+    /// F-003 (single-lock refactor): `set_active_provider` now writes
+    /// through exactly ONE lock (`SharedProvider`'s doc comment) instead of
+    /// two kept in sync by hand. F-005: the requested backend now resolves
+    /// via `set_active_provider`'s own `auth::resolve_auth` +
+    /// `factory::build_provider` call, not `AnyProvider::from_name`
+    /// directly -- proven here via env-var-backed anthropic credentials
+    /// (no OAuth token stored). The companion OAuth-only case is
+    /// `model_command_switches_to_anthropic_via_stored_oauth_token_without_api_key_env_var`
+    /// below. `ResilientProvider` exposes no accessor to its wrapped inner
+    /// provider (deliberately -- see `resilience.rs`), so the proof the
+    /// switch actually landed is a real `.send()` against a mock server
+    /// only the Anthropic backend would ever reach (the untouched `initial`
+    /// OpenAI provider points at an unreachable `http://initial.invalid`
+    /// and would error, not succeed).
+    #[tokio::test]
+    async fn model_command_switches_active_provider_to_requested_backend() {
+        let _lock = ENV_GUARD.lock().unwrap();
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config_dir = unique_temp_dir("model-switch-env");
+        std::env::set_var(rokr_provider::auth::ENV_FORCE_FILE_STORE, "1");
+        std::env::set_var(rokr_provider::anthropic::ENV_BASE_URL, mock_server.uri());
+        std::env::set_var(rokr_provider::anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        std::env::set_var(rokr_provider::anthropic::ENV_API_KEY, "test-key");
+
+        let initial = rokr_provider::AnyProvider::OpenAi(rokr_provider::OpenAiProvider::new(
+            "http://initial.invalid",
+            "gpt-4o-mini",
+            "initial-key",
+        ));
+        let active_provider =
+            tokio::sync::RwLock::new(rokr_provider::ResilientProvider::new(initial));
+
+        let result = set_active_provider(&active_provider, &config_dir, "anthropic").await;
+
+        std::env::remove_var(rokr_provider::auth::ENV_FORCE_FILE_STORE);
+        std::env::remove_var(rokr_provider::anthropic::ENV_BASE_URL);
+        std::env::remove_var(rokr_provider::anthropic::ENV_MODEL);
+        std::env::remove_var(rokr_provider::anthropic::ENV_API_KEY);
+        let _ = std::fs::remove_dir_all(&config_dir);
+
+        result.expect("switching to anthropic via env-backed credentials should succeed");
+
+        let guard = active_provider.read().await;
+        let messages = vec![Message::user_text("hello")];
+        guard.send(&messages, &[]).await.expect(
+            "the switched-to provider should be the Anthropic backend hitting the mock server",
+        );
+    }
+
+    /// F-005: `/model anthropic` must succeed for a user authenticated
+    /// ONLY via a stored OAuth token, with NO `ROKR_ANTHROPIC_API_KEY` env
+    /// var set. Before this fix, `/model` resolved the requested provider
+    /// via `AnyProvider::from_name`, which can only ever construct an
+    /// API-key-backed provider from env vars -- it has no way to build an
+    /// OAuth-backed one -- so this exact scenario failed with a
+    /// missing-env-var error every time.
+    #[tokio::test]
+    async fn model_command_switches_to_anthropic_via_stored_oauth_token_without_api_key_env_var() {
+        let _lock = ENV_GUARD.lock().unwrap();
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config_dir = unique_temp_dir("model-switch-oauth");
+        std::env::set_var(rokr_provider::auth::ENV_FORCE_FILE_STORE, "1");
+        std::env::set_var(rokr_provider::anthropic::ENV_BASE_URL, mock_server.uri());
+        std::env::set_var(rokr_provider::anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        // Deliberately absent -- this is the whole point of the test.
+        std::env::remove_var(rokr_provider::anthropic::ENV_API_KEY);
+
+        let token_store = rokr_provider::auth::default_token_store(&config_dir);
+        rokr_provider::auth::TokenStore::save(
+            token_store.as_ref(),
+            &rokr_provider::auth::Auth::OAuth {
+                access_token: "test-oauth-access-token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+            },
+        )
+        .expect("saving the stored OAuth token should succeed");
+
+        let initial = rokr_provider::AnyProvider::OpenAi(rokr_provider::OpenAiProvider::new(
+            "http://initial.invalid",
+            "gpt-4o-mini",
+            "initial-key",
+        ));
+        let active_provider =
+            tokio::sync::RwLock::new(rokr_provider::ResilientProvider::new(initial));
+
+        let result = set_active_provider(&active_provider, &config_dir, "anthropic").await;
+
+        std::env::remove_var(rokr_provider::auth::ENV_FORCE_FILE_STORE);
+        std::env::remove_var(rokr_provider::anthropic::ENV_BASE_URL);
+        std::env::remove_var(rokr_provider::anthropic::ENV_MODEL);
+        let _ = std::fs::remove_dir_all(&config_dir);
+
+        result.expect(
+            "switching to anthropic via a stored OAuth token, with no ROKR_ANTHROPIC_API_KEY \
+             env var set, should succeed",
+        );
+
+        let guard = active_provider.read().await;
+        let messages = vec![Message::user_text("hello")];
+        guard.send(&messages, &[]).await.expect(
+            "the switched-to provider should be the OAuth-backed Anthropic backend hitting the \
+             mock server",
+        );
     }
 }
