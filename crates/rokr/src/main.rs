@@ -295,6 +295,15 @@ async fn main() -> ExitCode {
             let data_dir = default_data_dir();
             let store = rokr_session::SessionStore::open(&data_dir);
 
+            // Ticket 40 (prompt-history), PRD decision 5: loaded once at
+            // startup -- lives at `data_dir/history`, a sibling of
+            // `sessions/`, entirely separate from any one session's own
+            // log (cross-session, not session-scoped). A load failure
+            // degrades gracefully (empty history this run) rather than
+            // crashing the TUI, matching this function's existing pattern
+            // for other optional startup concerns.
+            let prompt_history = rokr_session::PromptHistory::load(&data_dir).unwrap_or_default();
+
             let (initial_transcript, initial_last_known_usage, session_handle, initial_turn_index): (
                 Vec<rokr_core::Message>,
                 Option<rokr_core::Usage>,
@@ -446,6 +455,13 @@ async fn main() -> ExitCode {
             // takes ownership of the original binding, same reasoning as
             // `command_provider` above.
             let command_config_dir = config_dir.clone();
+            // Ticket 40 (prompt-history): `on_history_append`'s closure
+            // (built below, after `submit`/`command`) needs its own clone
+            // of `data_dir`, cloned here before `submit`'s `move` closure
+            // takes ownership of the original binding -- mirrors
+            // `command_data_dir`/`command_config_dir` above for the same
+            // reason.
+            let history_append_data_dir = data_dir.clone();
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
@@ -932,7 +948,15 @@ async fn main() -> ExitCode {
                 }
             };
 
-            match rokr_tui::run(submit, command).await {
+            let on_history_append = move |prompt: String| {
+                if let Err(err) =
+                    rokr_session::PromptHistory::append(&history_append_data_dir, &prompt)
+                {
+                    eprintln!("failed to append prompt to history: {err}");
+                }
+            };
+
+            match rokr_tui::run(submit, command, prompt_history, on_history_append).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) if err.is_not_a_tty() => {
                     // Not an error in a scripting/piping context: config is

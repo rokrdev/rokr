@@ -751,6 +751,141 @@ impl CheckpointStore {
     }
 }
 
+/// Cross-session prompt recall (ticket 40, prompt-history; PRD decision 5):
+/// a single append-only log at `$XDG_DATA_HOME/rokr/history`, separate from
+/// any one session's own `session.jsonl` -- a prompt typed in one session is
+/// just as useful to recall in another, so unlike everything else in this
+/// file, this isn't scoped to a session id at all. `rokr-tui`'s Up/Down
+/// recall (ticket 40) only ever sees the loaded `Vec<String>` primitive
+/// `load` hands back, never this type itself, per the PRD's crate-boundary
+/// decision (rokr-tui must not depend on rokr-session).
+pub struct PromptHistory;
+
+impl PromptHistory {
+    /// How many entries `load` returns at most -- once the file holds more
+    /// than this many lines, `load` returns only the most recent
+    /// `MAX_ENTRIES` (oldest-first within that window), and `append` trims
+    /// the on-disk file back down to this bound once it's just been
+    /// exceeded. Picked as a round number comfortably larger than any
+    /// realistic day's worth of prompts while keeping the file (and the
+    /// one-time startup read) small -- not a PRD-specified figure, this
+    /// ticket's own implementation choice.
+    pub const MAX_ENTRIES: usize = 1000;
+
+    fn history_path(data_dir: &std::path::Path) -> PathBuf {
+        data_dir.join("history")
+    }
+
+    /// Reads `$data_dir/history`, one entry per line (each line
+    /// escaped/unescaped via `encode_entry`/`decode_entry` so a prompt
+    /// containing a literal newline round-trips through this line-oriented
+    /// format -- ticket 41, multiline-input, is what actually lets a user
+    /// type one, but this ticket's storage format must not corrupt it if it
+    /// arrives), returned oldest-first. `Ok(Vec::new())` if the file doesn't
+    /// exist yet (no prompt has ever been submitted). If the file holds more
+    /// than `MAX_ENTRIES` lines, only the most recent `MAX_ENTRIES` are
+    /// returned.
+    pub fn load(data_dir: impl AsRef<std::path::Path>) -> std::io::Result<Vec<String>> {
+        let path = Self::history_path(data_dir.as_ref());
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        let mut entries: Vec<String> = contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(decode_entry)
+            .collect();
+
+        if entries.len() > Self::MAX_ENTRIES {
+            let excess = entries.len() - Self::MAX_ENTRIES;
+            entries.drain(0..excess);
+        }
+
+        Ok(entries)
+    }
+
+    /// Appends `entry` as a new line to `$data_dir/history` (creating
+    /// `data_dir` and the file if needed). A plain, fast `O(1)` append in
+    /// the common case -- this only pays the cost of a full read+rewrite
+    /// when the file has just grown past `MAX_ENTRIES` lines, trimming it
+    /// back down to the most recent `MAX_ENTRIES`; since that bound is a
+    /// small, fixed constant, the occasional rewrite is negligible, and this
+    /// is what keeps the file's on-disk size bounded (decision 5: "capped at
+    /// a bounded size") rather than growing forever the way a session's own
+    /// `session.jsonl` deliberately does (decision 1's accepted trade-off).
+    pub fn append(data_dir: impl AsRef<std::path::Path>, entry: &str) -> std::io::Result<()> {
+        let data_dir = data_dir.as_ref();
+        std::fs::create_dir_all(data_dir)?;
+        let path = Self::history_path(data_dir);
+
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            writeln!(file, "{}", encode_entry(entry))?;
+        }
+
+        let line_count = std::fs::read_to_string(&path)?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+        if line_count > Self::MAX_ENTRIES {
+            let trimmed = Self::load(data_dir)?; // already caps at MAX_ENTRIES
+            let rewritten = trimmed
+                .iter()
+                .map(|entry| encode_entry(entry))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(&path, rewritten)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Escapes a single history entry so it survives round-tripping through
+/// `PromptHistory`'s line-oriented file format even if it contains a literal
+/// newline or carriage return (ticket 41's multiline input is what actually
+/// lets a user type one) -- backslash is escaped first so the scheme is
+/// unambiguous to reverse, then real `\n`/`\r` characters become the
+/// two-character escapes `\n`/`\r` (a literal backslash followed by the
+/// letter), never a real line break.
+fn encode_entry(entry: &str) -> String {
+    entry
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Reverses `encode_entry`.
+fn decode_entry(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('\\') => result.push('\\'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// In-memory running state `run_writer` (ticket 36) keeps for the shared
 /// index, updated on every `Header`/`Turn` write and re-serialized as a
 /// [`SessionIndexEntry`] snapshot appended to `sessions/index.jsonl`.
@@ -1778,6 +1913,57 @@ mod tests {
         assert_eq!(
             touched, expected_touched,
             "expected rollback_to to report exactly the paths it actually restored"
+        );
+    }
+
+    /// Ticket 40 (prompt-history): appending more than `MAX_ENTRIES` entries
+    /// and reloading must return exactly `MAX_ENTRIES` entries, oldest-first,
+    /// with the earliest excess entries trimmed off -- proves both the
+    /// ordering and the bound `PromptHistory::load`/`append` are supposed to
+    /// enforce together.
+    #[test]
+    fn prompt_history_append_then_load_returns_entries_in_order_capped_at_bound() {
+        let dir = unique_temp_dir("prompt-history");
+
+        let total = PromptHistory::MAX_ENTRIES + 3;
+        for i in 0..total {
+            PromptHistory::append(&dir, &format!("prompt-{i}")).expect("append should succeed");
+        }
+
+        let loaded = PromptHistory::load(&dir).expect("load should succeed");
+
+        assert_eq!(
+            loaded.len(),
+            PromptHistory::MAX_ENTRIES,
+            "expected load to cap at MAX_ENTRIES, got {} entries",
+            loaded.len()
+        );
+
+        let expected: Vec<String> = (3..total).map(|i| format!("prompt-{i}")).collect();
+        assert_eq!(
+            loaded, expected,
+            "expected the oldest 3 entries to have been trimmed, keeping only the most recent \
+             MAX_ENTRIES in order"
+        );
+    }
+
+    /// Ticket 40 (prompt-history): an entry containing a literal newline and a
+    /// literal backslash must round-trip through the line-oriented history
+    /// file exactly, proving `encode_entry`/`decode_entry` don't corrupt or
+    /// truncate it.
+    #[test]
+    fn prompt_history_round_trips_entries_containing_newlines_and_backslashes() {
+        let dir = unique_temp_dir("prompt-history-escaping");
+        PromptHistory::append(&dir, "line one\nline two").unwrap();
+        PromptHistory::append(&dir, "a backslash: \\ and a newline: \n end").unwrap();
+
+        let loaded = PromptHistory::load(&dir).unwrap();
+        assert_eq!(
+            loaded,
+            vec![
+                "line one\nline two".to_string(),
+                "a backslash: \\ and a newline: \n end".to_string(),
+            ]
         );
     }
 

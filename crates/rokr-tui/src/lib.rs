@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::io::{self, IsTerminal, Stdout};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -46,6 +47,15 @@ pub struct AppState {
     /// decision. Drives the permission prompt in [`draw`] and, like
     /// `pending`, blocks prompt input/submission until resolved.
     pub permission_request: Option<PermissionRequest>,
+    /// Ticket 40 (prompt-history): every submitted prompt (both `Submit`
+    /// and `Command` routes), oldest-first -- seeded at startup from
+    /// `rokr_session::PromptHistory::load` (via `run`'s `history`
+    /// parameter; rokr-tui never depends on rokr-session itself, just this
+    /// primitive `Vec<String>`) and grown in-memory as further prompts are
+    /// submitted this run, so Up/Down recall sees this run's own
+    /// submissions immediately, not only ones persisted before this
+    /// process started.
+    pub history: Vec<String>,
 }
 
 /// A gated tool call awaiting user permission, described in primitives only
@@ -269,7 +279,17 @@ fn install_panic_hook() {
 /// rokr-tui doesn't know what any given command means — `main.rs` interprets
 /// literal command strings like `/compact`. Its resolved `String` is
 /// displayed the same way a `submit` reply is.
-pub async fn run<F, Fut, C, Fut2>(submit: F, command: C) -> Result<(), TuiError>
+///
+/// `history` (ticket 40, prompt-history) seeds [`AppState::history`] for
+/// Up/Down recall, and `on_history_append` is invoked with each submitted
+/// prompt so the caller (`main.rs`) can persist it — both are primitives
+/// only, since rokr-tui must not depend on rokr-session.
+pub async fn run<F, Fut, C, Fut2>(
+    submit: F,
+    command: C,
+    history: Vec<String>,
+    on_history_append: impl Fn(String) + Send + Sync + 'static,
+) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
@@ -281,16 +301,26 @@ where
     }
 
     let handle = tokio::runtime::Handle::current();
+    // Ticket 40 (prompt-history): wrapped in `Arc` so it can be cheaply
+    // cloned into a fresh `handle.spawn_blocking` call on every Enter-press
+    // (see `event_loop`) -- `PromptHistory::append` is blocking fs IO and
+    // must never run inline on the crossterm-polling thread (this
+    // codebase's "never block the render loop" principle, ADR 0008).
+    let on_history_append: Arc<dyn Fn(String) + Send + Sync> = Arc::new(on_history_append);
 
-    tokio::task::spawn_blocking(move || run_blocking(handle, submit, command))
-        .await
-        .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
+    tokio::task::spawn_blocking(move || {
+        run_blocking(handle, submit, command, history, on_history_append)
+    })
+    .await
+    .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
 fn run_blocking<F, Fut, C, Fut2>(
     handle: tokio::runtime::Handle,
     submit: F,
     command: C,
+    history: Vec<String>,
+    on_history_append: Arc<dyn Fn(String) + Send + Sync>,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -303,9 +333,12 @@ where
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut state = AppState::default();
+    let mut state = AppState {
+        history,
+        ..AppState::default()
+    };
 
-    event_loop(&mut terminal, &mut state, &handle, &submit, &command)
+    event_loop(&mut terminal, &mut state, &handle, &submit, &command, &on_history_append)
 }
 
 fn event_loop<F, Fut, C, Fut2>(
@@ -314,6 +347,7 @@ fn event_loop<F, Fut, C, Fut2>(
     handle: &tokio::runtime::Handle,
     submit: &F,
     command: &C,
+    on_history_append: &Arc<dyn Fn(String) + Send + Sync>,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -336,6 +370,11 @@ where
     // ADR 0008: redraw only on state change, never on a fixed timer with no
     // change. Starts true so the first frame still paints.
     let mut dirty = true;
+    // Ticket 40 (prompt-history): `None` = not currently navigating
+    // (`prompt_input` is either empty or genuinely user-typed text);
+    // `Some(index)` while an Up/Down walk is in progress, indexing into
+    // `state.history`.
+    let mut history_cursor: Option<usize> = None;
 
     loop {
         if dirty {
@@ -412,6 +451,24 @@ where
                     match key.code {
                         KeyCode::Enter if !state.prompt_input.is_empty() => {
                             let input = std::mem::take(&mut state.prompt_input);
+                            // Ticket 40 (prompt-history): captured at the
+                            // moment of submission, independent of whether
+                            // the outgoing call (spawned below) ever
+                            // succeeds -- a prompt should be recallable the
+                            // instant it's sent, not gated on a network
+                            // round-trip. Appended to the in-memory list
+                            // immediately (so Up/Down sees it this run
+                            // without waiting on disk IO) and to the
+                            // on-disk history file via a spawned blocking
+                            // task (fs IO must never run inline on this
+                            // thread).
+                            history_cursor = None;
+                            state.history.push(input.clone());
+                            {
+                                let cb = on_history_append.clone();
+                                let entry = input.clone();
+                                handle.spawn_blocking(move || cb(entry));
+                            }
                             state.view_lines.push(format!("> {input}"));
                             state.pending = true;
                             dirty = true;
@@ -439,12 +496,44 @@ where
                             }
                         }
                         KeyCode::Char(c) => {
+                            // Ticket 40: typing breaks a history walk in
+                            // progress (the buffer is now genuinely
+                            // user-edited, not a pure recall), but keeps
+                            // whatever text is currently there.
+                            history_cursor = None;
                             state.prompt_input.push(c);
                             dirty = true;
                         }
                         KeyCode::Backspace => {
+                            history_cursor = None;
                             state.prompt_input.pop();
                             dirty = true;
+                        }
+                        KeyCode::Up => {
+                            if let Some((index, text)) = history_navigate_up(
+                                &state.history,
+                                history_cursor,
+                                state.prompt_input.is_empty(),
+                            ) {
+                                history_cursor = Some(index);
+                                state.prompt_input = text;
+                                dirty = true;
+                            }
+                        }
+                        KeyCode::Down => {
+                            match history_navigate_down(&state.history, history_cursor) {
+                                HistoryDown::Recall { index, text } => {
+                                    history_cursor = Some(index);
+                                    state.prompt_input = text;
+                                    dirty = true;
+                                }
+                                HistoryDown::ClearToEmpty => {
+                                    history_cursor = None;
+                                    state.prompt_input.clear();
+                                    dirty = true;
+                                }
+                                HistoryDown::NoOp => {}
+                            }
                         }
                         _ => {}
                     }
@@ -522,6 +611,71 @@ fn route_input(input: String) -> InputRoute {
         InputRoute::Command(input)
     } else {
         InputRoute::Submit(input)
+    }
+}
+
+/// Ticket 40 (prompt-history): decides the new `(index, text)` when Up is
+/// pressed, or `None` for a no-op. Pure and side-effect-free so it's
+/// unit-testable without a live event loop, mirroring `should_quit`/
+/// `handle_permission_key`/`route_input`.
+///
+/// Behavior (shell-like, PRD decision 5's "prev/next recall"):
+/// - Up on an empty prompt, when not already navigating, starts a walk at
+///   the most recent entry.
+/// - Up on a NON-empty prompt that is genuinely typed (not itself a history
+///   recall -- i.e. `cursor` is `None`) is a no-op: recall only starts from
+///   an empty buffer, so a half-typed prompt is never silently clobbered.
+///   This is the "only recall from empty buffer" choice (as opposed to
+///   "replace any typed content"), picked because it can never destroy
+///   unsent text the user was actively composing.
+/// - Once already navigating (`cursor` is `Some`), further Up presses walk
+///   to the next-older entry regardless of the buffer's current content;
+///   at the oldest entry, Up is a no-op (stays put).
+fn history_navigate_up(
+    history: &[String],
+    cursor: Option<usize>,
+    prompt_is_empty: bool,
+) -> Option<(usize, String)> {
+    match cursor {
+        None if prompt_is_empty && !history.is_empty() => {
+            let index = history.len() - 1;
+            Some((index, history[index].clone()))
+        }
+        None => None,
+        Some(0) => None,
+        Some(index) => {
+            let index = index - 1;
+            Some((index, history[index].clone()))
+        }
+    }
+}
+
+/// Result of a Down navigation attempt (see [`history_navigate_down`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryDown {
+    /// Not currently navigating -- Down does nothing.
+    NoOp,
+    /// Walk to a newer entry: set the cursor to `index`, buffer to `text`.
+    Recall { index: usize, text: String },
+    /// Walking past the newest entry exits the walk entirely: cursor back
+    /// to `None`, buffer back to empty -- shell-like "keep going forward
+    /// and land back on a blank line".
+    ClearToEmpty,
+}
+
+/// Ticket 40 (prompt-history): mirrors [`history_navigate_up`] for Down.
+/// Pure and side-effect-free for the same testability reasons.
+fn history_navigate_down(history: &[String], cursor: Option<usize>) -> HistoryDown {
+    match cursor {
+        None => HistoryDown::NoOp,
+        Some(index) if index + 1 < history.len() => {
+            let index = index + 1;
+            HistoryDown::Recall {
+                index,
+                text: history[index].clone(),
+            }
+        }
+        Some(_) => HistoryDown::ClearToEmpty,
     }
 }
 
@@ -750,5 +904,54 @@ mod tests {
             route_input("/compact".to_string()),
             InputRoute::Command("/compact".to_string())
         );
+    }
+
+    #[test]
+    fn history_navigate_up_starts_walk_from_empty_prompt_at_most_recent_entry() {
+        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let result = history_navigate_up(&history, None, true);
+        assert_eq!(result, Some((2, "third".to_string())));
+    }
+
+    #[test]
+    fn history_navigate_up_is_noop_when_prompt_not_empty_and_not_already_navigating() {
+        let history = vec!["only".to_string()];
+        let result = history_navigate_up(&history, None, false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn history_navigate_up_walks_to_older_entry_when_already_navigating() {
+        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let result = history_navigate_up(&history, Some(2), false);
+        assert_eq!(result, Some((1, "second".to_string())));
+    }
+
+    #[test]
+    fn history_navigate_up_is_noop_at_oldest_entry() {
+        let history = vec!["first".to_string(), "second".to_string()];
+        let result = history_navigate_up(&history, Some(0), false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn history_navigate_down_is_noop_when_not_navigating() {
+        let history = vec!["first".to_string()];
+        assert_eq!(history_navigate_down(&history, None), HistoryDown::NoOp);
+    }
+
+    #[test]
+    fn history_navigate_down_walks_to_newer_entry() {
+        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        assert_eq!(
+            history_navigate_down(&history, Some(0)),
+            HistoryDown::Recall { index: 1, text: "second".to_string() }
+        );
+    }
+
+    #[test]
+    fn history_navigate_down_clears_to_empty_past_newest_entry() {
+        let history = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(history_navigate_down(&history, Some(1)), HistoryDown::ClearToEmpty);
     }
 }

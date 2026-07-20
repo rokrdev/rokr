@@ -6690,3 +6690,234 @@ fn search_command_returns_matching_session_ids_for_content_substring() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
+
+/// Ticket 40 (prompt-history) acceptance test: a prompt submitted in one
+/// process (Enter pressed on a non-empty prompt) is appended to the
+/// cross-session prompt-history file at `$XDG_DATA_HOME/rokr/history` (PRD
+/// decision 5) BEFORE that process exits; a second, entirely separate
+/// process spawned afterward against the SAME `XDG_DATA_HOME` can recall it
+/// by pressing Up in an empty prompt. This is deliberately NOT gated on the
+/// mocked assistant reply landing -- `rokr-tui`'s history-append hook fires
+/// synchronously at the Enter keypress, independent of whether the outgoing
+/// provider call ever succeeds, so this test polls the history FILE
+/// directly (mirroring
+/// `resume_without_confirm_warns_and_confirm_swaps_transcript_and_writer`'s
+/// same filesystem-polling convention) rather than waiting on pty output,
+/// avoiding any race with the async submit call's own completion.
+#[tokio::test]
+async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_history_file() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let canned_response = "MockedAssistantReplyForHistoryRecallTesting";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-history",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": canned_response },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-history");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-history");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-history");
+
+    // Single token (no spaces), same reason as every other test in this
+    // file: ratatui's diff-based redraw can leave cursor-jump gaps across
+    // unchanged cells, so a literal multi-word substring match on raw pty
+    // bytes can spuriously fail.
+    let recalled_prompt = "recallthisuniqueprompttoken";
+
+    // --- Run 1: submit the prompt, then wait for it to actually land in
+    // the on-disk history file before exiting. ---
+    {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("failed to open pty (run 1)");
+
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+        cmd.env("HOME", &home);
+        cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+        cmd.env("XDG_DATA_HOME", &xdg_data_home);
+        cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+        cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+        cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+        let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty (run 1)");
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader (run 1)");
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut writer = pair.master.take_writer().expect("failed to take pty writer (run 1)");
+
+        let mut output = String::new();
+        let render_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < render_deadline {
+            while let Ok(chunk) = rx.try_recv() {
+                output.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            output.contains("Header"),
+            "expected pty output to contain Header (run 1), got: {output:?}"
+        );
+
+        writer
+            .write_all(format!("{recalled_prompt}\r").as_bytes())
+            .expect("failed to write prompt to pty (run 1)");
+
+        let history_path = xdg_data_home.join("rokr").join("history");
+        let write_deadline = Instant::now() + Duration::from_secs(10);
+        let mut history_contents = String::new();
+        while Instant::now() < write_deadline {
+            history_contents = std::fs::read_to_string(&history_path).unwrap_or_default();
+            if history_contents.contains(recalled_prompt) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            history_contents.contains(recalled_prompt),
+            "expected the submitted prompt to be appended to {history_path:?}, got: \
+             {history_contents:?}"
+        );
+
+        writer.write_all(b"\x03").expect("failed to write Ctrl+C to pty (run 1)");
+        let exit_deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll rokr exit status (run 1)") {
+                break status;
+            }
+            if Instant::now() > exit_deadline {
+                let _ = child.kill();
+                panic!("rokr (run 1) did not exit within timeout; output so far: {output:?}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.success(), "expected rokr (run 1) to exit cleanly, got status: {status:?}");
+    }
+
+    // --- Run 2: a fresh process against the SAME XDG_DATA_HOME. Pressing
+    // Up in the (empty) prompt must recall run 1's submitted prompt. ---
+    {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("failed to open pty (run 2)");
+
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+        cmd.env("HOME", &home);
+        cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+        cmd.env("XDG_DATA_HOME", &xdg_data_home);
+        cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+        cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+        cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+        let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty (run 2)");
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader (run 2)");
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut writer = pair.master.take_writer().expect("failed to take pty writer (run 2)");
+
+        let mut output = String::new();
+        let render_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < render_deadline {
+            while let Ok(chunk) = rx.try_recv() {
+                output.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            output.contains("Header"),
+            "expected pty output to contain Header (run 2), got: {output:?}"
+        );
+
+        // Up-arrow: ESC [ A.
+        writer
+            .write_all(b"\x1b[A")
+            .expect("failed to write Up arrow to pty (run 2)");
+
+        let recall_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < recall_deadline {
+            while let Ok(chunk) = rx.try_recv() {
+                output.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            if output.contains(recalled_prompt) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            output.contains(recalled_prompt),
+            "expected pressing Up in an empty prompt (run 2, fresh process, same \
+             XDG_DATA_HOME) to recall run 1's submitted prompt into the prompt buffer, got: \
+             {output:?}"
+        );
+
+        writer.write_all(b"\x03").expect("failed to write Ctrl+C to pty (run 2)");
+        let exit_deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll rokr exit status (run 2)") {
+                break status;
+            }
+            if Instant::now() > exit_deadline {
+                let _ = child.kill();
+                panic!("rokr (run 2) did not exit within timeout; output so far: {output:?}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.success(), "expected rokr (run 2) to exit cleanly, got status: {status:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+}
