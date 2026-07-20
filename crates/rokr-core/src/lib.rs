@@ -36,7 +36,13 @@ pub struct ToolSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionPayload {
     Command(String),
-    Diff { old: String, new: String },
+    /// `path` (ticket 38, checkpoint-pre-images) mirrors
+    /// `rokr_tools::Preview::Diff`'s `path` field one-for-one — see that
+    /// type's doc comment for why it's needed here: a pre-image snapshot
+    /// keyed by `(turn_index, path)` is taken on the permission-decision
+    /// path in `crates/rokr/src/main.rs`, which only sees this payload, not
+    /// the raw tool-call JSON.
+    Diff { path: String, old: String, new: String },
 }
 
 /// A gated tool call awaiting user permission: the tool's name plus a
@@ -173,8 +179,8 @@ macro_rules! impl_executable_tool_gated {
                         rokr_tools::Preview::Command(command) => {
                             PermissionPayload::Command(command)
                         }
-                        rokr_tools::Preview::Diff { old, new } => {
-                            PermissionPayload::Diff { old, new }
+                        rokr_tools::Preview::Diff { path, old, new } => {
+                            PermissionPayload::Diff { path, old, new }
                         }
                     },
                 ))
@@ -891,7 +897,8 @@ mod tests {
         }));
 
         match preview {
-            Some(Ok(PermissionPayload::Diff { old, new })) => {
+            Some(Ok(PermissionPayload::Diff { path, old, new })) => {
+                assert_eq!(path, target_path);
                 assert_eq!(old, old_content);
                 assert_eq!(new, "new content");
             }

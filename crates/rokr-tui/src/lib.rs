@@ -2,10 +2,15 @@
 
 use std::future::Future;
 use std::io::{self, IsTerminal, Stdout};
+use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -31,6 +36,9 @@ const PROMPT_HEIGHT: u16 = 3;
 /// pane than the scroll-to-bottom logic in [`draw`] already has to account
 /// for.
 const MAX_DIFF_LINES: usize = 18;
+/// How many lines each individual mouse-wheel tick moves the View pane's
+/// scroll offset by (ticket 43, mouse-scroll-status-line).
+const SCROLL_LINES_PER_TICK: u16 = 3;
 
 /// State rendered into the TUI's View section. Owns the scrollback lines
 /// shown in the View pane and the current prompt input buffer.
@@ -46,6 +54,40 @@ pub struct AppState {
     /// decision. Drives the permission prompt in [`draw`] and, like
     /// `pending`, blocks prompt input/submission until resolved.
     pub permission_request: Option<PermissionRequest>,
+    /// Ticket 40 (prompt-history): every submitted prompt (both `Submit`
+    /// and `Command` routes), oldest-first -- seeded at startup from
+    /// `rokr_session::PromptHistory::load` (via `run`'s `history`
+    /// parameter; rokr-tui never depends on rokr-session itself, just this
+    /// primitive `Vec<String>`) and grown in-memory as further prompts are
+    /// submitted this run, so Up/Down recall sees this run's own
+    /// submissions immediately, not only ones persisted before this
+    /// process started.
+    pub history: Vec<String>,
+    /// Ticket 43 (mouse-scroll-status-line): how many lines the View pane is
+    /// scrolled up from the live bottom-anchored position. `0` means fully
+    /// caught up (auto-follows new output); mouse wheel Up/Down (see
+    /// `adjust_view_scroll_offset`) adjust it. Deliberately expressed as a
+    /// constant *distance from the bottom* rather than an absolute line
+    /// index: this is the simplest representation that requires no book-
+    /// keeping when new output arrives -- the view naturally keeps
+    /// following along `offset` lines behind the latest content rather than
+    /// either snapping back to the bottom or freezing at a fixed absolute
+    /// line (see `draw`'s scroll_y computation). A keypress does not reset
+    /// this offset either, by the same "simplest thing that works" choice --
+    /// only scrolling back down (or reaching the bottom) clears it.
+    pub view_scroll_offset: u16,
+    /// Ticket 43: elapsed session time, recomputed from a TUI-local
+    /// `Instant` captured once at session start (see `run_blocking`) and
+    /// copied in here by the event loop so `draw` stays a pure function of
+    /// `AppState` -- this also makes the status line's time-formatting
+    /// testable with a fixed `Duration`, without any real wall-clock wait.
+    pub elapsed: Duration,
+    /// Ticket 43: the most recently reported context-window usage, or
+    /// `None` before any turn has completed. Delivered from `main.rs` over a
+    /// status-update channel mirroring the permission-request channel's
+    /// shape -- a plain primitive, no rokr-core types crossing into this
+    /// crate (see `SessionStatus`'s own doc comment).
+    pub session_status: Option<SessionStatus>,
 }
 
 /// A gated tool call awaiting user permission, described in primitives only
@@ -69,6 +111,22 @@ pub enum PermissionDetail {
     /// Old/new content for a `write`-style change, rendered as a
     /// line-level diff.
     Diff { old: String, new: String },
+}
+
+/// Plain data describing the session status line's contents (ticket 43,
+/// mouse-scroll-status-line): elapsed time is computed TUI-locally (see
+/// `AppState::elapsed`), but the context-window usage percentage requires
+/// token counts that only `main.rs` has access to (rokr-tui must not depend
+/// on rokr-core's `Usage` type), so `main.rs` computes the percentage itself
+/// and sends it across a status-update channel as this primitive struct --
+/// mirroring how `PermissionRequest`/`PermissionHandle` round-trip a
+/// primitive shape rather than a rokr-core type directly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionStatus {
+    /// Fraction (not a whole percent) of the context window used by the
+    /// most recent turn's reported usage: `(input_tokens + output_tokens) /
+    /// context_window_size`. Rendered multiplied by 100 in `draw`.
+    pub context_percent: f64,
 }
 
 /// Handle for requesting permission mid-`submit`, round-tripped through the
@@ -126,7 +184,8 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         ])
         .split(frame.area());
 
-    let header = Block::default().borders(Borders::ALL).title(HEADER_TITLE);
+    let header = Paragraph::new(status_line_text(state))
+        .block(Block::default().borders(Borders::ALL).title(HEADER_TITLE));
     frame.render_widget(header, chunks[0]);
 
     let mut view_lines = state.view_lines.clone();
@@ -148,12 +207,19 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     } else if state.pending {
         view_lines.push("...".to_string());
     }
-    // While a permission prompt is showing, anchor the Paragraph's scroll to
-    // the bottom so the prompt + "[y]/[n]" line stay visible even when a
-    // long transcript (or, previously, a long diff — now capped by
-    // MAX_DIFF_LINES) would otherwise push them past the bottom of the View
-    // pane. `Paragraph` has no bottom-anchor mode, so this computes an
-    // explicit `scroll` offset instead.
+    // Bottom-anchor the View pane so the latest content -- the permission
+    // prompt/"[y]/[n]" line, the pending indicator, or just the tail of a
+    // long transcript -- stays visible instead of ratatui's default
+    // scroll-from-top clipping it once content exceeds the pane's height.
+    // Ticket 43 (mouse-scroll-status-line) generalizes this beyond the
+    // permission-prompt case it originally shipped for: `state
+    // .view_scroll_offset` (adjusted by mouse wheel, see
+    // `adjust_view_scroll_offset`) shifts the anchor UP from the bottom by
+    // that many lines, so scrolling back through history works the same way
+    // in normal operation. While a permission prompt is showing, any manual
+    // scroll offset is ignored and the view is forced fully to the bottom
+    // instead -- per the acceptance criterion, mouse scrolling must never
+    // affect an open permission prompt.
     //
     // Known limitation: this counts *unwrapped* logical lines against the
     // pane's inner height, not post-wrap rendered rows, since wrapping
@@ -164,12 +230,13 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
     // each one into a real rendered row regardless of pane width. Only
     // *wrapping* of a long single logical line remains an approximation; a
     // very long unwrapped line could still make the estimate short.
+    let inner_height = chunks[1].height.saturating_sub(2); // top/bottom border
+    let total_lines: usize = view_lines.iter().map(|line| line.split('\n').count()).sum();
+    let max_scroll = (total_lines as u16).saturating_sub(inner_height);
     let scroll_y = if showing_permission_prompt {
-        let inner_height = chunks[1].height.saturating_sub(2); // top/bottom border
-        let total_lines: usize = view_lines.iter().map(|line| line.split('\n').count()).sum();
-        (total_lines as u16).saturating_sub(inner_height)
+        max_scroll
     } else {
-        0
+        max_scroll.saturating_sub(state.view_scroll_offset)
     };
     // Wrapped so a long line (e.g. a bash command in a permission prompt)
     // doesn't get silently clipped at the pane's width.
@@ -179,9 +246,56 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         .block(Block::default().borders(Borders::ALL).title(VIEW_TITLE));
     frame.render_widget(view, chunks[1]);
 
+    // Ticket 42 (editor-integration) fix: bottom-anchor the Prompt pane the
+    // same way the View pane already does above, so a multi-line buffer
+    // (composed via Alt/Shift+Enter per ticket 41, or loaded back from
+    // `$EDITOR` per ticket 42) shows its tail -- where the cursor
+    // conceptually is -- once the buffer grows past the Prompt box's single
+    // inner row, instead of leaving line 2+ unrendered and invisible. Without
+    // this, editing a multi-line buffer in `$EDITOR` produced no visible
+    // feedback in the Prompt box at all: `Paragraph` with no scroll always
+    // draws starting at line 0, so anything past the first line was silently
+    // clipped.
+    let prompt_inner_height = chunks[2].height.saturating_sub(2); // top/bottom border
+    let prompt_line_count = state.prompt_input.split('\n').count() as u16;
+    let prompt_scroll_y = prompt_line_count.saturating_sub(prompt_inner_height);
     let prompt = Paragraph::new(state.prompt_input.as_str())
+        .wrap(Wrap { trim: false })
+        .scroll((prompt_scroll_y, 0))
         .block(Block::default().borders(Borders::ALL).title(PROMPT_TITLE));
     frame.render_widget(prompt, chunks[2]);
+}
+
+/// Formats `elapsed` as `mm:ss`, or `hh:mm:ss` once it reaches an hour.
+/// Ticket 43 (mouse-scroll-status-line): a pure function of a `Duration` so
+/// the status line's time rendering is unit-testable without any real
+/// wall-clock wait -- the caller (`draw`, via `state.elapsed`) supplies
+/// whatever duration matters for the test.
+fn format_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Builds the Header block's status-line text: elapsed session time, plus a
+/// context-window usage percentage once at least one turn's usage has been
+/// reported (`state.session_status`). Extracted as a pure function of
+/// `AppState` so it's unit-testable the same way `draw`'s other helpers are.
+fn status_line_text(state: &AppState) -> String {
+    let elapsed = format_elapsed(state.elapsed);
+    match state.session_status {
+        Some(status) => {
+            let percent = (status.context_percent * 100.0).round() as i64;
+            format!("{elapsed} | context {percent}%")
+        }
+        None => elapsed,
+    }
 }
 
 /// Renders `old` and `new` as a naive line-level diff: every line of `old`
@@ -207,8 +321,9 @@ fn truncate_diff(mut lines: Vec<String>) -> Vec<String> {
     lines
 }
 
-/// Ensures raw mode is disabled and the alternate screen is left, no matter
-/// how the event loop exits (normal return, early `?`, or panic unwind).
+/// Ensures raw mode is disabled, mouse capture is turned off, and the
+/// alternate screen is left, no matter how the event loop exits (normal
+/// return, early `?`, or panic unwind).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -218,8 +333,35 @@ impl TerminalGuard {
         // the alternate screen fails, the guard still gets dropped on the way
         // out and disables raw mode instead of leaking it.
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        // Ticket 43 (mouse-scroll-status-line): mouse capture is enabled
+        // alongside the alternate screen. Known trade-off (PRD decision 6):
+        // enabling mouse capture disables the terminal's native click-drag
+        // text selection in most emulators. Mitigation shipped this phase is
+        // documentation only, no toggle command: Shift-drag (the common
+        // terminal-emulator convention) bypasses application mouse capture
+        // and still performs native OS text selection.
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(guard)
+    }
+
+    /// Ticket 42 ($EDITOR integration): temporarily leaves raw mode, mouse
+    /// capture, and the alternate screen so a suspended `$EDITOR` subprocess
+    /// can use the terminal normally, mirroring `restore_terminal`'s
+    /// best-effort semantics -- the guard's own `Drop` still restores the
+    /// terminal on the way out of `run_blocking` regardless of whether
+    /// `resume` below is ever reached. Ticket 43 extends this to mouse
+    /// capture: left enabled, a suspended `$EDITOR` would have its own mouse
+    /// handling clobbered by rokr's capture mode.
+    fn suspend(&self) {
+        restore_terminal();
+    }
+
+    /// Re-enters raw mode, mouse capture, and the alternate screen after
+    /// `suspend`, so the render loop can keep drawing.
+    fn resume(&self) -> io::Result<()> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        Ok(())
     }
 }
 
@@ -233,7 +375,7 @@ fn restore_terminal() {
     // Best-effort: we're often already unwinding or exiting, so there's no
     // good way to react to failures here.
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
 /// Installs a panic hook that restores the terminal (raw mode off, leave
@@ -245,6 +387,175 @@ fn install_panic_hook() {
         restore_terminal();
         previous(panic_info);
     }));
+}
+
+/// Errors from an `$EDITOR` invocation (ticket 42, editor-integration).
+/// Distinct from [`TuiError`] since these can occur independent of terminal
+/// setup -- e.g. in the unit test, which exercises
+/// [`edit_buffer_with_editor`] directly without a live terminal.
+#[derive(Debug, thiserror::Error)]
+enum EditorError {
+    /// The resolved editor command was empty (e.g. `$EDITOR` set to
+    /// whitespace only).
+    #[error("no editor command to run")]
+    NotSet,
+    /// The editor process could not be spawned at all (e.g. command not
+    /// found).
+    #[error("failed to spawn editor: {0}")]
+    Spawn(#[source] io::Error),
+    /// The editor process ran but exited with a non-zero status.
+    #[error("editor exited with non-zero status: {0}")]
+    NonZeroExit(ExitStatus),
+    /// Writing the buffer to, or reading it back from, the temp file
+    /// failed.
+    #[error("editor temp file io error: {0}")]
+    Io(#[source] io::Error),
+}
+
+/// Writes `buffer` to a fresh temp file, spawns `editor_command` against
+/// that file, waits for it to exit, and on success reads the file back.
+///
+/// `editor_command` is parsed as a whitespace-separated program plus
+/// arguments (the common `$EDITOR="code --wait"` convention), with the temp
+/// file's path appended as the final argument. Takes the command as a plain
+/// string rather than reading `$EDITOR` itself, so it's unit-testable
+/// against a scripted stand-in without mutating process-wide environment
+/// state.
+///
+/// A single trailing `\n`, if present, is trimmed from the file's contents
+/// before returning: virtually every text editor appends a final newline on
+/// save, and the prompt buffer's existing contract (ticket 41,
+/// multiline-input: append-only, no forced trailing newline) shouldn't gain
+/// one merely from a round trip through `$EDITOR`.
+///
+/// Process-wide counter mixed into the temp file name alongside the
+/// nanosecond timestamp and PID. `edit_buffer_with_editor` used to write via
+/// `fs::write`, which silently overwrote on a name collision, so a same-tick
+/// collision was harmless. F-005 switched the temp file open to
+/// `create_new(true)` (see below), which instead *fails* on collision -- and
+/// the test binary runs several tests that call `edit_buffer_with_editor`
+/// concurrently on different threads, all sharing one PID, so two threads
+/// reading `SystemTime::now()` in the same clock tick could compute an
+/// identical path and hard-error. The counter guarantees every call within
+/// this process gets a distinct path regardless of clock resolution.
+static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn edit_buffer_with_editor(buffer: &str, editor_command: &str) -> Result<String, EditorError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if editor_command.trim().is_empty() {
+        return Err(EditorError::NotSet);
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = std::env::temp_dir().join(format!(
+        "rokr-editor-{}-{nanos}-{counter}.txt",
+        std::process::id()
+    ));
+
+    // F-005 (security, argus review): `OpenOptions::create_new(true)` fails
+    // atomically if `temp_path` already exists in ANY form -- including as
+    // a pre-planted symlink -- closing both the "predictable name" attack
+    // (an attacker pre-creates the path) and the "truncate-follows-symlink"
+    // attack (a plain `fs::write` would happily follow a symlink and
+    // clobber whatever it points at). `mode(0o600)` makes the file
+    // owner-read-write-only from creation, never briefly world-readable
+    // the way a bare `fs::create`/`fs::write` (mode 0644 by default) would
+    // be for the window between creation and any later chmod.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)
+        .map_err(EditorError::Io)?;
+    {
+        use std::io::Write as _;
+        file.write_all(buffer.as_bytes()).map_err(EditorError::Io)?;
+    }
+    drop(file);
+
+    // F-010 (argus review): spawned via the user's OWN shell (`sh -c`)
+    // rather than this process doing a naive `split_whitespace` on
+    // `editor_command` -- a naive split mangles a quoted argument (e.g.
+    // `EDITOR="code --wait --user-data-dir='/some path'"`), splitting it
+    // apart at the embedded space rather than respecting the quoting. `sh
+    // -c` parses `editor_command` exactly the way the user's own shell
+    // would, and the temp file path is passed as `$1` (a real positional
+    // parameter, safely substituted regardless of any special characters
+    // it might contain) rather than being string-interpolated into the `-c`
+    // script text. This is a deliberate, reviewed choice, not an oversight:
+    // it spawns the user's own `$EDITOR` value through their own shell --
+    // the same trust level as running the editor binary itself, since
+    // `$EDITOR` is already arbitrary user-controlled code.
+    let status = match Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor_command} \"$1\""))
+        .arg("sh") // becomes $0 inside the -c script
+        .arg(&temp_path) // becomes $1 inside the -c script
+        .status()
+    {
+        Ok(status) => status,
+        Err(io_err) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(EditorError::Spawn(io_err));
+        }
+    };
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(EditorError::NonZeroExit(status));
+    }
+
+    let mut contents = std::fs::read_to_string(&temp_path).map_err(EditorError::Io)?;
+    let _ = std::fs::remove_file(&temp_path);
+    if contents.ends_with('\n') {
+        contents.pop();
+    }
+    Ok(contents)
+}
+
+/// Resolves the `$EDITOR` env var into a usable editor command, falling
+/// back to `vi` when it's unset OR set to an empty/whitespace-only string
+/// (F-009, argus review) -- e.g. `EDITOR=""` in a script-generated
+/// environment should behave the same as `$EDITOR` being unset entirely,
+/// not surface a confusing "no editor command to run" error.
+fn resolve_editor_command(raw: Option<String>) -> String {
+    raw.filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_string())
+}
+
+/// Handles the editor keybinding (ticket 42, editor-integration): reads
+/// `$EDITOR` (falling back to `vi` if unset or empty), suspends the
+/// terminal via `guard`, runs [`edit_buffer_with_editor`] against the
+/// current prompt buffer, and resumes the terminal -- regardless of whether
+/// the editor invocation succeeded, so a spawn failure or non-zero exit
+/// can't strand the terminal in a suspended state. On success,
+/// `state.prompt_input` is replaced with the edited contents; on failure,
+/// the buffer is left untouched and an error is appended to
+/// `state.view_lines` for visibility. `terminal.clear()` forces a full
+/// repaint on the next draw, since the alternate-screen round trip through
+/// the suspended editor leaves ratatui's cached buffer stale.
+fn run_editor_keybinding(
+    state: &mut AppState,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    guard: &TerminalGuard,
+) -> io::Result<()> {
+    let editor_command = resolve_editor_command(std::env::var("EDITOR").ok());
+
+    guard.suspend();
+    let result = edit_buffer_with_editor(&state.prompt_input, &editor_command);
+    guard.resume()?;
+    terminal.clear()?;
+
+    match result {
+        Ok(edited) => state.prompt_input = edited,
+        Err(err) => state.view_lines.push(format!("$EDITOR failed: {err}")),
+    }
+    Ok(())
 }
 
 /// Runs the TUI event loop: draws `Header`/`View`/`Prompt`, and exits on
@@ -269,7 +580,25 @@ fn install_panic_hook() {
 /// rokr-tui doesn't know what any given command means — `main.rs` interprets
 /// literal command strings like `/compact`. Its resolved `String` is
 /// displayed the same way a `submit` reply is.
-pub async fn run<F, Fut, C, Fut2>(submit: F, command: C) -> Result<(), TuiError>
+///
+/// `history` (ticket 40, prompt-history) seeds [`AppState::history`] for
+/// Up/Down recall, and `on_history_append` is invoked with each submitted
+/// prompt so the caller (`main.rs`) can persist it — both are primitives
+/// only, since rokr-tui must not depend on rokr-session.
+///
+/// `status_rx` (ticket 43, mouse-scroll-status-line) delivers `SessionStatus`
+/// updates -- primitive context-usage figures computed by the caller once a
+/// turn's usage is known -- into the render loop, the mirror image of the
+/// permission-request channel (there, rokr-tui owns both ends and hands the
+/// caller a `PermissionHandle`; here, the caller creates and owns the
+/// channel and rokr-tui just consumes the receiving end).
+pub async fn run<F, Fut, C, Fut2>(
+    submit: F,
+    command: C,
+    history: Vec<String>,
+    on_history_append: impl Fn(String) + Send + Sync + 'static,
+    status_rx: mpsc::Receiver<SessionStatus>,
+) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
@@ -281,16 +610,27 @@ where
     }
 
     let handle = tokio::runtime::Handle::current();
+    // Ticket 40 (prompt-history): wrapped in `Arc` so it can be cheaply
+    // cloned into a fresh `handle.spawn_blocking` call on every Enter-press
+    // (see `event_loop`) -- `PromptHistory::append` is blocking fs IO and
+    // must never run inline on the crossterm-polling thread (this
+    // codebase's "never block the render loop" principle, ADR 0008).
+    let on_history_append: Arc<dyn Fn(String) + Send + Sync> = Arc::new(on_history_append);
 
-    tokio::task::spawn_blocking(move || run_blocking(handle, submit, command))
-        .await
-        .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
+    tokio::task::spawn_blocking(move || {
+        run_blocking(handle, submit, command, history, on_history_append, status_rx)
+    })
+    .await
+    .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
 fn run_blocking<F, Fut, C, Fut2>(
     handle: tokio::runtime::Handle,
     submit: F,
     command: C,
+    history: Vec<String>,
+    on_history_append: Arc<dyn Fn(String) + Send + Sync>,
+    status_rx: mpsc::Receiver<SessionStatus>,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -299,13 +639,33 @@ where
     Fut2: Future<Output = String> + Send + 'static,
 {
     install_panic_hook();
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let mut state = AppState::default();
+    let mut state = AppState {
+        history,
+        ..AppState::default()
+    };
+    // Ticket 43 (mouse-scroll-status-line): captured once here, right after
+    // entering the terminal -- this is "session start" for elapsed-time
+    // purposes even for a resumed session (PRD decision 6's "or at resume
+    // time"): there is no cross-process-restart wall-clock state to thread
+    // through, so "resume time" is simply whenever THIS process's TUI loop
+    // begins.
+    let start_instant = Instant::now();
 
-    event_loop(&mut terminal, &mut state, &handle, &submit, &command)
+    event_loop(
+        &mut terminal,
+        &mut state,
+        &handle,
+        &submit,
+        &command,
+        &on_history_append,
+        &guard,
+        start_instant,
+        status_rx,
+    )
 }
 
 fn event_loop<F, Fut, C, Fut2>(
@@ -314,6 +674,10 @@ fn event_loop<F, Fut, C, Fut2>(
     handle: &tokio::runtime::Handle,
     submit: &F,
     command: &C,
+    on_history_append: &Arc<dyn Fn(String) + Send + Sync>,
+    guard: &TerminalGuard,
+    start_instant: Instant,
+    status_rx: mpsc::Receiver<SessionStatus>,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -336,8 +700,25 @@ where
     // ADR 0008: redraw only on state change, never on a fixed timer with no
     // change. Starts true so the first frame still paints.
     let mut dirty = true;
+    // Ticket 40 (prompt-history): `None` = not currently navigating
+    // (`prompt_input` is either empty or genuinely user-typed text);
+    // `Some(index)` while an Up/Down walk is in progress, indexing into
+    // `state.history`.
+    let mut history_cursor: Option<usize> = None;
 
     loop {
+        // Ticket 43: only marks dirty when the WHOLE-SECOND elapsed value
+        // actually changes, not on every ~100ms poll cycle below -- keeps
+        // ADR 0008's "redraw only on state change" intact (the visible
+        // mm:ss/hh:mm:ss text is unchanged sub-second, so redrawing then
+        // would be pure waste) while still ticking the status line forward
+        // once a second even when no other input/event arrives.
+        let elapsed = start_instant.elapsed();
+        if elapsed.as_secs() != state.elapsed.as_secs() {
+            state.elapsed = elapsed;
+            dirty = true;
+        }
+
         if dirty {
             terminal.draw(|frame| draw(frame, state))?;
             dirty = false;
@@ -346,6 +727,11 @@ where
         if let Ok((request, responder)) = perm_rx.try_recv() {
             state.permission_request = Some(request);
             pending_permission_responder = Some(responder);
+            dirty = true;
+        }
+
+        if let Ok(status) = status_rx.try_recv() {
+            state.session_status = Some(status);
             dirty = true;
         }
 
@@ -410,8 +796,38 @@ where
                     }
 
                     match key.code {
+                        KeyCode::Enter if handle_enter_key(state, key.modifiers) => {
+                            // Ticket 41 (multiline-input): Alt+Enter or
+                            // Shift+Enter inserted a newline into
+                            // `prompt_input` instead of submitting (see
+                            // `handle_enter_key`) -- typing, so it exits any
+                            // history walk in progress the same way
+                            // `Char`/`Backspace` do below, rather than
+                            // leaving a stale recall cursor pointed at a
+                            // buffer that's now been hand-edited.
+                            history_cursor = None;
+                            dirty = true;
+                        }
                         KeyCode::Enter if !state.prompt_input.is_empty() => {
                             let input = std::mem::take(&mut state.prompt_input);
+                            // Ticket 40 (prompt-history): captured at the
+                            // moment of submission, independent of whether
+                            // the outgoing call (spawned below) ever
+                            // succeeds -- a prompt should be recallable the
+                            // instant it's sent, not gated on a network
+                            // round-trip. Appended to the in-memory list
+                            // immediately (so Up/Down sees it this run
+                            // without waiting on disk IO) and to the
+                            // on-disk history file via a spawned blocking
+                            // task (fs IO must never run inline on this
+                            // thread).
+                            history_cursor = None;
+                            state.history.push(input.clone());
+                            {
+                                let cb = on_history_append.clone();
+                                let entry = input.clone();
+                                handle.spawn_blocking(move || cb(entry));
+                            }
                             state.view_lines.push(format!("> {input}"));
                             state.pending = true;
                             dirty = true;
@@ -438,15 +854,68 @@ where
                                 }
                             }
                         }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ticket 42 (editor-integration): like
+                            // Enter/Char/Backspace above, exits any history
+                            // walk in progress since the buffer is about to
+                            // be replaced wholesale by whatever the editor
+                            // saves.
+                            history_cursor = None;
+                            run_editor_keybinding(state, terminal, guard)?;
+                            dirty = true;
+                        }
                         KeyCode::Char(c) => {
+                            // Ticket 40: typing breaks a history walk in
+                            // progress (the buffer is now genuinely
+                            // user-edited, not a pure recall), but keeps
+                            // whatever text is currently there.
+                            history_cursor = None;
                             state.prompt_input.push(c);
                             dirty = true;
                         }
                         KeyCode::Backspace => {
+                            history_cursor = None;
                             state.prompt_input.pop();
                             dirty = true;
                         }
+                        KeyCode::Up => {
+                            if let Some((index, text)) = history_navigate_up(
+                                &state.history,
+                                history_cursor,
+                                state.prompt_input.is_empty(),
+                            ) {
+                                history_cursor = Some(index);
+                                state.prompt_input = text;
+                                dirty = true;
+                            }
+                        }
+                        KeyCode::Down => {
+                            match history_navigate_down(&state.history, history_cursor) {
+                                HistoryDown::Recall { index, text } => {
+                                    history_cursor = Some(index);
+                                    state.prompt_input = text;
+                                    dirty = true;
+                                }
+                                HistoryDown::ClearToEmpty => {
+                                    history_cursor = None;
+                                    state.prompt_input.clear();
+                                    dirty = true;
+                                }
+                                HistoryDown::NoOp => {}
+                            }
+                        }
                         _ => {}
+                    }
+                }
+                Event::Mouse(mouse_event) => {
+                    let new_offset = adjust_view_scroll_offset(
+                        state.view_scroll_offset,
+                        mouse_event.kind,
+                        state.permission_request.is_some(),
+                    );
+                    if new_offset != state.view_scroll_offset {
+                        state.view_scroll_offset = new_offset;
+                        dirty = true;
                     }
                 }
                 Event::Resize(_, _) => dirty = true,
@@ -468,6 +937,40 @@ where
 fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool, pending: bool) -> bool {
     (matches!(code, KeyCode::Char('q')) && prompt_is_empty && !pending)
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Ticket 41 (multiline-input): an `Enter` keypress submits the prompt
+/// UNLESS `modifiers` carries ALT or SHIFT, in which case it instead
+/// appends a newline to `state.prompt_input` and returns `true` so the
+/// caller (`event_loop`'s `KeyCode::Enter` match guard) knows to treat this
+/// as a buffer edit rather than falling through to the submit arm.
+///
+/// PRD decision 5 (phase-5-session-management) fixes this split for the
+/// phase -- Enter always submits, Alt+Enter/Shift+Enter always inserts,
+/// not configurable -- so no further key-binding lookup is needed here.
+///
+/// SHIFT is checked alongside ALT for terminals that do transmit it (some
+/// modern terminal + keyboard-protocol combinations do), even though this
+/// crate doesn't opt into crossterm's kitty keyboard-enhancement flags, so
+/// a raw xterm-style PTY can only ever be driven via ALT in practice (see
+/// the crossterm-decoding doc comment on
+/// `multiline_prompt_composed_with_shift_enter_submits_as_single_prompt_on_enter`
+/// in `crates/rokr/tests/tui_test.rs` for the byte-level detail).
+///
+/// Deliberately append-only (no cursor-position tracking): this crate's
+/// input buffer has no separate edit-cursor concept yet (`Char`/
+/// `Backspace` only ever act at the end of `prompt_input`), and the
+/// acceptance criterion only requires composing and submitting a
+/// multi-line prompt, not mid-buffer cursor movement -- adding real
+/// cursor-aware insertion would be building more editor than this ticket
+/// asks for.
+fn handle_enter_key(state: &mut AppState, modifiers: KeyModifiers) -> bool {
+    if modifiers.contains(KeyModifiers::ALT) || modifiers.contains(KeyModifiers::SHIFT) {
+        state.prompt_input.push('\n');
+        true
+    } else {
+        false
+    }
 }
 
 /// What a keypress means while a permission prompt is showing (i.e.
@@ -522,6 +1025,109 @@ fn route_input(input: String) -> InputRoute {
         InputRoute::Command(input)
     } else {
         InputRoute::Submit(input)
+    }
+}
+
+/// Ticket 43 (mouse-scroll-status-line): decides the new View-pane scroll
+/// offset for a mouse-wheel event. Pure and side-effect-free, mirroring
+/// `should_quit`/`handle_permission_key`/`route_input`/`history_navigate_*`.
+///
+/// Scrolling is scoped ONLY to the View pane's scrollback offset -- it never
+/// reads or writes `prompt_input`, so it can't affect the prompt buffer.
+/// `permission_prompt_showing` makes this a no-op while a permission prompt
+/// is up (PRD decision 6: mouse input must never affect an open permission
+/// prompt); the prompt's own bottom-anchored rendering in `draw` also
+/// ignores this offset independently, so scrolling can't disturb it even if
+/// this guard were ever bypassed.
+///
+/// This app has exactly one scrollable region (the View pane), so every
+/// wheel event is treated as a View-scroll regardless of the pointer's
+/// on-screen row/column -- no separate positional hit-testing against the
+/// View pane's rendered bounds, since there is nothing else on screen a
+/// wheel event could plausibly mean.
+///
+/// `ScrollUp` increases the offset (scrolls back through history, away from
+/// the live bottom); `ScrollDown` decreases it, saturating at 0 (fully
+/// caught up to the bottom). Any other `MouseEventKind` (click, drag, moved)
+/// is a no-op -- PRD decision 6 explicitly defers mouse-driven text
+/// selection/click-to-jump to a later slice.
+fn adjust_view_scroll_offset(
+    offset: u16,
+    kind: MouseEventKind,
+    permission_prompt_showing: bool,
+) -> u16 {
+    if permission_prompt_showing {
+        return offset;
+    }
+    match kind {
+        MouseEventKind::ScrollUp => offset.saturating_add(SCROLL_LINES_PER_TICK),
+        MouseEventKind::ScrollDown => offset.saturating_sub(SCROLL_LINES_PER_TICK),
+        _ => offset,
+    }
+}
+
+/// Ticket 40 (prompt-history): decides the new `(index, text)` when Up is
+/// pressed, or `None` for a no-op. Pure and side-effect-free so it's
+/// unit-testable without a live event loop, mirroring `should_quit`/
+/// `handle_permission_key`/`route_input`.
+///
+/// Behavior (shell-like, PRD decision 5's "prev/next recall"):
+/// - Up on an empty prompt, when not already navigating, starts a walk at
+///   the most recent entry.
+/// - Up on a NON-empty prompt that is genuinely typed (not itself a history
+///   recall -- i.e. `cursor` is `None`) is a no-op: recall only starts from
+///   an empty buffer, so a half-typed prompt is never silently clobbered.
+///   This is the "only recall from empty buffer" choice (as opposed to
+///   "replace any typed content"), picked because it can never destroy
+///   unsent text the user was actively composing.
+/// - Once already navigating (`cursor` is `Some`), further Up presses walk
+///   to the next-older entry regardless of the buffer's current content;
+///   at the oldest entry, Up is a no-op (stays put).
+fn history_navigate_up(
+    history: &[String],
+    cursor: Option<usize>,
+    prompt_is_empty: bool,
+) -> Option<(usize, String)> {
+    match cursor {
+        None if prompt_is_empty && !history.is_empty() => {
+            let index = history.len() - 1;
+            Some((index, history[index].clone()))
+        }
+        None => None,
+        Some(0) => None,
+        Some(index) => {
+            let index = index - 1;
+            Some((index, history[index].clone()))
+        }
+    }
+}
+
+/// Result of a Down navigation attempt (see [`history_navigate_down`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryDown {
+    /// Not currently navigating -- Down does nothing.
+    NoOp,
+    /// Walk to a newer entry: set the cursor to `index`, buffer to `text`.
+    Recall { index: usize, text: String },
+    /// Walking past the newest entry exits the walk entirely: cursor back
+    /// to `None`, buffer back to empty -- shell-like "keep going forward
+    /// and land back on a blank line".
+    ClearToEmpty,
+}
+
+/// Ticket 40 (prompt-history): mirrors [`history_navigate_up`] for Down.
+/// Pure and side-effect-free for the same testability reasons.
+fn history_navigate_down(history: &[String], cursor: Option<usize>) -> HistoryDown {
+    match cursor {
+        None => HistoryDown::NoOp,
+        Some(index) if index + 1 < history.len() => {
+            let index = index + 1;
+            HistoryDown::Recall {
+                index,
+                text: history[index].clone(),
+            }
+        }
+        Some(_) => HistoryDown::ClearToEmpty,
     }
 }
 
@@ -749,6 +1355,338 @@ mod tests {
         assert_eq!(
             route_input("/compact".to_string()),
             InputRoute::Command("/compact".to_string())
+        );
+    }
+
+    #[test]
+    fn history_navigate_up_starts_walk_from_empty_prompt_at_most_recent_entry() {
+        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let result = history_navigate_up(&history, None, true);
+        assert_eq!(result, Some((2, "third".to_string())));
+    }
+
+    #[test]
+    fn history_navigate_up_is_noop_when_prompt_not_empty_and_not_already_navigating() {
+        let history = vec!["only".to_string()];
+        let result = history_navigate_up(&history, None, false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn history_navigate_up_walks_to_older_entry_when_already_navigating() {
+        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let result = history_navigate_up(&history, Some(2), false);
+        assert_eq!(result, Some((1, "second".to_string())));
+    }
+
+    #[test]
+    fn history_navigate_up_is_noop_at_oldest_entry() {
+        let history = vec!["first".to_string(), "second".to_string()];
+        let result = history_navigate_up(&history, Some(0), false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn history_navigate_down_is_noop_when_not_navigating() {
+        let history = vec!["first".to_string()];
+        assert_eq!(history_navigate_down(&history, None), HistoryDown::NoOp);
+    }
+
+    #[test]
+    fn history_navigate_down_walks_to_newer_entry() {
+        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        assert_eq!(
+            history_navigate_down(&history, Some(0)),
+            HistoryDown::Recall { index: 1, text: "second".to_string() }
+        );
+    }
+
+    #[test]
+    fn history_navigate_down_clears_to_empty_past_newest_entry() {
+        let history = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(history_navigate_down(&history, Some(1)), HistoryDown::ClearToEmpty);
+    }
+
+    /// Ticket 41 (multiline-input) acceptance-adjacent unit test: Shift+Enter
+    /// (and Alt+Enter, its raw-PTY-portable equivalent -- see the
+    /// crossterm-decoding note on `handle_enter_key`) must insert a newline
+    /// into `prompt_input` rather than submitting -- asserted here by
+    /// showing the buffer keeps growing (never cleared the way the event
+    /// loop's `mem::take` on a real submit would empty it).
+    #[test]
+    fn shift_enter_inserts_newline_without_submitting() {
+        let mut state = AppState {
+            prompt_input: "line one".to_string(),
+            ..Default::default()
+        };
+
+        let inserted = handle_enter_key(&mut state, KeyModifiers::SHIFT);
+
+        assert!(inserted, "expected Shift+Enter to insert a newline, not submit");
+        assert_eq!(
+            state.prompt_input, "line one\n",
+            "expected the newline to be appended and the buffer preserved rather than cleared/submitted"
+        );
+
+        // Alt+Enter must behave identically (both are treated as "insert a
+        // newline" per the ticket).
+        let inserted_alt = handle_enter_key(&mut state, KeyModifiers::ALT);
+        assert!(inserted_alt, "expected Alt+Enter to insert a newline, not submit");
+        assert_eq!(state.prompt_input, "line one\n\n");
+
+        // A plain Enter (no ALT/SHIFT) must NOT be treated as a newline
+        // insert -- that's the event loop's cue to submit instead.
+        let inserted_plain = handle_enter_key(&mut state, KeyModifiers::NONE);
+        assert!(!inserted_plain, "expected plain Enter not to insert a newline");
+        assert_eq!(state.prompt_input, "line one\n\n", "plain Enter must not modify the buffer");
+    }
+
+    /// Ticket 42 (editor-integration) unit test: `edit_buffer_with_editor`
+    /// writes the given buffer to a temp file, runs the given (scripted, for
+    /// this test) editor command against it, and reads the edited contents
+    /// back once the process exits -- exercised here with a tiny
+    /// non-interactive shell script standing in for a real interactive
+    /// `$EDITOR`, since this unit test (unlike the PTY acceptance test in
+    /// `crates/rokr/tests/tui_test.rs`) has no live terminal to
+    /// suspend/resume.
+    #[test]
+    fn editor_suspend_writes_buffer_to_temp_file_and_reloads_edited_contents_on_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_dir = std::env::temp_dir().join(format!(
+            "rokr-tui-editor-unit-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&script_dir).expect("failed to create script dir");
+        let script_path = script_dir.join("fake_editor.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf '\\nedited by script\\n' >> \"$1\"\n")
+            .expect("failed to write fake editor script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("failed to stat fake editor script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)
+            .expect("failed to make fake editor script executable");
+
+        let result = edit_buffer_with_editor(
+            "original line",
+            script_path.to_str().expect("script path should be valid utf-8"),
+        )
+        .expect("scripted editor should succeed");
+
+        assert_eq!(
+            result, "original line\nedited by script",
+            "expected the buffer written to the temp file, plus the scripted editor's \
+             appended line, read back with the trailing newline trimmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    /// F-005 (argus review, security): the temp file `edit_buffer_with_editor`
+    /// writes the prompt buffer to must be created with owner-only
+    /// (`0600`) permissions from the moment it's created -- never briefly
+    /// world-readable, and never silently following/clobbering a
+    /// pre-planted symlink at the same predictable path. Proven here by
+    /// having the scripted "editor" `stat` its own `$1` argument (the temp
+    /// file) and record the octal mode into a marker file this test can
+    /// read back after the process exits and the temp file is deleted.
+    #[test]
+    fn edit_buffer_with_editor_creates_temp_file_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_dir = std::env::temp_dir().join(format!(
+            "rokr-tui-editor-perm-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&script_dir).expect("failed to create script dir");
+        let script_path = script_dir.join("permission_check_editor.sh");
+        let marker_path = script_dir.join("perm_marker.txt");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nstat -f '%Lp' \"$1\" > {marker_path:?} 2>/dev/null || stat -c '%a' \"$1\" > {marker_path:?}\n"
+            ),
+        )
+        .expect("failed to write permission-check editor script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("failed to stat permission-check editor script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)
+            .expect("failed to make permission-check editor script executable");
+
+        edit_buffer_with_editor("content", script_path.to_str().expect("script path should be valid utf-8"))
+            .expect("scripted editor should succeed");
+
+        let mode = std::fs::read_to_string(&marker_path)
+            .expect("marker file should have been written by the script")
+            .trim()
+            .to_string();
+        assert_eq!(
+            mode, "600",
+            "expected the editor temp file to be created with mode 0600, got: {mode}"
+        );
+
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    /// F-010 (argus review, security): `editor_command` is spawned through
+    /// the user's own shell (`sh -c`), not a naive `split_whitespace`, so a
+    /// quoted argument (e.g. `EDITOR="code --wait --user-data-dir='/some
+    /// path'"`) is parsed the same way the user's own shell would parse it.
+    /// `$1` here is the quoted `"hello world"` token from `editor_command`
+    /// below; `$2` is the real temp file path `edit_buffer_with_editor`
+    /// appends. If the shell correctly parsed the quotes, `$1` arrives as
+    /// ONE argument (`hello world`, no embedded quote characters); a naive
+    /// pre-fix whitespace split would instead have passed the literal
+    /// tokens `"hello` and `world"` as two separate args and shifted `$2`
+    /// to the wrong value entirely.
+    #[test]
+    fn editor_command_with_quoted_argument_is_parsed_by_shell_not_naive_whitespace_split() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_dir = std::env::temp_dir().join(format!(
+            "rokr-tui-editor-quoted-arg-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&script_dir).expect("failed to create script dir");
+        let script_path = script_dir.join("quoted_arg_editor.sh");
+        std::fs::write(&script_path, "#!/bin/sh\nprintf '%s' \"$1\" >> \"$2\"\n")
+            .expect("failed to write quoted-arg editor script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("failed to stat quoted-arg editor script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)
+            .expect("failed to make quoted-arg editor script executable");
+
+        let editor_command = format!(
+            "{} \"hello world\"",
+            script_path.to_str().expect("script path should be valid utf-8")
+        );
+        let result = edit_buffer_with_editor("original", &editor_command)
+            .expect("scripted editor with a quoted argument should succeed");
+
+        assert_eq!(
+            result, "originalhello world",
+            "expected the quoted \"hello world\" argument to arrive as a single, correctly-parsed \
+             value appended after the pre-existing buffer content"
+        );
+
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    /// F-009 (argus review): `$EDITOR` set to an empty or whitespace-only
+    /// string (e.g. `EDITOR=""` in a script-generated environment) must
+    /// fall back to `vi`, the same as `$EDITOR` being unset entirely --
+    /// not surface a confusing "no editor command to run" error.
+    #[test]
+    fn resolve_editor_command_falls_back_to_vi_when_env_value_is_missing_or_blank() {
+        assert_eq!(resolve_editor_command(None), "vi");
+        assert_eq!(resolve_editor_command(Some(String::new())), "vi");
+        assert_eq!(resolve_editor_command(Some("   ".to_string())), "vi");
+        assert_eq!(resolve_editor_command(Some("code --wait".to_string())), "code --wait");
+    }
+
+    /// Ticket 43 (mouse-scroll-status-line): mouse-wheel scroll adjusts
+    /// `AppState.view_scroll_offset` and nothing else -- in particular, it
+    /// must never touch `prompt_input`, since scrolling is scoped to the
+    /// View pane's scrollback only.
+    #[test]
+    fn mouse_scroll_event_adjusts_view_offset_without_touching_prompt_buffer() {
+        let mut state = AppState {
+            prompt_input: "unsent draft".to_string(),
+            ..Default::default()
+        };
+
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollUp, false);
+        assert_eq!(state.view_scroll_offset, SCROLL_LINES_PER_TICK);
+        assert_eq!(state.prompt_input, "unsent draft");
+
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollUp, false);
+        assert_eq!(state.view_scroll_offset, SCROLL_LINES_PER_TICK * 2);
+
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollDown, false);
+        assert_eq!(state.view_scroll_offset, SCROLL_LINES_PER_TICK);
+        assert_eq!(
+            state.prompt_input, "unsent draft",
+            "mouse scrolling must never touch the prompt buffer"
+        );
+
+        // A permission prompt showing must block the scroll from moving at
+        // all, per PRD decision 6.
+        let offset_before = state.view_scroll_offset;
+        state.view_scroll_offset =
+            adjust_view_scroll_offset(state.view_scroll_offset, MouseEventKind::ScrollUp, true);
+        assert_eq!(
+            state.view_scroll_offset, offset_before,
+            "scrolling must not affect an open permission prompt"
+        );
+    }
+
+    /// Ticket 43 (mouse-scroll-status-line): the Header block's status line
+    /// renders elapsed session time (formatted mm:ss, or hh:mm:ss once past
+    /// an hour) and a context-usage percentage derived from
+    /// `AppState.session_status`, once a turn's usage has been reported.
+    #[test]
+    fn status_line_renders_elapsed_time_and_context_usage_percentage_from_session_status() {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            elapsed: Duration::from_secs(125), // 02:05
+            session_status: Some(SessionStatus { context_percent: 0.42 }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rendered: String = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("02:05"),
+            "expected the header to show elapsed time 02:05, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("42%"),
+            "expected the header to show a 42% context-usage figure, got: {rendered:?}"
+        );
+
+        // Past an hour, the formatter switches to hh:mm:ss.
+        let long_state = AppState {
+            elapsed: Duration::from_secs(3725), // 01:02:05
+            ..Default::default()
+        };
+        terminal.draw(|frame| draw(frame, &long_state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("01:02:05"),
+            "expected elapsed time past the one-hour mark to render as \
+             hh:mm:ss, got: {rendered:?}"
         );
     }
 }

@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rokr-core = { path = "../rokr-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+ulid = "1"

@@ -58,6 +58,7 @@ impl PreviewableTool for WriteTool {
             Err(e) => return Err(ToolError::Io(e)),
         };
         Ok(Preview::Diff {
+            path: input.path,
             old,
             new: input.content,
         })
@@ -91,6 +92,7 @@ mod tests {
         assert_eq!(
             preview,
             Preview::Diff {
+                path: file_path.to_string_lossy().into_owned(),
                 old: String::new(),
                 new: "new content".to_string()
             }
