@@ -523,7 +523,20 @@ async fn main() -> ExitCode {
             // borrow, not ownership, so no `.clone()` is required. Consulted
             // via the `resolve_custom_command` closure built below, right
             // before the `rokr_tui::run` call.
-            let command_registry = rokr_app::CommandRegistry::discover_user_scope(&config_dir);
+            //
+            // Ticket 64 (custom-command-project-scope-and-trust-boundary):
+            // project-scope commands (`<cwd>/.rokr/commands/*.md`) are
+            // discovered from the same already-resolved `cwd` used above for
+            // memory loading, then merged OVER the user-scope registry so a
+            // project's own command shadows a same-named personal one (ADR
+            // 0014, decision 3). A `cwd` that couldn't be resolved simply
+            // skips project-scope discovery, same as it already does for
+            // memory loading above -- not an error.
+            let mut command_registry = rokr_app::CommandRegistry::discover_user_scope(&config_dir);
+            if let Some(cwd) = cwd.as_deref() {
+                command_registry
+                    .merge_overriding(rokr_app::CommandRegistry::discover_project_scope(cwd));
+            }
             // Ticket 62 (memory-slash-command-opens-editor): `/memory`'s
             // path-resolver closure (built below, after `submit`/`command`)
             // needs its own clones of `cwd` and `config_dir` -- cloned here,

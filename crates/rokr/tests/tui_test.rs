@@ -12749,3 +12749,423 @@ async fn typing_discovered_user_command_expands_template_and_submits_through_ord
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// Ticket 64 (custom-command-project-scope-and-trust-boundary) acceptance
+/// test: a project-scope `.rokr/commands/deploy.md` template, discovered
+/// from the spawned process's cwd, must expand and submit through the same
+/// ordinary path ticket 63 proved for user-scope commands -- ALONGSIDE a
+/// user-scope command (`my-command.md`, mirroring
+/// `typing_discovered_user_command_expands_template_and_submits_through_ordinary_path`),
+/// proving project-scope discovery happens in ADDITION to user-scope, not
+/// instead of it. Asserts on the captured request bodies (via
+/// `mock_server.received_requests()`) that each command's EXPANDED template
+/// text went out over the wire, in submission order.
+#[tokio::test]
+async fn project_scope_command_discovered_from_dot_rokr_commands_directory_alongside_user_scope() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let canned_response = "MockedAssistantReplyForProjectScopeCommandTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-project-scope-command",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-project-scope-command");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-project-scope-command");
+    let project_dir = unique_temp_dir("project-scope-command-project");
+
+    // Project-scope fixture: `.rokr/commands/deploy.md` under the project
+    // directory the spawned process's cwd will be set to.
+    let project_commands_dir = project_dir.join(".rokr").join("commands");
+    std::fs::create_dir_all(&project_commands_dir)
+        .expect("failed to create fixture project-scope commands directory");
+    std::fs::write(
+        project_commands_dir.join("deploy.md"),
+        "---\ndescription: test\n---\nDeploying: $ARGUMENTS",
+    )
+    .expect("failed to write fixture deploy.md");
+
+    // User-scope fixture: a DIFFERENTLY-named command, to prove project
+    // scope is discovered ALONGSIDE user scope, not instead of it.
+    let user_commands_dir = xdg_config_home.join("rokr").join("commands");
+    std::fs::create_dir_all(&user_commands_dir)
+        .expect("failed to create fixture user-scope commands directory");
+    std::fs::write(
+        user_commands_dir.join("my-command.md"),
+        "---\ndescription: test\n---\nHandle: $ARGUMENTS",
+    )
+    .expect("failed to write fixture my-command.md");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-openai-api-key");
+    cmd.cwd(&project_dir);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/deploy prod\r")
+        .expect("failed to write /deploy invocation to pty");
+
+    let first_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response after /deploy prod; got: \
+         {output:?}"
+    );
+
+    writer
+        .write_all(b"/my-command foo\r")
+        .expect("failed to write /my-command invocation to pty");
+
+    // Wait for a SECOND outgoing request to have landed at the mock server,
+    // proving /my-command also round-tripped through the ordinary submit
+    // path (not just re-rendering the first response already in `output`).
+    // Keeps draining `rx` into `output` on every poll, same as the
+    // render/response wait loops above -- otherwise the pty's output buffer
+    // fills up while nobody reads it and the child blocks on its own
+    // stdout write, wedging it before it ever processes the later `q`.
+    let second_request_deadline = Instant::now() + Duration::from_secs(10);
+    let mut received_requests = Vec::new();
+    while Instant::now() < second_request_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        received_requests = mock_server.received_requests().await.expect(
+            "mock server should have recorded received requests \
+             (make sure the request recorder wasn't disabled)",
+        );
+        if received_requests.len() >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !output.contains("unknown command: /deploy"),
+        "expected the project-scope discovered /deploy command to be recognized rather than \
+         falling through to the built-in dispatcher's \"unknown command\" arm; got: {output:?}"
+    );
+    assert!(
+        !output.contains("unknown command: /my-command"),
+        "expected the user-scope discovered /my-command command to still be recognized \
+         alongside project-scope discovery; got: {output:?}"
+    );
+
+    assert_eq!(
+        received_requests.len(),
+        2,
+        "expected exactly two outgoing requests to /chat/completions -- one for /deploy prod, \
+         one for /my-command foo; got: {received_requests:?}"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains("Deploying: prod"),
+        "expected the first outgoing request body to contain the EXPANDED project-scope \
+         template text ('Deploying: prod'); got body: {first_request_body:?}"
+    );
+    let second_request_body = String::from_utf8_lossy(&received_requests[1].body).into_owned();
+    assert!(
+        second_request_body.contains("Handle: foo"),
+        "expected the second outgoing request body to contain the EXPANDED user-scope \
+         template text ('Handle: foo'); got body: {second_request_body:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// Ticket 64 (custom-command-project-scope-and-trust-boundary) acceptance
+/// test locking in ADR 0014's trust boundary at the full-binary level: a
+/// project-scope command body containing a `!`-prefixed line that LOOKS
+/// like inline shell-execution syntax must never actually spawn a
+/// subprocess -- `CommandRegistry::expand_template` has no shell-execution
+/// semantics, so the text is expected to reach the outgoing request body
+/// unexpanded, byte-for-byte. Proves this two ways: (1) a marker file the
+/// embedded `!touch ...` would have created is asserted absent, and (2) the
+/// literal `!touch ...` text is asserted present, unexpanded, in the
+/// captured outgoing request body -- ruling out the (wrong) alternate
+/// explanation that `/deploy` was simply unrecognized.
+#[tokio::test]
+async fn project_scope_command_containing_bang_prefixed_syntax_expands_to_inert_text_with_no_process_spawned(
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let canned_response = "MockedAssistantReplyForBangPrefixTrustBoundaryTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-bang-prefix-trust-boundary",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-bang-prefix-trust-boundary");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-bang-prefix-trust-boundary");
+    let project_dir = unique_temp_dir("bang-prefix-trust-boundary-project");
+    let marker_path =
+        unique_temp_dir("bang-marker-parent").join("should-never-be-created.marker");
+
+    let project_commands_dir = project_dir.join(".rokr").join("commands");
+    std::fs::create_dir_all(&project_commands_dir)
+        .expect("failed to create fixture project-scope commands directory");
+    std::fs::write(
+        project_commands_dir.join("deploy.md"),
+        format!(
+            "---\ndescription: test\n---\nDeploy step: !touch {} && echo pwned",
+            marker_path.display()
+        ),
+    )
+    .expect("failed to write fixture deploy.md");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-openai-api-key");
+    cmd.cwd(&project_dir);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/deploy\r")
+        .expect("failed to write /deploy invocation to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response after /deploy, proving \
+         the normal submit path still completed; got: {output:?}"
+    );
+
+    assert!(
+        !marker_path.exists(),
+        "expected the '!touch ...' text in the command template to NEVER have been executed as \
+         a subprocess -- found marker file at {marker_path:?}, proving a shell command was \
+         spawned"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains("Deploy step: !touch")
+            && first_request_body.contains("&& echo pwned"),
+        "expected the outgoing request body to contain the LITERAL, unexpanded '!'-prefixed \
+         text, proving it reached the model as inert text rather than being executed or \
+         stripped; got body: {first_request_body:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let _ = std::fs::remove_dir_all(marker_path.parent().unwrap());
+}
