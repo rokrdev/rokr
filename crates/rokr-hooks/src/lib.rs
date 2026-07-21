@@ -149,15 +149,27 @@ pub async fn execute_hook(command: &str, payload: &HookPayload, timeout: Duratio
         }
     };
 
-    let mut child = match tokio::process::Command::new("sh")
+    let mut spawn_command = tokio::process::Command::new("sh");
+    spawn_command
         .arg("-c")
         .arg(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    // Argus F-006: makes the child the leader of a brand-new process group
+    // (pgid == its own pid) rather than inheriting rokr's -- so a compound
+    // or backgrounded command's grandchildren (`cmd & sleep 30`, `a && b`)
+    // share ONE killable group instead of scattering as orphans the
+    // existing `kill_on_drop` (which only ever signals the direct `sh`
+    // child) can't reach. Unix-only; falls back to the pre-existing
+    // single-child kill on other platforms.
+    #[cfg(unix)]
     {
+        spawn_command.process_group(0);
+    }
+
+    let mut child = match spawn_command.spawn() {
         Ok(child) => child,
         Err(err) => {
             return HookResult::NonBlockingFailure {
@@ -165,6 +177,10 @@ pub async fn execute_hook(command: &str, payload: &HookPayload, timeout: Duratio
             }
         }
     };
+    // Captured before `child` moves into `wait_with_output()` below --
+    // needed on the timeout branch to `killpg` the whole group.
+    #[cfg(unix)]
+    let child_pid = child.id();
 
     // Written on a separate task, concurrently with reading the child's
     // output below, rather than sequentially before it -- a hook that
@@ -191,10 +207,25 @@ pub async fn execute_hook(command: &str, payload: &HookPayload, timeout: Duratio
             }
         }
         Err(_elapsed) => {
+            // Argus F-006: SIGKILL the entire process group BEFORE the
+            // direct child alone gets killed below -- otherwise a
+            // grandchild (backgrounded or part of a compound command)
+            // outlives its parent as an orphan and keeps running.
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // SAFETY: `killpg` is a plain signal-delivery syscall; `pid`
+                // was read from a `Child` we just spawned and is a valid
+                // process/group id at the time of this call (or, if the
+                // group has already exited, a harmless no-op ESRCH).
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
             // `wait_with_output` owns `child` by value; dropping this whole
             // future on timeout drops that owned `child` too, and
-            // `kill_on_drop(true)` above makes THAT send a kill -- the hook
-            // process is reaped, never left to hang the caller.
+            // `kill_on_drop(true)` above makes THAT send a kill -- the
+            // direct hook process is reaped, never left to hang the caller
+            // (and is the only kill that happens on non-Unix platforms).
             return HookResult::NonBlockingFailure {
                 message: format!("hook timed out after {timeout:?}"),
             };
@@ -372,6 +403,49 @@ mod tests {
             !marker.exists(),
             "payload content must never be interpolated into the command line -- the embedded \
              shell metacharacters must not have executed"
+        );
+    }
+
+    /// Argus F-006: the timeout path previously only killed the direct `sh`
+    /// child (`kill_on_drop` on the `Child` handle alone), orphaning any
+    /// grandchild a compound/backgrounded command spawned -- the shell
+    /// backgrounds `(sleep 0.5 && touch <marker>)` via `&`, detaching it
+    /// from the direct child, then itself sleeps far longer than the
+    /// timeout. If only the direct child is killed, the backgrounded
+    /// grandchild survives as an orphan and creates the marker ~0.5s later
+    /// regardless. A correct process-group-wide kill must reap it too, so
+    /// the marker must never appear.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_timeout_kills_grandchild_process_via_process_group() {
+        let marker = unique_temp_marker("grandchild-killed");
+        let payload = HookPayload::PreToolUse {
+            tool_name: "bash".to_string(),
+            tool_input: serde_json::json!({}),
+        };
+
+        let command = format!("(sleep 0.5 && touch {}) & sleep 30", marker.display());
+
+        let result = execute_hook(&command, &payload, Duration::from_millis(150)).await;
+
+        match result {
+            HookResult::NonBlockingFailure { message } => {
+                assert!(
+                    message.to_lowercase().contains("time"),
+                    "expected a timeout message, got: {message:?}"
+                );
+            }
+            other => panic!("expected HookResult::NonBlockingFailure on timeout, got {other:?}"),
+        }
+
+        // Give the grandchild's own would-be 0.5s delay time to elapse --
+        // if it survived the timeout kill, it would have created the marker
+        // well within this window.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !marker.exists(),
+            "grandchild process must be killed alongside its parent on hook timeout \
+             (process-group SIGKILL), but the marker file exists, meaning it survived"
         );
     }
 

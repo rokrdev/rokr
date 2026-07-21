@@ -10876,18 +10876,21 @@ async fn two_mcp_servers_with_colliding_tool_name_both_reachable_by_namespaced_n
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
 
-/// Ticket 46 (mcp-namespace-multi-server-freeze) acceptance test: PRD "MCP
-/// caching and session semantics" -- "the MCP tool set is frozen for the
-/// lifetime of a session ... never mutated turn-to-turn". A server held in
-/// `Starting` (via the `FAKE_MCP_SERVER_READY_GATE_FILE` ticket-46 fixture
-/// knob) contributes zero tools to the FIRST submit's frozen snapshot;
-/// releasing the gate and letting the server reach `Ready` afterwards must
-/// NOT retroactively add its tool to a LATER submit in the same session --
-/// proving the snapshot really is taken once (at first use) and reused,
-/// not recomputed fresh every turn (ticket 45's original, now-superseded
-/// behavior).
+/// PC-1 ruling acceptance test (supersedes ticket 46's whole-session
+/// `OnceLock` freeze and this test's original "must NOT retroactively add
+/// its tool" semantics): a server's tool contribution joins the session
+/// snapshot EXACTLY ONCE, at its own first `Ready` -- never re-frozen for
+/// the whole session up front. A server held in `Starting` (via the
+/// `FAKE_MCP_SERVER_READY_GATE_FILE` fixture knob) contributes zero tools
+/// to turn 1's outgoing tool list; releasing the gate and letting it reach
+/// `Ready` before turn 2 means it DOES join and appear in turn 2's outgoing
+/// tool list -- this is the intended one-time auto-join, not a forbidden
+/// "turn-to-turn mutation" (an already-joined server's own contribution
+/// staying byte-for-byte identical turn-to-turn is the invariant that
+/// still holds; a not-yet-joined server joining for the first time is not
+/// a mutation of anything).
 #[tokio::test]
-async fn mid_session_server_tool_list_change_does_not_alter_already_frozen_snapshot() {
+async fn slow_server_joins_snapshot_on_first_ready_reached_between_turns() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -11093,14 +11096,22 @@ async fn mid_session_server_tool_list_change_does_not_alter_already_frozen_snaps
         "expected at least two outgoing requests (one per turn), got: {}",
         received_requests.len()
     );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        !first_request_body.contains(&slow_server_qualified_name),
+        "expected turn 1's outgoing request to NOT contain '{slow_server_qualified_name}' -- \
+         'slow' was still gated (Starting), never having reached Ready, so it had not yet \
+         joined the session's tool set; got body: {first_request_body:?}"
+    );
     let second_request_body =
         String::from_utf8_lossy(&received_requests[1].body).into_owned();
     assert!(
-        !second_request_body.contains(&slow_server_qualified_name),
-        "expected turn 2's outgoing request to NOT contain '{slow_server_qualified_name}' -- \
-         the session's MCP tool snapshot was taken (frozen empty) on turn 1, before 'slow' \
-         became Ready, and must not have picked up its tool on turn 2 just because the server \
-         became ready in between; got body: {second_request_body:?}"
+        second_request_body.contains(&slow_server_qualified_name),
+        "expected turn 2's outgoing request to CONTAIN '{slow_server_qualified_name}' -- PC-1: \
+         'slow' reached Ready (and therefore joined) between turn 1 and turn 2, and a server's \
+         first Ready is exactly when it's supposed to join the session's tool set, not \
+         something a stale whole-session freeze should hold back until a future session; got \
+         body: {second_request_body:?}"
     );
 
     let _ = std::fs::remove_dir_all(&home);

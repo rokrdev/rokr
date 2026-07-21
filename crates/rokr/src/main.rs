@@ -617,11 +617,11 @@ async fn main() -> ExitCode {
             // notice instead of crashing or blocking the rest of rokr.
             // Replaces ticket 44's `ROKR_MCP_SERVER` env-var interim wiring
             // wholesale (see docs/adr/0011-rokr-mcp-crate-boundary.md's
-            // Consequences section). Ticket 46
-            // (mcp-namespace-multi-server-freeze): the tool-set snapshot
-            // built from these handles is frozen for the session's lifetime
-            // (`mcp_tools_frozen` below), NOT re-read fresh on every
-            // `submit` as ticket 45 originally left it.
+            // Consequences section). PC-1 ruling (supersedes ticket 46's
+            // whole-session freeze): each server's contribution instead
+            // freezes individually at its own first `Ready`
+            // (`McpServerHandle::joined`) -- see `submit`'s
+            // `mcp_tools_snapshot` below.
             let (mcp_notice_tx, mcp_notice_rx) = std::sync::mpsc::channel::<String>();
             // Bridges rokr-mcp's plain `String` notices (rokr-mcp depends
             // on rokr-core only -- ADR 0011 -- so it can't know about
@@ -723,19 +723,21 @@ async fn main() -> ExitCode {
                     .collect(),
             );
 
-            // Ticket 46 (mcp-namespace-multi-server-freeze), PRD "MCP
-            // caching and session semantics": "the MCP tool set is frozen
-            // for the lifetime of a session ... snapshotted once servers
-            // report ready (or at submit time) ... never mutated
-            // turn-to-turn". `OnceLock` gives exactly that: the FIRST
-            // `submit` call that actually needs MCP tools (Build tier)
-            // computes `rokr_mcp::snapshot_tools` once and every later
-            // `submit` in this session -- even one issued after more
-            // servers/tools have since become `Ready` -- reuses that exact
-            // `Vec` instead of recomputing it. A session that never enters
-            // Build tier simply never initializes this cell.
-            let mcp_tools_frozen: Arc<std::sync::OnceLock<Vec<Arc<rokr_mcp::McpTool>>>> =
-                Arc::new(std::sync::OnceLock::new());
+            // PC-1 ruling (supersedes ticket 46's "the MCP tool set is
+            // frozen for the lifetime of a session" whole-session
+            // `OnceLock` freeze): each server's tool contribution now
+            // freezes individually, in `McpServerHandle::joined`, at that
+            // server's own first `Ready` (or a later explicit `/mcp
+            // reconnect` success) -- see `rokr_mcp::snapshot_tools`'s doc
+            // comment. `submit` below therefore calls `snapshot_tools`
+            // FRESH every turn rather than caching it in a `OnceLock`:
+            // that's cheap (no I/O, just iterating handles' already-frozen
+            // `joined` state) and always safe, since the underlying
+            // per-server freeze is what actually provides the "no
+            // turn-to-turn mutation of an already-joined server" guarantee
+            // -- a session simply sees whichever servers have joined AS OF
+            // that turn, in deterministic sorted order.
+            let submit_mcp_notice_tx = mcp_notice_tx.clone();
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
@@ -749,7 +751,7 @@ async fn main() -> ExitCode {
                 let data_dir = data_dir.clone();
                 let status_tx = status_tx.clone();
                 let mcp_server_handles = mcp_server_handles.clone();
-                let mcp_tools_frozen = mcp_tools_frozen.clone();
+                let mcp_notice_tx = submit_mcp_notice_tx.clone();
                 let mcp_http_origins = mcp_http_origins.clone();
                 let hooks_config = hooks_config_for_submit.clone();
                 async move {
@@ -981,29 +983,31 @@ async fn main() -> ExitCode {
                         subagent_request_permission,
                     );
 
-                    // Ticket 46 (mcp-namespace-multi-server-freeze), PRD
-                    // "MCP caching and session semantics": the session's MCP
-                    // tool-set snapshot -- sorted deterministically by
-                    // (server, tool) via `rokr_mcp::snapshot_tools` -- is
-                    // computed AT MOST ONCE per session, the first time a
-                    // Build-tier `submit` needs it, and reused verbatim by
-                    // every later `submit`, even one issued after more
-                    // servers/tools have since become `Ready` ("a server
-                    // reconnecting mid-session with a changed tool list is
-                    // treated as a one-time accepted cache invalidation for
-                    // that session, not a per-turn concern"). Supersedes
-                    // ticket 45's original "fresh snapshot every submit"
-                    // behavior, which would otherwise let the tool-spec list
-                    // -- and therefore the cached prompt prefix -- shuffle
-                    // turn-to-turn. Declared here, as owned `Arc<McpTool>`s,
-                    // BEFORE `tools` below so the `&dyn ExecutableTool`
-                    // references pushed into `tools` borrow from something
-                    // that outlives the `run_tool_loop` call.
+                    // PC-1 ruling (supersedes ticket 46's whole-session
+                    // `OnceLock` freeze): the session's MCP tool-set
+                    // snapshot -- sorted deterministically by (server,
+                    // tool) via `rokr_mcp::snapshot_tools` -- is now
+                    // recomputed fresh every Build-tier `submit`, but each
+                    // individual server's contribution within it is
+                    // ALREADY frozen (`McpServerHandle::joined`, written at
+                    // most once per server: that server's own first
+                    // `Ready`, or again on a later explicit `/mcp
+                    // reconnect` success -- never on an automatic
+                    // Ready-after-Fail flap). So a server that's still
+                    // `Starting` on turn 1 and reaches `Ready` before turn
+                    // 2 DOES appear starting turn 2 (this is the intended,
+                    // one-time auto-join, not "mutation"); a server that
+                    // was already joined on turn 1 contributes the EXACT
+                    // SAME tools on turn 2 even if its live tool list
+                    // somehow changed, since this reads each server's
+                    // frozen `joined` snapshot, never its live one.
+                    // Declared here, as owned `Arc<McpTool>`s, BEFORE
+                    // `tools` below so the `&dyn ExecutableTool` references
+                    // pushed into `tools` borrow from something that
+                    // outlives the `run_tool_loop` call.
                     let mcp_tools_snapshot: Vec<Arc<rokr_mcp::McpTool>> =
                         if matches!(agent, AgentTier::Build) {
-                            mcp_tools_frozen
-                                .get_or_init(|| rokr_mcp::snapshot_tools(&mcp_server_handles))
-                                .clone()
+                            rokr_mcp::snapshot_tools(&mcp_server_handles, &mcp_notice_tx)
                         } else {
                             Vec::new()
                         };
@@ -1477,10 +1481,25 @@ async fn main() -> ExitCode {
                             .iter()
                             .find(|handle| handle.name == server_name)
                         {
-                            Some(handle) => {
-                                handle.reconnect();
-                                format!("Reconnecting MCP server '{server_name}'.")
-                            }
+                            Some(handle) => match mcp_reconnect_gate(&handle.status()) {
+                                Ok(()) => {
+                                    handle.reconnect();
+                                    format!("Reconnecting MCP server '{server_name}'.")
+                                }
+                                // F-002: PC-1/F-002's "auto-join is
+                                // once-per-server, re-entry only via
+                                // explicit reconnect" guard only makes
+                                // sense if reconnect itself is gated to
+                                // `Degraded` servers -- reconnecting an
+                                // already-`Ready`/`Starting` server would
+                                // spin up a second concurrent lifecycle
+                                // task for no reason (F-002's race the
+                                // generation fence guards against).
+                                Err(state_word) => format!(
+                                    "server '{server_name}' is {state_word}; reconnect only \
+                                     applies to degraded servers"
+                                ),
+                            },
                             None => format!("no such MCP server: '{server_name}'"),
                         };
                     }
@@ -1645,6 +1664,55 @@ fn format_tool_call_permission_text(
     text
 }
 
+/// F-002: gates `/mcp reconnect <server>` to `Degraded` servers only --
+/// reconnecting a `Starting` or already-`Ready` server would spin up a
+/// second, redundant lifecycle task racing the one already running (the
+/// exact scenario F-002's generation fence in `rokr-mcp` exists to survive,
+/// but there's no reason to invite it from a command whose whole point is
+/// "this server is broken, try again"). `Ok(())` means reconnect may
+/// proceed; `Err(word)` carries the state word for the refusal message.
+/// A free function (rather than inlined at the one call site) so it's
+/// unit-testable without spinning up a real `McpServerHandle`/lifecycle
+/// task.
+fn mcp_reconnect_gate(status: &rokr_mcp::McpServerStatus) -> Result<(), &'static str> {
+    match status {
+        rokr_mcp::McpServerStatus::Degraded { .. } => Ok(()),
+        rokr_mcp::McpServerStatus::Starting => Err("starting"),
+        rokr_mcp::McpServerStatus::Ready => Err("connected"),
+    }
+}
+
+#[cfg(test)]
+mod mcp_reconnect_gate_tests {
+    use super::*;
+
+    /// F-002 done-when: reconnect is refused for a `Ready` (connected)
+    /// server -- only a `Degraded` server may reconnect.
+    #[test]
+    fn reconnect_on_connected_server_is_refused() {
+        let result = mcp_reconnect_gate(&rokr_mcp::McpServerStatus::Ready);
+        assert_eq!(
+            result,
+            Err("connected"),
+            "expected reconnect to be refused for an already-connected server"
+        );
+    }
+
+    #[test]
+    fn reconnect_on_starting_server_is_refused() {
+        let result = mcp_reconnect_gate(&rokr_mcp::McpServerStatus::Starting);
+        assert_eq!(result, Err("starting"));
+    }
+
+    #[test]
+    fn reconnect_on_degraded_server_is_permitted() {
+        let result = mcp_reconnect_gate(&rokr_mcp::McpServerStatus::Degraded {
+            reason: "boom".to_string(),
+        });
+        assert_eq!(result, Ok(()));
+    }
+}
+
 /// Ticket 51 (mcp-hooks-introspection), `/mcp`: renders one line per
 /// configured MCP server (PRD "connection state (connected/degraded/
 /// disabled)"), sorted by name for deterministic output. `configs` is the
@@ -1688,9 +1756,17 @@ fn format_mcp_listing(
                     ("state=starting".to_string(), Vec::new())
                 }
                 Some(rokr_mcp::McpServerStatus::Ready) => {
+                    // PC-1 ruling: reflects this server's live JOIN state
+                    // (`joined`, frozen at its own first Ready or a later
+                    // explicit reconnect success) rather than its raw live
+                    // `tools()` -- this is what's actually contributing to
+                    // every session's assembled snapshot right now, so
+                    // there's no separate "restart to pick up tools" note
+                    // needed: whatever's listed here is already active.
                     let tool_names = handle
                         .expect("handle present for a Ready status")
-                        .tools()
+                        .joined()
+                        .unwrap_or_default()
                         .iter()
                         .map(|tool| tool.name().to_string())
                         .collect::<Vec<_>>();

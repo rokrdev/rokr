@@ -48,7 +48,11 @@ reqwest = { version = "0.13", default-features = false }
 http = "1"
 
 [dev-dependencies]
-tokio = { workspace = true }
+# F-001: `test-util` (paused/advanceable virtual time) lets the
+# never-resolving-connector timeout test fast-forward through
+# `CONNECT_TIMEOUT` * `MAX_CONNECT_ATTEMPTS` without a real multi-minute
+# wait. Additive to the workspace `tokio` dep, dev-only.
+tokio = { workspace = true, features = ["test-util"] }
 # Ticket 48 (mcp-http-transport): fake HTTP MCP server fixture for
 # `http_transport_sends_static_token_header_on_every_request` -- mirrors
 # how `crates/rokr/tests/tui_test.rs` already uses wiremock for its own

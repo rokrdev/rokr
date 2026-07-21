@@ -9,6 +9,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rokr_core::{ExecutableTool, PermissionPayload, ToolSpec};
@@ -174,13 +175,36 @@ pub enum McpServerStatus {
 /// Shared, introspectable state for one configured MCP server: current
 /// status plus the tools it contributes once ready. The background
 /// lifecycle task (spawned by `spawn_server_with_connector`) is the sole
-/// writer of `status`/`tools`; every reader (tool-set assembly in
+/// writer of `status`/`tools`/`joined`; every reader (tool-set assembly in
 /// `main.rs`, ticket 51's `/mcp` command) only ever reads through the
 /// accessor methods below.
 pub struct McpServerHandle {
     pub name: String,
     status: Arc<std::sync::Mutex<McpServerStatus>>,
     tools: Arc<std::sync::Mutex<Vec<Arc<McpTool>>>>,
+    /// PC-1 ruling (supersedes ticket 46's whole-session `OnceLock`
+    /// freeze): this server's FROZEN tool contribution to every session's
+    /// assembled snapshot -- `None` until this server has joined at least
+    /// once, `Some(tools)` from then on. Written exactly by
+    /// `run_lifecycle`'s success path, at most once per invocation: the
+    /// first time this server reaches `Ready` (whether that's the initial
+    /// spawn's bounded retry or, after `Degraded`, an explicit
+    /// `reconnect()`), overwriting any previous value. Deliberately NOT
+    /// cleared by a transport-level `Degraded` transition (F-003, set
+    /// directly by `McpTool::execute_boxed` on a failed call) or by
+    /// `reconnect()` itself before the new attempt succeeds -- a
+    /// mid-session tool call failure or a reconnect attempt still in
+    /// flight must never retroactively un-join tools already contributed
+    /// to the session snapshot.
+    joined: Arc<std::sync::Mutex<Option<Vec<Arc<McpTool>>>>>,
+    /// F-002: bumped by `reconnect()` before it re-spawns the lifecycle
+    /// task. `run_lifecycle` captures the generation value current AT THE
+    /// MOMENT IT WAS SPAWNED and re-checks it against this live counter
+    /// immediately before every `status`/`tools`/`joined` write; a
+    /// mismatch means a newer `reconnect()` has since superseded this
+    /// task, which then abandons silently instead of clobbering the newer
+    /// task's state with a stale result.
+    generation: Arc<AtomicU64>,
     /// Ticket 51 (mcp-hooks-introspection), `/mcp reconnect`: re-invokes
     /// this server's connect+`list_tools` retry loop from a fresh
     /// `Starting` state. Boxed/type-erased (rather than a second generic
@@ -196,38 +220,49 @@ impl McpServerHandle {
         self.status.lock().unwrap().clone()
     }
 
-    /// The current tool snapshot: empty before `Ready`, and permanently
-    /// empty for a `Degraded` server. Cloned out (cheap -- `Arc<McpTool>`
-    /// per entry) rather than borrowed, so a caller can build a tool-set
-    /// snapshot without holding this handle's lock.
+    /// The current LIVE tool list: empty before `Ready`, and permanently
+    /// empty for a `Degraded` server. This is NOT what a session's tool-set
+    /// snapshot is built from (see `joined`/`snapshot_tools` below) --
+    /// it's informational, reflecting this handle's state right now.
+    /// Cloned out (cheap -- `Arc<McpTool>` per entry) rather than borrowed,
+    /// so a caller doesn't need to hold this handle's lock.
     pub fn tools(&self) -> Vec<Arc<McpTool>> {
         self.tools.lock().unwrap().clone()
     }
 
+    /// PC-1 ruling: this server's FROZEN contribution to the session
+    /// snapshot -- `None` if it has never joined (never reached `Ready`),
+    /// `Some(tools)` from its first join onward. See `joined`'s doc comment
+    /// on the struct for exactly when this is written.
+    pub fn joined(&self) -> Option<Vec<Arc<McpTool>>> {
+        self.joined.lock().unwrap().clone()
+    }
+
     /// Ticket 51 (mcp-hooks-introspection), `/mcp reconnect`: resets this
     /// server back to `Starting` and re-spawns its connect+`list_tools`
-    /// retry loop from attempt 1. The exhausted bounded retry's backoff
-    /// state lived entirely on the stack of the now-finished
-    /// `run_lifecycle` task -- spawning a fresh one from attempt 1 IS
-    /// clearing it; there is no separate counter to reset. Also clears any
-    /// stale tool snapshot, though a `Degraded` server already has none
-    /// (PRD "MCP lifecycle": "contributes zero tools until a future manual
-    /// reconnect").
+    /// retry loop from attempt 1, fencing off the OLD lifecycle task first
+    /// (F-002) by bumping `generation` -- any write that in-flight task
+    /// still attempts afterward is silently discarded rather than racing
+    /// the new one. The exhausted bounded retry's backoff state lived
+    /// entirely on the stack of the now-superseded `run_lifecycle` task --
+    /// spawning a fresh one from attempt 1 IS clearing it; there is no
+    /// separate counter to reset. Also clears the LIVE tool snapshot
+    /// (`tools`), though a `Degraded` server already has none.
     ///
-    /// Deliberately does NOT touch any session's already-frozen MCP
-    /// tool-set snapshot (`mcp_tools_frozen`/`OnceLock` in `main.rs`,
-    /// ticket 46) -- that snapshot is a separate owned `Vec` cloned out via
-    /// `snapshot_tools` at the moment a session first needs it, so a
-    /// reconnect mid-session can only ever affect the NEXT session's
-    /// snapshot, never retroactively change tools already in flight for
-    /// calls already dispatched.
+    /// Deliberately does NOT touch `joined` -- PC-1's per-server frozen
+    /// session contribution is only overwritten by a NEW successful
+    /// `Ready` from the freshly-spawned lifecycle task below (a "rejoin"),
+    /// never blanked out just because a reconnect attempt STARTED; a
+    /// session that already saw this server's tools keeps seeing them
+    /// while the reconnect is still in flight.
     ///
-    /// Callable regardless of current status (not just `Degraded`) -- a
-    /// caller may restrict which states it allows reconnecting from
-    /// (`main.rs`'s `/mcp reconnect` does not bother; restarting an
-    /// already-`Ready` server from scratch is harmless), this method
-    /// itself has no opinion.
+    /// Callable regardless of current status -- a caller may restrict
+    /// which states it allows reconnecting from (`main.rs`'s `/mcp
+    /// reconnect` refuses anything but `Degraded`, PC-1/F-002's "auto-join
+    /// is once-per-server, re-entry only via explicit reconnect" guard),
+    /// this method itself has no opinion and always proceeds.
     pub fn reconnect(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         *self.status.lock().unwrap() = McpServerStatus::Starting;
         self.tools.lock().unwrap().clear();
         (*self.restart)();
@@ -235,22 +270,54 @@ impl McpServerHandle {
 }
 
 
-/// PRD "MCP caching and session semantics": builds one session's MCP
-/// tool-set snapshot from every configured server's CURRENT tools (empty
-/// for a server still `Starting` or permanently `Degraded`), sorted
-/// deterministically by `(server, tool)` -- not handle/server registration
-/// order, which is neither meaningful nor stable -- so the resulting
-/// tool-spec order (and therefore the cached prompt prefix) never shuffles
-/// between two snapshots taken over the same ready set. Pure and
-/// side-effect-free: calling this again reflects whatever the handles look
-/// like AT THAT MOMENT. Freezing the result for the lifetime of a session
-/// (calling this exactly once and reusing the owned `Vec` afterwards,
-/// never re-snapshotting turn-to-turn) is the CALLER's job -- `main.rs`
-/// (ticket 46, mcp-namespace-multi-server-freeze) does that with a
-/// `OnceLock`.
-pub fn snapshot_tools(handles: &[McpServerHandle]) -> Vec<Arc<McpTool>> {
-    let mut tools: Vec<Arc<McpTool>> = handles.iter().flat_map(|handle| handle.tools()).collect();
+/// PC-1 ruling (supersedes ticket 46's whole-session `OnceLock` freeze;
+/// PRD "MCP caching and session semantics"): builds the CURRENT joined
+/// tool-set from every server's frozen per-server contribution
+/// (`McpServerHandle::joined` -- `None`/not-yet-joined servers contribute
+/// nothing), sorted deterministically by `(server, tool)` -- not handle/
+/// server registration order, which is neither meaningful nor stable -- so
+/// ordering is a pure function of WHICH servers have joined, never of
+/// timing. A server's contribution here can only ever GROW the set (a new
+/// join) or stay the same turn-to-turn -- it never shrinks or reorders an
+/// already-joined server's tools, since `joined` itself is monotonic (see
+/// its doc comment). Callers (`main.rs`'s `submit`) call this fresh on
+/// every turn rather than caching the result themselves -- unlike ticket
+/// 46's now-superseded `OnceLock`, re-calling this is cheap (no I/O, just
+/// iterating handles) and always safe, since the underlying `joined`
+/// state it reads is itself already the frozen/monotonic part.
+///
+/// F-004: sanitization can make two distinct (server, tool) pairs collide
+/// on the same qualified `mcp__<server>__<tool>` name (e.g. servers "my
+/// server" and "my_server" both sanitize to "my_server"; or server "a__b"
+/// + tool "c" vs. server "a" + tool "b__c" both produce "mcp__a__b__c").
+/// After sorting, the FIRST (server, tool) pair to claim a qualified name
+/// wins; every later colliding entry is dropped and reported via
+/// `notice_tx` rather than silently shadowing the first (which is what
+/// "last write wins" `ToolSpec` lookup by name would otherwise do).
+pub fn snapshot_tools(
+    handles: &[McpServerHandle],
+    notice_tx: &std::sync::mpsc::Sender<String>,
+) -> Vec<Arc<McpTool>> {
+    let mut tools: Vec<Arc<McpTool>> = handles
+        .iter()
+        .filter_map(|handle| handle.joined())
+        .flatten()
+        .collect();
     tools.sort_by(|a, b| (&a.server, &a.tool_name).cmp(&(&b.server, &b.tool_name)));
+
+    let mut seen_qualified_names = std::collections::HashSet::new();
+    tools.retain(|tool| {
+        if seen_qualified_names.insert(tool.qualified_name.clone()) {
+            true
+        } else {
+            let _ = notice_tx.send(format!(
+                "MCP tool name collision: '{}' (server '{}', tool '{}') dropped -- \
+                 a different server/tool pair already claimed this qualified name",
+                tool.qualified_name, tool.server, tool.tool_name
+            ));
+            false
+        }
+    });
     tools
 }
 
@@ -259,6 +326,15 @@ pub fn snapshot_tools(handles: &[McpServerHandle]) -> Vec<Arc<McpTool>> {
 /// degraded", "no unbounded retry loop"). Ticket 51 adds a manual `/mcp
 /// reconnect` for after this is exhausted.
 const MAX_CONNECT_ATTEMPTS: u32 = 3;
+
+/// F-001: per-attempt bound on `connect()`/`list_tools()` each, so a
+/// hung `initialize` handshake (a server that accepts the connection but
+/// never replies) can't leave a server stuck in `Starting` forever -- a
+/// timed-out attempt now counts as a failed attempt (`last_error` set to
+/// "timed out during initialize") and proceeds through the same
+/// retry/backoff/degrade path a connection-refused or protocol-error
+/// failure already did.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(200 * attempt as u64)
@@ -302,6 +378,11 @@ where
 {
     let status = Arc::new(std::sync::Mutex::new(McpServerStatus::Starting));
     let tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let joined = Arc::new(std::sync::Mutex::new(None));
+    // F-002: generation 0 is the initial spawn below; `reconnect()` bumps
+    // this before re-invoking `spawn_lifecycle`, fencing off whichever
+    // task was already in flight.
+    let generation = Arc::new(AtomicU64::new(0));
     let notice_tx = Arc::new(std::sync::Mutex::new(notice_tx));
 
     let spawn_lifecycle: Arc<dyn Fn() + Send + Sync> = {
@@ -309,17 +390,29 @@ where
         let connect = connect.clone();
         let status = Arc::clone(&status);
         let tools = Arc::clone(&tools);
+        let joined = Arc::clone(&joined);
+        let generation = Arc::clone(&generation);
         let notice_tx = Arc::clone(&notice_tx);
         let auto_approve = Arc::clone(&auto_approve);
         Arc::new(move || {
             let sender = notice_tx.lock().unwrap().clone();
+            // F-002: read the CURRENT generation synchronously, before the
+            // task is even spawned, so this invocation's task is
+            // permanently stamped with the generation active at the
+            // moment it was started -- a later `reconnect()` bumping the
+            // live counter afterward is exactly what makes THIS task
+            // stale.
+            let my_generation = generation.load(Ordering::SeqCst);
             tokio::spawn(run_lifecycle(
                 name.clone(),
                 connect.clone(),
                 Arc::clone(&status),
                 Arc::clone(&tools),
+                Arc::clone(&joined),
                 sender,
                 Arc::clone(&auto_approve),
+                Arc::clone(&generation),
+                my_generation,
             ));
         })
     };
@@ -330,52 +423,102 @@ where
         name,
         status,
         tools,
+        joined,
+        generation,
         restart: spawn_lifecycle,
     }
 }
 
 /// The background task body `spawn_server_with_connector` spawns: a bounded
-/// retry loop over connect+`list_tools`, publishing `Ready`+tools on
-/// success or `Degraded`+a one-line notice once attempts are exhausted.
-/// Never panics on a connect/list_tools failure -- a server that errors,
-/// exits immediately, or times out degrades this one server, never the
-/// rest of the process (PRD "MCP lifecycle": "never crashes or blocks the
-/// rest of rokr").
+/// retry loop over connect+`list_tools`, publishing `Ready`+tools (and, PC-1,
+/// joining the session snapshot) on success, or `Degraded`+a one-line
+/// notice once attempts are exhausted. Never panics on a connect/list_tools
+/// failure -- a server that errors, exits immediately, or times out (F-001)
+/// degrades this one server, never the rest of the process (PRD "MCP
+/// lifecycle": "never crashes or blocks the rest of rokr").
+///
+/// F-002: `generation`/`my_generation` fence every write this task makes
+/// against `status`/`tools_out`/`joined` -- `my_generation` is the value
+/// `generation` held at the moment this task was spawned (by the initial
+/// spawn or a `reconnect()`); if `generation`'s LIVE value has since moved
+/// on (a newer `reconnect()` happened), this task abandons silently right
+/// before each write rather than racing a newer task for the last write.
+///
+/// PC-1 ruling: on a successful `Ready`, this server's tool contribution
+/// joins `joined` unconditionally -- there is no separate "already joined,
+/// skip" check needed, because this function's success branch runs at most
+/// once per invocation (it `return`s immediately after), and invocations
+/// only ever happen at the initial spawn or an explicit `reconnect()` --
+/// never as an automatic re-run after `Ready`. That's exactly "auto-join is
+/// once-per-server, first Ready only, re-entry only via explicit
+/// reconnect": nothing here re-triggers itself.
 async fn run_lifecycle<F, Fut>(
     name: String,
     connect: F,
     status: Arc<std::sync::Mutex<McpServerStatus>>,
     tools_out: Arc<std::sync::Mutex<Vec<Arc<McpTool>>>>,
+    joined: Arc<std::sync::Mutex<Option<Vec<Arc<McpTool>>>>>,
     notice_tx: std::sync::mpsc::Sender<String>,
     auto_approve: Arc<Vec<String>>,
+    generation: Arc<AtomicU64>,
+    my_generation: u64,
 ) where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<Arc<dyn McpClientPort>, McpClientError>>,
 {
     let mut last_error = String::new();
+    // F-003: shared across every `McpTool` this invocation builds, so a
+    // transport-level failure on ANY of this server's tools degrades the
+    // same `status` this lifecycle task itself writes to (and reuses the
+    // same notice channel).
+    let tool_notice_tx = Arc::new(std::sync::Mutex::new(notice_tx.clone()));
 
     for attempt in 1..=MAX_CONNECT_ATTEMPTS {
-        match connect().await {
-            Ok(client) => match client.list_tools().await {
-                Ok(defs) => {
-                    let built: Vec<Arc<McpTool>> = defs
-                        .into_iter()
-                        .map(|def| {
-                            Arc::new(McpTool::new(
-                                client.clone(),
-                                name.clone(),
-                                def,
-                                auto_approve.clone(),
-                            ))
-                        })
-                        .collect();
-                    *tools_out.lock().unwrap() = built;
-                    *status.lock().unwrap() = McpServerStatus::Ready;
+        // F-001: each attempt's connect+list_tools is individually bounded
+        // -- a hung `initialize` handshake can no longer leave this task
+        // stuck forever; it times out, counts as a failed attempt, and the
+        // loop proceeds exactly as it would after any other failure.
+        let attempt_result = match tokio::time::timeout(CONNECT_TIMEOUT, connect()).await {
+            Ok(Ok(client)) => {
+                match tokio::time::timeout(CONNECT_TIMEOUT, client.list_tools()).await {
+                    Ok(Ok(defs)) => Ok((client, defs)),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(_elapsed) => Err("timed out during initialize".to_string()),
+                }
+            }
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_elapsed) => Err("timed out during initialize".to_string()),
+        };
+
+        match attempt_result {
+            Ok((client, defs)) => {
+                if generation.load(Ordering::SeqCst) != my_generation {
+                    // F-002: a newer reconnect superseded this task while
+                    // connect/list_tools was in flight -- abandon before
+                    // writing anything.
                     return;
                 }
-                Err(err) => last_error = err.to_string(),
-            },
-            Err(err) => last_error = err.to_string(),
+                let built: Vec<Arc<McpTool>> = defs
+                    .into_iter()
+                    .map(|def| {
+                        Arc::new(McpTool::new(
+                            client.clone(),
+                            name.clone(),
+                            def,
+                            auto_approve.clone(),
+                            Arc::clone(&status),
+                            Arc::clone(&tool_notice_tx),
+                        ))
+                    })
+                    .collect();
+                *tools_out.lock().unwrap() = built.clone();
+                *status.lock().unwrap() = McpServerStatus::Ready;
+                // PC-1: joins (or rejoins, on a reconnect success) this
+                // server's frozen session contribution.
+                *joined.lock().unwrap() = Some(built);
+                return;
+            }
+            Err(err) => last_error = err,
         }
 
         if attempt < MAX_CONNECT_ATTEMPTS {
@@ -383,6 +526,12 @@ async fn run_lifecycle<F, Fut>(
         }
     }
 
+    if generation.load(Ordering::SeqCst) != my_generation {
+        // F-002: superseded before the bounded retry even finished
+        // exhausting -- don't report a stale failure over a newer task's
+        // in-progress or already-successful attempt.
+        return;
+    }
     *status.lock().unwrap() = McpServerStatus::Degraded {
         reason: last_error.clone(),
     };
@@ -554,6 +703,19 @@ pub struct McpTool {
     /// server rather than cloned per tool, since it's set once at server
     /// configuration time and never mutated.
     auto_approve: Arc<Vec<String>>,
+    /// F-003: the SAME `status` cell `McpServerHandle`/`run_lifecycle`
+    /// share for this server. `Ready` was previously sticky -- once a
+    /// server reached `Ready`, nothing ever moved it out of that state
+    /// again, so a server that died mid-session kept reporting
+    /// `state=connected` via `/mcp` while every call silently errored.
+    /// `execute_boxed` below writes `Degraded` here on a transport-level
+    /// failure, so the NEXT `/mcp` (or reconnect attempt) reflects reality.
+    status: Arc<std::sync::Mutex<McpServerStatus>>,
+    /// F-003: shared notice sender (`Arc<Mutex<_>>` since
+    /// `std::sync::mpsc::Sender` is `Send` but not `Sync`, and `McpTool`
+    /// must be `Sync` -- `ExecutableTool: Send + Sync`) for the one-line
+    /// degrade notice `execute_boxed` sends alongside the `status` write.
+    notice_tx: Arc<std::sync::Mutex<std::sync::mpsc::Sender<String>>>,
 }
 
 impl McpTool {
@@ -562,6 +724,8 @@ impl McpTool {
         server: impl Into<String>,
         def: McpToolDef,
         auto_approve: Arc<Vec<String>>,
+        status: Arc<std::sync::Mutex<McpServerStatus>>,
+        notice_tx: Arc<std::sync::Mutex<std::sync::mpsc::Sender<String>>>,
     ) -> Self {
         let server = server.into();
         let qualified_name = qualified_name(&server, &def.name);
@@ -573,6 +737,8 @@ impl McpTool {
             description: def.description,
             input_schema: def.input_schema,
             auto_approve,
+            status,
+            notice_tx,
         }
     }
 }
@@ -627,11 +793,42 @@ impl ExecutableTool for McpTool {
         Box::pin(async move {
             match self.client.call_tool(&self.tool_name, input).await {
                 Ok(result) if result.is_error => {
+                    // Tool-level `isError` (the SERVER ran the call and
+                    // reported a failure) must NOT degrade the server --
+                    // the transport itself is fine; only a
+                    // `McpClientError::Request` below (the round-trip
+                    // itself failing) means this server is unreachable.
                     Err(rokr_core::ToolError::ExecutionFailed(flatten_content(
                         &result.content,
                     )))
                 }
                 Ok(result) => Ok(flatten_content(&result.content)),
+                Err(err @ McpClientError::Request(_)) => {
+                    // F-003: `Ready` was sticky -- a dead server mid-session
+                    // kept reporting `state=connected` via `/mcp` forever
+                    // while every call kept failing. A transport-level
+                    // error here means THIS server, not just this one
+                    // call, is unreachable, so it degrades the shared
+                    // `status` cell (visible to `/mcp` and to any future
+                    // `/mcp reconnect` gate) and emits a one-line notice --
+                    // matching `run_lifecycle`'s own degrade-notice shape.
+                    // PC-1 interaction: this does NOT touch
+                    // `McpServerHandle::joined` -- the server's
+                    // already-joined tools stay frozen in every session's
+                    // snapshot; only the live `status` (and therefore
+                    // whether `/mcp reconnect` will even accept a retry)
+                    // changes.
+                    let reason = err.to_string();
+                    *self.status.lock().unwrap() = McpServerStatus::Degraded {
+                        reason: reason.clone(),
+                    };
+                    let notice_tx = self.notice_tx.lock().unwrap().clone();
+                    let _ = notice_tx.send(format!(
+                        "MCP server '{}' degraded: {reason}",
+                        self.server
+                    ));
+                    Err(rokr_core::ToolError::ExecutionFailed(reason))
+                }
                 Err(err) => Err(rokr_core::ToolError::ExecutionFailed(err.to_string())),
             }
         })
@@ -667,9 +864,15 @@ impl ExecutableTool for McpTool {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
     struct FakeClient {
         content: Vec<RawContentItem>,
         is_error: bool,
+        /// ITEM 0 / F-004 test support: `list_tools`'s canned response.
+        /// Defaults to empty (`..Default::default()` at existing call
+        /// sites that only care about `call_tool` behavior); a test
+        /// exercising the join/snapshot path sets this explicitly.
+        tools: Vec<McpToolDef>,
     }
 
     impl McpClientPort for FakeClient {
@@ -677,7 +880,8 @@ mod tests {
             &'a self,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<McpToolDef>, McpClientError>> + Send + 'a>>
         {
-            Box::pin(async { Ok(Vec::new()) })
+            let tools = self.tools.clone();
+            Box::pin(async move { Ok(tools) })
         }
 
         fn call_tool<'a>(
@@ -690,6 +894,19 @@ mod tests {
             let is_error = self.is_error;
             Box::pin(async move { Ok(RawCallResult { content, is_error }) })
         }
+    }
+
+    /// F-003 test support: a throwaway `status`/`notice_tx` pair for tests
+    /// that build a bare `McpTool` directly (rather than through
+    /// `spawn_server_with_connector`/`run_lifecycle`) and don't care about
+    /// wiring it to a real `McpServerHandle`.
+    fn fresh_status_and_notice() -> (
+        Arc<std::sync::Mutex<McpServerStatus>>,
+        Arc<std::sync::Mutex<std::sync::mpsc::Sender<String>>>,
+    ) {
+        let status = Arc::new(std::sync::Mutex::new(McpServerStatus::Ready));
+        let (notice_tx, _notice_rx) = std::sync::mpsc::channel::<String>();
+        (status, Arc::new(std::sync::Mutex::new(notice_tx)))
     }
 
     #[tokio::test]
@@ -708,10 +925,7 @@ mod tests {
                 // released.
                 let rx = gate_rx.lock().unwrap().take().expect("connect called once");
                 let _ = rx.await;
-                let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
-                    content: Vec::new(),
-                    is_error: false,
-                });
+                let client: Arc<dyn McpClientPort> = Arc::new(FakeClient::default());
                 Ok(client)
             }
         };
@@ -766,10 +980,7 @@ mod tests {
                 async move {
                     attempts.fetch_add(1, Ordering::SeqCst);
                     if should_succeed.load(Ordering::SeqCst) {
-                        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
-                            content: Vec::new(),
-                            is_error: false,
-                        });
+                        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient::default());
                         Ok(client)
                     } else {
                         Err(McpClientError::Spawn("boom".to_string()))
@@ -827,6 +1038,175 @@ mod tests {
         );
     }
 
+    /// F-001 done-when: a connector whose future never resolves (a hung
+    /// `initialize` handshake) must not leave the server stuck in
+    /// `Starting` forever -- each attempt's `connect()` is bounded by
+    /// `CONNECT_TIMEOUT`, so the bounded retry still exhausts and reaches
+    /// `Degraded` with a notice, on the SAME schedule a real
+    /// connection-refused failure would. Paused/advanceable virtual time
+    /// (`start_paused = true`) lets this cover `CONNECT_TIMEOUT *
+    /// MAX_CONNECT_ATTEMPTS` of virtual time without a real multi-minute
+    /// wait -- tokio auto-advances the paused clock to the next timer
+    /// deadline whenever every task is blocked on one.
+    #[tokio::test(start_paused = true)]
+    async fn hung_connect_times_out_and_still_reaches_degraded_with_notice() {
+        let connect = || async {
+            // Never resolves -- simulates a server that accepts the
+            // connection but never replies to `initialize`.
+            std::future::pending::<Result<Arc<dyn McpClientPort>, McpClientError>>().await
+        };
+
+        let (notice_tx, notice_rx) = std::sync::mpsc::channel::<String>();
+        let handle = spawn_server_with_connector(
+            "hung".to_string(),
+            connect,
+            notice_tx,
+            Arc::new(Vec::new()),
+        );
+
+        // Under start_paused virtual time, this auto-fast-forwards through
+        // every CONNECT_TIMEOUT + backoff interval as soon as every task is
+        // blocked on a timer -- resolves promptly in real wall-clock time.
+        tokio::time::sleep(CONNECT_TIMEOUT * (MAX_CONNECT_ATTEMPTS + 1)).await;
+
+        assert!(
+            matches!(handle.status(), McpServerStatus::Degraded { .. }),
+            "expected a permanently-hung connect to still reach Degraded within the bounded \
+             retry window, got {:?}",
+            handle.status()
+        );
+
+        let notice = notice_rx
+            .try_recv()
+            .expect("expected a degrade notice to have been sent");
+        assert!(
+            notice.contains("hung"),
+            "expected the notice to name the server, got: {notice:?}"
+        );
+    }
+
+    /// F-002 done-when: `reconnect()` mid-retry must fence off the
+    /// already-in-flight OLD lifecycle task so ONLY the newer task's
+    /// outcome is ever observable, even if the old task's own attempt
+    /// later resolves SUCCESSFULLY (racing after the newer task already
+    /// wrote `Ready`). Deterministic (gate-controlled, not sleep-raced):
+    /// the very first `connect()` call ever (the original spawn's attempt
+    /// 1) blocks on a gate the test holds closed until well after
+    /// `reconnect()`'s own freshly-spawned task has already reached
+    /// `Ready`; every OTHER call succeeds immediately. Critically, the two
+    /// outcomes are DISTINGUISHABLE (different tool names) -- proving
+    /// fencing actually discarded the stale write, not just that both
+    /// writes happened to agree.
+    #[tokio::test]
+    async fn reconnect_mid_retry_fences_off_stale_task_so_only_newer_task_state_survives() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let (stale_gate_tx, stale_gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let stale_gate_rx = Arc::new(std::sync::Mutex::new(Some(stale_gate_rx)));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let connect = {
+            let stale_gate_rx = Arc::clone(&stale_gate_rx);
+            let call_count = Arc::clone(&call_count);
+            move || {
+                let stale_gate_rx = Arc::clone(&stale_gate_rx);
+                let call_count = Arc::clone(&call_count);
+                async move {
+                    let n = call_count.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // The very first call ever (the original spawn's
+                        // attempt 1): blocks until the test explicitly
+                        // releases it -- well after reconnect()'s own task
+                        // has already reached Ready -- then succeeds with a
+                        // tool distinctly named "stale_tool".
+                        let rx = stale_gate_rx.lock().unwrap().take().expect("gate taken once");
+                        let _ = rx.await;
+                        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
+                            tools: vec![McpToolDef {
+                                name: "stale_tool".to_string(),
+                                description: String::new(),
+                                input_schema: serde_json::json!({}),
+                            }],
+                            ..Default::default()
+                        });
+                        Ok(client)
+                    } else {
+                        // Every later call (the reconnect-spawned task's
+                        // own first attempt) succeeds immediately with a
+                        // distinctly named "fresh_tool".
+                        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
+                            tools: vec![McpToolDef {
+                                name: "fresh_tool".to_string(),
+                                description: String::new(),
+                                input_schema: serde_json::json!({}),
+                            }],
+                            ..Default::default()
+                        });
+                        Ok(client)
+                    }
+                }
+            }
+        };
+
+        let (notice_tx, _notice_rx) = std::sync::mpsc::channel::<String>();
+        let handle = spawn_server_with_connector(
+            "srv".to_string(),
+            connect,
+            notice_tx,
+            Arc::new(Vec::new()),
+        );
+
+        // Give the first (stale) attempt a moment to actually start and
+        // block on the gate.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(handle.status(), McpServerStatus::Starting);
+
+        // Bumps generation and spawns a NEW lifecycle task, whose first
+        // connect() call (n >= 1, gate already taken) succeeds immediately
+        // with "fresh_tool".
+        handle.reconnect();
+
+        let ready_deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while handle.status() != McpServerStatus::Ready {
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "expected the newer task to reach Ready promptly, got {:?}",
+                handle.status()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let joined_after_new_ready = handle.joined().expect("expected the server to have joined");
+        assert_eq!(
+            joined_after_new_ready.len(),
+            1,
+            "expected exactly one tool from the newer task's join"
+        );
+        assert_eq!(joined_after_new_ready[0].name(), qualified_name("srv", "fresh_tool"));
+
+        // NOW release the stale task's gate -- its call resolves
+        // successfully with "stale_tool", strictly AFTER the newer task
+        // already joined with "fresh_tool".
+        let _ = stale_gate_tx.send(());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            handle.status(),
+            McpServerStatus::Ready,
+            "the stale task's late-resolving success must not have altered status"
+        );
+        let joined_after_stale_resolves =
+            handle.joined().expect("expected the server to still be joined");
+        assert_eq!(
+            joined_after_stale_resolves
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect::<Vec<_>>(),
+            vec![qualified_name("srv", "fresh_tool")],
+            "the stale (pre-reconnect) task's late success must not have overwritten the \
+             newer task's joined contribution with 'stale_tool'"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_tool_flattens_text_content_and_maps_is_error() {
         let client = Arc::new(FakeClient {
@@ -836,7 +1216,9 @@ mod tests {
                 RawContentItem::Text("second part".to_string()),
             ],
             is_error: true,
+            ..Default::default()
         });
+        let (status, notice_tx) = fresh_status_and_notice();
         let tool = McpTool::new(
             client,
             "srv",
@@ -846,6 +1228,8 @@ mod tests {
                 input_schema: serde_json::json!({}),
             },
             Arc::new(Vec::new()),
+            status,
+            notice_tx,
         );
 
         let result = tool.execute_boxed(serde_json::json!({})).await;
@@ -862,6 +1246,120 @@ mod tests {
             }
             Ok(text) => panic!("expected an error result (isError: true), got Ok({text})"),
         }
+    }
+
+    /// A `FakeClient` whose `call_tool` always fails at the TRANSPORT
+    /// level (`McpClientError::Request`), for F-003's degrade test --
+    /// distinct from `is_error: true` in `FakeClient` above, which is a
+    /// tool-level (`isError` in the wire response) failure that must NOT
+    /// degrade the server.
+    struct TransportFailingClient;
+
+    impl McpClientPort for TransportFailingClient {
+        fn list_tools<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<McpToolDef>, McpClientError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn call_tool<'a>(
+            &'a self,
+            _name: &'a str,
+            _arguments: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<RawCallResult, McpClientError>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(McpClientError::Request(
+                    "connection reset by peer".to_string(),
+                ))
+            })
+        }
+    }
+
+    /// F-003 done-when: a transport-level `Err(McpClientError::Request(_))`
+    /// from `call_tool` -- e.g. the server process died mid-session -- must
+    /// degrade the SHARED `status` cell (not leave `Ready` sticky) and emit
+    /// a one-line notice, so `/mcp` and a future `/mcp reconnect` both see
+    /// reality instead of a server that looks connected forever while every
+    /// call silently errors.
+    #[tokio::test]
+    async fn transport_level_call_tool_error_degrades_shared_status_and_sends_notice() {
+        let client: Arc<dyn McpClientPort> = Arc::new(TransportFailingClient);
+        let status = Arc::new(std::sync::Mutex::new(McpServerStatus::Ready));
+        let (notice_tx, notice_rx) = std::sync::mpsc::channel::<String>();
+        let notice_tx = Arc::new(std::sync::Mutex::new(notice_tx));
+        let tool = McpTool::new(
+            client,
+            "flaky-server",
+            McpToolDef {
+                name: "echo".to_string(),
+                description: "d".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            Arc::new(Vec::new()),
+            Arc::clone(&status),
+            notice_tx,
+        );
+
+        let result = tool.execute_boxed(serde_json::json!({})).await;
+        assert!(result.is_err(), "expected the transport error to surface as a tool error");
+
+        assert!(
+            matches!(*status.lock().unwrap(), McpServerStatus::Degraded { .. }),
+            "expected the shared status cell to be Degraded after a transport-level call_tool \
+             error, got: {:?}",
+            *status.lock().unwrap()
+        );
+
+        let notice = notice_rx
+            .try_recv()
+            .expect("expected a one-line degrade notice to have been sent");
+        assert!(
+            notice.contains("flaky-server"),
+            "expected the notice to name the degraded server, got: {notice:?}"
+        );
+    }
+
+    /// F-003: a tool-level `isError: true` result (the server ran the call
+    /// and reported failure) must NOT degrade the server -- the transport
+    /// itself is fine. Reuses `FakeClient`'s existing `is_error` knob
+    /// (distinct from `TransportFailingClient` above).
+    #[tokio::test]
+    async fn tool_level_is_error_does_not_degrade_shared_status() {
+        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
+            content: vec![RawContentItem::Text("failed on purpose".to_string())],
+            is_error: true,
+            ..Default::default()
+        });
+        let status = Arc::new(std::sync::Mutex::new(McpServerStatus::Ready));
+        let (notice_tx, notice_rx) = std::sync::mpsc::channel::<String>();
+        let notice_tx = Arc::new(std::sync::Mutex::new(notice_tx));
+        let tool = McpTool::new(
+            client,
+            "srv",
+            McpToolDef {
+                name: "echo".to_string(),
+                description: "d".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            Arc::new(Vec::new()),
+            Arc::clone(&status),
+            notice_tx,
+        );
+
+        let result = tool.execute_boxed(serde_json::json!({})).await;
+        assert!(result.is_err(), "expected the isError result to surface as a tool error");
+
+        assert_eq!(
+            *status.lock().unwrap(),
+            McpServerStatus::Ready,
+            "a tool-level isError must not degrade the server status"
+        );
+        assert!(
+            notice_rx.try_recv().is_err(),
+            "a tool-level isError must not send a degrade notice"
+        );
     }
 
 
@@ -961,10 +1459,8 @@ mod tests {
     /// the model actually sees via `ExecutableTool::name`/`to_tool_spec`.
     #[test]
     fn tool_names_sanitized_and_namespaced_as_mcp_server_tool() {
-        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
-            content: Vec::new(),
-            is_error: false,
-        });
+        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient::default());
+        let (status, notice_tx) = fresh_status_and_notice();
         let tool = McpTool::new(
             client,
             "my server",
@@ -974,6 +1470,8 @@ mod tests {
                 input_schema: serde_json::json!({}),
             },
             Arc::new(Vec::new()),
+            status,
+            notice_tx,
         );
 
         assert_eq!(tool.name(), "mcp__my_server__search_tool");
@@ -987,19 +1485,24 @@ mod tests {
         );
     }
 
-    /// Ticket 46 (mcp-namespace-multi-server-freeze), PRD "MCP caching and
-    /// session semantics": a tool-set snapshot assembled from multiple
-    /// servers is sorted deterministically by (server, tool) -- not server
-    /// registration/iteration order -- and calling the snapshot fn again
-    /// against UNCHANGED handles returns a byte-for-byte identical result.
+    /// PC-1 ruling (supersedes ticket 46's whole-session `OnceLock`
+    /// freeze/this test's original semantics): `snapshot_tools` assembles
+    /// from every handle's FROZEN `joined` contribution, sorted
+    /// deterministically by (server, tool) -- not handle/tool
+    /// registration order. A handle's LIVE `tools` mutating (e.g. a
+    /// reconnect attempt still in flight, before it reaches `Ready` and
+    /// rejoins) never reaches into the assembled set, since that reads
+    /// only `joined`. Unlike ticket 46's now-superseded whole-session
+    /// freeze, though, a server joining for the FIRST time between two
+    /// calls DOES show up in the later one -- there's no session-wide
+    /// cache to go stale; ordering is a pure function of which servers
+    /// have joined as of THIS call, recomputed fresh every time.
     #[test]
-    fn snapshot_sorted_by_server_then_tool_and_stable_across_repeated_calls() {
-        fn make_handle(name: &str, tool_names: &[&str]) -> McpServerHandle {
-            let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
-                content: Vec::new(),
-                is_error: false,
-            });
-            let tools = tool_names
+    fn joined_snapshot_sorted_by_server_then_tool_ignores_live_churn_but_reflects_new_joins() {
+        fn make_joined_handle(name: &str, joined_tool_names: &[&str]) -> McpServerHandle {
+            let client: Arc<dyn McpClientPort> = Arc::new(FakeClient::default());
+            let (status, notice_tx) = fresh_status_and_notice();
+            let tools = joined_tool_names
                 .iter()
                 .map(|tool_name| {
                     Arc::new(McpTool::new(
@@ -1011,13 +1514,17 @@ mod tests {
                             input_schema: serde_json::json!({}),
                         },
                         Arc::new(Vec::new()),
+                        Arc::clone(&status),
+                        Arc::clone(&notice_tx),
                     ))
                 })
                 .collect::<Vec<_>>();
             McpServerHandle {
                 name: name.to_string(),
-                status: Arc::new(std::sync::Mutex::new(McpServerStatus::Ready)),
-                tools: Arc::new(std::sync::Mutex::new(tools)),
+                status,
+                tools: Arc::new(std::sync::Mutex::new(tools.clone())),
+                joined: Arc::new(std::sync::Mutex::new(Some(tools))),
+                generation: Arc::new(AtomicU64::new(0)),
                 restart: Arc::new(|| {}),
             }
         }
@@ -1025,12 +1532,13 @@ mod tests {
         // Deliberately out of (server, tool) order, and with "server_a"
         // registered AFTER "server_b", to prove the snapshot re-sorts
         // rather than trusting handle/tool iteration order.
-        let handles = vec![
-            make_handle("server_b", &["search", "alpha"]),
-            make_handle("server_a", &["zzz", "search"]),
+        let mut handles = vec![
+            make_joined_handle("server_b", &["search", "alpha"]),
+            make_joined_handle("server_a", &["zzz", "search"]),
         ];
 
-        let snapshot_1 = snapshot_tools(&handles);
+        let (notice_tx, _notice_rx) = std::sync::mpsc::channel::<String>();
+        let snapshot_1 = snapshot_tools(&handles, &notice_tx);
         let names_1: Vec<&str> = snapshot_1.iter().map(|t| t.name()).collect();
         assert_eq!(
             names_1,
@@ -1042,34 +1550,93 @@ mod tests {
             ]
         );
 
-        let snapshot_2 = snapshot_tools(&handles);
+        // A handle's LIVE tool list changing must not affect the joined
+        // snapshot, which reads only the frozen `joined` field, never
+        // `tools`.
+        *handles[0].tools.lock().unwrap() = vec![];
+        let snapshot_2 = snapshot_tools(&handles, &notice_tx);
         let names_2: Vec<&str> = snapshot_2.iter().map(|t| t.name()).collect();
         assert_eq!(
             names_1, names_2,
-            "repeated snapshots over unchanged handles must be byte-for-byte identical"
+            "a handle's LIVE tool list mutating must not affect the joined snapshot"
         );
 
-        // A handle's live tool list changing AFTER a snapshot was taken
-        // (e.g. a future reconnect) must never reach back into that
-        // already-taken snapshot -- `snapshot_1` returns owned `Arc<McpTool>`
-        // clones, not a view into the handle's mutex.
-        *handles[0].tools.lock().unwrap() = vec![Arc::new(McpTool::new(
-            Arc::new(FakeClient {
-                content: Vec::new(),
-                is_error: false,
-            }),
-            "server_b".to_string(),
-            McpToolDef {
-                name: "changed".to_string(),
-                description: String::new(),
-                input_schema: serde_json::json!({}),
-            },
-            Arc::new(Vec::new()),
-        ))];
-        let names_1_after_mutation: Vec<&str> = snapshot_1.iter().map(|t| t.name()).collect();
+        // A server joining for the FIRST time (added to the handle list,
+        // as an initial spawn's first Ready would) appears in the very
+        // next call, in deterministic sorted position -- no session-wide
+        // freeze holds it back.
+        handles.push(make_joined_handle("server_c", &["late"]));
+        let snapshot_3 = snapshot_tools(&handles, &notice_tx);
+        let names_3: Vec<&str> = snapshot_3.iter().map(|t| t.name()).collect();
         assert_eq!(
-            names_1_after_mutation, names_1,
-            "an already-taken snapshot must be unaffected by a later handle mutation"
+            names_3,
+            vec![
+                qualified_name("server_a", "search"),
+                qualified_name("server_a", "zzz"),
+                qualified_name("server_b", "alpha"),
+                qualified_name("server_b", "search"),
+                qualified_name("server_c", "late"),
+            ],
+            "a newly-joined server must appear, in deterministic sorted position, on the next call"
+        );
+    }
+
+    /// F-004: two servers whose names sanitize to the SAME string ("my
+    /// server" and "my_server" both become "my_server"), each contributing
+    /// a tool with the identical raw name, collide on the same qualified
+    /// `mcp__my_server__search` -- the snapshot must drop the later
+    /// duplicate (keeping exactly one, per (server, tool) sort order) and
+    /// report the drop via a notice, rather than silently producing two
+    /// `ToolSpec`s with the same name (which would route every call to
+    /// whichever one a naive by-name lookup finds first).
+    #[test]
+    fn snapshot_drops_duplicate_qualified_name_and_emits_collision_notice() {
+        fn make_joined_handle(server: &str, tool_name: &str) -> McpServerHandle {
+            let client: Arc<dyn McpClientPort> = Arc::new(FakeClient::default());
+            let (status, notice_tx) = fresh_status_and_notice();
+            let tool = Arc::new(McpTool::new(
+                client,
+                server.to_string(),
+                McpToolDef {
+                    name: tool_name.to_string(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                },
+                Arc::new(Vec::new()),
+                status.clone(),
+                notice_tx,
+            ));
+            McpServerHandle {
+                name: server.to_string(),
+                status,
+                tools: Arc::new(std::sync::Mutex::new(vec![tool.clone()])),
+                joined: Arc::new(std::sync::Mutex::new(Some(vec![tool]))),
+                generation: Arc::new(AtomicU64::new(0)),
+                restart: Arc::new(|| {}),
+            }
+        }
+
+        let handles = vec![
+            make_joined_handle("my server", "search"),
+            make_joined_handle("my_server", "search"),
+        ];
+
+        let (notice_tx, notice_rx) = std::sync::mpsc::channel::<String>();
+        let snapshot = snapshot_tools(&handles, &notice_tx);
+
+        let names: Vec<&str> = snapshot.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            vec![qualified_name("my_server", "search")],
+            "expected exactly one survivor of the colliding qualified name, got: {names:?}"
+        );
+
+        let notice = notice_rx
+            .try_recv()
+            .expect("expected a collision notice to have been sent");
+        assert!(
+            notice.contains("collision") || notice.contains("duplicate"),
+            "expected the notice to describe a name collision, got: {notice:?}"
         );
     }
 }

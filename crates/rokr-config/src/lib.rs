@@ -86,6 +86,16 @@ fn default_auto_compact_threshold() -> f64 {
     0.7
 }
 
+/// Argus F-005: an MCP server block with no explicit `enabled` key defaults
+/// to enabled. Previously defaulted to `false` (plain `#[serde(default)]`
+/// on a `bool`), which silently disabled any server whose config the user
+/// forgot to mark `"enabled": true` -- a footgun, since the field reads as
+/// optional/informational rather than an opt-in gate. `"enabled": false` is
+/// now the only way to opt a server out.
+fn default_true() -> bool {
+    true
+}
+
 /// One configured MCP server (PRD "Config schema"). `auto_approve` (ticket
 /// 47, mcp-permission-polish) is a per-server allowlist of UNQUALIFIED
 /// tool names (the server-local name as reported by `tools/list`, e.g.
@@ -96,7 +106,7 @@ fn default_auto_compact_threshold() -> f64 {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
     pub transport: McpTransport,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub auto_approve: Vec<String>,
@@ -482,6 +492,32 @@ mod tests {
     /// static bearer/env-token value the caller already resolved (no
     /// OAuth 2.1 -- PRD "Out of Scope"), so this is a plain string map,
     /// deserialized the same way `StdioTransportConfig.env` already is.
+    /// Argus F-005: `enabled` defaulted to `false` when absent was a
+    /// silently-disabled-server footgun -- a server block with no explicit
+    /// `enabled` key must default to `true`; `"enabled": false` is now the
+    /// only way to opt a server out.
+    #[test]
+    fn mcp_server_without_explicit_enabled_field_defaults_to_true() {
+        let json = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": { "command": "/path/to/server" }
+                    }
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert!(
+            server.enabled,
+            "expected enabled to default to true when the field is absent"
+        );
+    }
+
     #[test]
     fn mcp_server_transport_deserializes_http_variant_with_headers() {
         let json = r#"{
