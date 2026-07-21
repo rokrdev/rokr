@@ -13169,3 +13169,189 @@ async fn project_scope_command_containing_bang_prefixed_syntax_expands_to_inert_
     let _ = std::fs::remove_dir_all(&project_dir);
     let _ = std::fs::remove_dir_all(marker_path.parent().unwrap());
 }
+
+/// Ticket 65 (skills-instruction-bundle-loading) acceptance test: a
+/// project-scope command template containing an `@skill:<name>` mention
+/// must have that mention resolved to the NAMED skill's full markdown file
+/// contents, inlined in place of the mention, in the outgoing prompt --
+/// proven end-to-end through the real binary (PTY), not just at the
+/// `CommandRegistry` unit level (`commands.rs`'s
+/// `skill_mention_resolves_to_named_skill_file_contents_from_scoped_directory`).
+/// The skill file lives in the project-scope `skills/` directory
+/// (`<project_dir>/.rokr/skills/code-style.md`), sibling to
+/// `.rokr/commands/`, mirroring how project-scope commands are discovered.
+#[tokio::test]
+async fn command_template_with_skill_mention_inlines_skill_file_contents_in_outgoing_prompt() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let canned_response = "MockedAssistantReplyForSkillMentionTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-skill-mention",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-skill-mention");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-skill-mention");
+    let project_dir = unique_temp_dir("skill-mention-project");
+
+    let project_commands_dir = project_dir.join(".rokr").join("commands");
+    std::fs::create_dir_all(&project_commands_dir)
+        .expect("failed to create fixture project-scope commands directory");
+    std::fs::write(
+        project_commands_dir.join("review.md"),
+        "---\ndescription: test\n---\nFollow @skill:code-style",
+    )
+    .expect("failed to write fixture review.md");
+
+    let project_skills_dir = project_dir.join(".rokr").join("skills");
+    std::fs::create_dir_all(&project_skills_dir)
+        .expect("failed to create fixture project-scope skills directory");
+    let skill_content = "SKILL-CONTENT-MARKER: use 4-space indentation and trailing commas.";
+    std::fs::write(project_skills_dir.join("code-style.md"), skill_content)
+        .expect("failed to write fixture code-style.md");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-openai-api-key");
+    cmd.cwd(&project_dir);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/review\r")
+        .expect("failed to write /review invocation to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response after /review, proving \
+         the normal submit path still completed; got: {output:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains(skill_content),
+        "expected the outgoing request body to contain the skill file's full contents inlined \
+         in place of the @skill:code-style mention; got body: {first_request_body:?}"
+    );
+    assert!(
+        !first_request_body.contains("@skill:code-style"),
+        "expected the @skill:code-style mention to have been replaced, not left literal; got \
+         body: {first_request_body:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
