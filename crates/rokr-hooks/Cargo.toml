@@ -16,3 +16,10 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# Ticket 50 (hooks-remaining-events-and-config): the tool-name glob matcher
+# (`matches_tool_name` in `src/lib.rs`) is hand-rolled (`*`/`?` only, no
+# character classes/brace expansion) rather than pulling in `glob` or
+# `globset` -- the PRD's matcher shape only ever needs those two symbols
+# (`mcp__*`, `bash*`, ...), a ~15-line recursive matcher covers it exactly,
+# and it avoids a new dependency (plus its transitive graph) for a surface
+# this small. Revisit if a future ticket needs richer glob syntax.

@@ -141,6 +141,38 @@ pub type PreToolHookCallback<'a> = dyn Fn(PreToolHookRequest) -> Pin<Box<dyn Fut
     + Sync
     + 'a;
 
+/// What actually happened for one tool call, handed to an optional
+/// `PostToolUse` hook callback (ticket 50, hooks-remaining-events-and-config;
+/// PRD "Hooks") AFTER the tool has already run to completion -- this
+/// callback only fires for a call that actually reached
+/// [`ExecutableTool::execute_boxed`] (success or failure), never for a call
+/// short-circuited earlier by a `PreToolUse` hook deny, a rejected
+/// permission prompt, or an unknown-tool name, since none of those actually
+/// "ran" a tool for `PostToolUse` to react to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostToolHookRequest {
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub tool_output: String,
+    pub is_error: bool,
+}
+
+/// A caller-supplied `PostToolUse` hook, injected into `run_tool_loop` the
+/// same way [`PreToolHookCallback`] is -- a boxed `dyn Fn` behind an
+/// `Option<&_>`, for the identical "most call sites pass `None`" reason
+/// documented on that type. Unlike `PreToolHookCallback`, this callback
+/// returns `()`, not an outcome enum: `PostToolUse` is fire-and-observe
+/// (PRD "Hooks", architect decision) -- it runs strictly after the tool's
+/// `ToolResult` is already decided, so it has nothing left to veto or alter.
+/// The caller (`crates/rokr/src/main.rs`) is responsible for mapping
+/// `rokr_hooks::HookResult`'s non-blocking-failure branch down to a
+/// one-line notice on its own; `run_tool_loop` just awaits the callback and
+/// moves on regardless of what it did internally.
+pub type PostToolHookCallback<'a> = dyn Fn(PostToolHookRequest) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    + Send
+    + Sync
+    + 'a;
+
 /// Object-safe veneer over `rokr_tools::Tool`, needed because `Tool::execute`
 /// is a native `async fn` and therefore not itself dyn-compatible. The tool
 /// loop needs to hold a heterogeneous, runtime-selectable set of tools (the
@@ -326,6 +358,14 @@ impl_executable_tool_gated!(rokr_tools::webfetch::WebfetchTool);
 /// message, identical in shape to a rejected permission request.
 /// [`PreToolHookOutcome::Allow`] (or `None`, meaning no hook is configured)
 /// falls through to the unchanged preview/permission/execute path.
+///
+/// `post_tool_hook` (ticket 50, hooks-remaining-events-and-config; PRD
+/// "Hooks", "Core seam") is consulted once per tool call that actually
+/// executed (skipped for a call short-circuited by `pre_tool_hook` or a
+/// rejected permission prompt -- see [`PostToolHookRequest`]'s doc comment),
+/// AFTER that call's `ToolResult` content/`is_error` are already decided.
+/// Fire-and-observe: its return value can never change what was already
+/// recorded for that call.
 pub async fn run_tool_loop<P, F, Fut>(
     provider: &P,
     system_prompt: &str,
@@ -334,6 +374,7 @@ pub async fn run_tool_loop<P, F, Fut>(
     tools: &[&dyn ExecutableTool],
     request_permission: F,
     pre_tool_hook: Option<&PreToolHookCallback<'_>>,
+    post_tool_hook: Option<&PostToolHookCallback<'_>>,
 ) -> Result<(Message, Usage), P::Error>
 where
     P: Provider,
@@ -402,16 +443,22 @@ where
                 None => None,
             };
 
-            let (content, is_error) = if let Some(message) = hook_denial {
-                (message, true)
+            // Cloned up front (regardless of whether `post_tool_hook` is
+            // configured) so the original `tool_input` survives past
+            // whichever branch below moves `input` into `execute_boxed` --
+            // `PostToolHookRequest` below needs it after the fact.
+            let tool_input_for_hook = input.clone();
+
+            let (content, is_error, did_execute) = if let Some(message) = hook_denial {
+                (message, true, false)
             } else {
                 match tools.iter().find(|tool| tool.name() == name.as_str()) {
                     Some(tool) => match tool.preview(input.clone()) {
                         None => match tool.execute_boxed(input).await {
-                            Ok(output) => (output, false),
-                            Err(err) => (err.to_string(), true),
+                            Ok(output) => (output, false, true),
+                            Err(err) => (err.to_string(), true, true),
                         },
-                        Some(Err(preview_err)) => (preview_err.to_string(), true),
+                        Some(Err(preview_err)) => (preview_err.to_string(), true, false),
                         Some(Ok(payload)) => {
                             let request = PermissionRequest {
                                 tool_name: name.clone(),
@@ -419,17 +466,38 @@ where
                             };
                             if request_permission(request).await {
                                 match tool.execute_boxed(input).await {
-                                    Ok(output) => (output, false),
-                                    Err(err) => (err.to_string(), true),
+                                    Ok(output) => (output, false, true),
+                                    Err(err) => (err.to_string(), true, true),
                                 }
                             } else {
-                                ("permission denied by user".to_string(), true)
+                                ("permission denied by user".to_string(), true, false)
                             }
                         }
                     },
-                    None => (format!("unknown tool: {name}"), true),
+                    None => (format!("unknown tool: {name}"), true, false),
                 }
             };
+
+            // `PostToolUse` (ticket 50, hooks-remaining-events-and-config):
+            // fires only for a call that actually reached `execute_boxed`
+            // (`did_execute`) -- never for one short-circuited by a
+            // `PreToolUse` hook deny, a rejected permission prompt, a failed
+            // preview, or an unknown tool name, since none of those ran a
+            // tool for `PostToolUse` to react to. Fire-and-observe: its
+            // `()` return can never change `content`/`is_error`, already
+            // fixed above.
+            if did_execute {
+                if let Some(hook) = post_tool_hook {
+                    hook(PostToolHookRequest {
+                        tool_name: name.clone(),
+                        tool_input: tool_input_for_hook,
+                        tool_output: content.clone(),
+                        is_error,
+                    })
+                    .await;
+                }
+            }
+
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: id,
                 content,
@@ -833,6 +901,7 @@ mod tests {
             &tools,
             |_request| async { true },
             None,
+            None,
         )
         .await
         .expect("loop should succeed");
@@ -959,6 +1028,7 @@ mod tests {
             &tools,
             |_request| async { false },
             None,
+            None,
         )
         .await
         .expect("loop should succeed even when permission is rejected");
@@ -1051,6 +1121,7 @@ mod tests {
                 async { true }
             },
             Some(&pre_tool_hook),
+            None,
         )
         .await
         .expect("loop should succeed even when a PreToolUse hook denies");
@@ -1086,6 +1157,124 @@ mod tests {
             }
             other => panic!("expected a single ToolResult block, got {other:?}"),
         }
+    }
+
+    /// A non-gated tool whose `execute` always fails, so a test can exercise
+    /// `PostToolUse`'s error-case payload without needing a gated tool /
+    /// permission dance.
+    struct FakeFailingTool;
+
+    impl_executable_tool!(FakeFailingTool);
+
+    impl rokr_tools::Tool for FakeFailingTool {
+        fn name(&self) -> &'static str {
+            "fake_failing"
+        }
+
+        fn description(&self) -> &'static str {
+            "fake tool that always fails, for tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _input: serde_json::Value) -> Result<String, rokr_tools::ToolError> {
+            Err(rokr_tools::ToolError::ExecutionFailed(
+                "fake failure for testing".to_string(),
+            ))
+        }
+    }
+
+    /// Ticket 50 (hooks-remaining-events-and-config), PRD "Hooks" testing
+    /// decision ("PostToolUse: a test asserting the post-tool callback
+    /// receives the actual tool result (success and error cases) after
+    /// execution"): a single reply naming both a succeeding and a failing
+    /// tool call proves the callback fires once per tool call, after
+    /// execution, carrying that call's own `tool_output`/`is_error` -- and
+    /// that a `None` return from the callback (fire-and-observe; see
+    /// `PostToolHookCallback`'s doc comment) never alters the `ToolResult`
+    /// already produced for either call.
+    #[tokio::test]
+    async fn post_tool_hook_receives_actual_tool_result_for_success_and_error_cases() {
+        let tool_call_reply = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_ok".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "/tmp/whatever.txt"}),
+                    cache_control: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_err".to_string(),
+                    name: "fake_failing".to_string(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+            ],
+        };
+        let final_reply = Message::assistant_text("final answer after post-tool hook");
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_reply.clone(),
+                final_reply.clone(),
+            ])),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let read_tool = FakeReadTool;
+        let failing_tool = FakeFailingTool;
+        let tools: [&dyn ExecutableTool; 2] = [&read_tool, &failing_tool];
+
+        let mut transcript = vec![Message::user_text("run both tools")];
+
+        let observed: std::sync::Arc<std::sync::Mutex<Vec<PostToolHookRequest>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_closure = observed.clone();
+        let post_tool_hook = move |request: PostToolHookRequest| {
+            let observed = observed_for_closure.clone();
+            Box::pin(async move {
+                observed.lock().unwrap().push(request);
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        };
+
+        let (result, _usage) = run_tool_loop(
+            &provider,
+            "you are a test agent",
+            None,
+            &mut transcript,
+            &tools,
+            |_request| async { true },
+            None,
+            Some(&post_tool_hook),
+        )
+        .await
+        .expect("loop should succeed");
+
+        assert_eq!(result.text(), "final answer after post-tool hook");
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed.len(),
+            2,
+            "expected the post-tool hook to fire once per tool call, got: {observed:?}"
+        );
+
+        let ok_call = observed
+            .iter()
+            .find(|request| request.tool_name == "read")
+            .expect("expected a PostToolHookRequest for the succeeding 'read' call");
+        assert!(!ok_call.is_error);
+        assert!(ok_call.tool_output.contains("/tmp/whatever.txt"));
+
+        let err_call = observed
+            .iter()
+            .find(|request| request.tool_name == "fake_failing")
+            .expect("expected a PostToolHookRequest for the failing 'fake_failing' call");
+        assert!(err_call.is_error);
+        assert!(err_call.tool_output.contains("fake failure for testing"));
     }
 
     /// Creates a fresh, uniquely-named directory under the system temp dir,
@@ -1183,6 +1372,7 @@ mod tests {
             &mut transcript,
             &tools,
             |_request| async { false },
+            None,
             None,
         )
         .await

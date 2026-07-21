@@ -92,6 +92,74 @@ fn parse_agent_tier(args: &[String]) -> Result<AgentTier, ()> {
     }
 }
 
+/// Runs `entry`'s command against `payload`, honoring its `timeout_ms`
+/// override (falling back to `rokr_hooks::DEFAULT_TIMEOUT` when absent).
+/// Ticket 50 (hooks-remaining-events-and-config): shared by every hook call
+/// site below (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`,
+/// `SessionStart`, `Stop`, `SessionEnd`) so the timeout-override lookup
+/// lives in exactly one place.
+async fn run_hook_entry(
+    entry: &rokr_config::HookEntry,
+    payload: &rokr_hooks::HookPayload,
+) -> rokr_hooks::HookResult {
+    let timeout = entry
+        .timeout_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(rokr_hooks::DEFAULT_TIMEOUT);
+    rokr_hooks::execute_hook(&entry.command, payload, timeout).await
+}
+
+/// Every hook entry configured for `event`, matcher-filtered against
+/// `tool_name` when `Some` (`PreToolUse`/`PostToolUse`) or left unfiltered
+/// when `None` -- every lifecycle event (`SessionStart`, `UserPromptSubmit`,
+/// `Stop`, `SessionEnd`) ignores `matcher` entirely, per the PRD's "Matcher
+/// shape" note, simply by always being called with `tool_name: None` at its
+/// call sites below. An entry with no `matcher` set behaves like `"*"`
+/// (matches every tool), same as a missing `matcher` string would via
+/// `rokr_hooks::matches_tool_name`.
+fn matching_hook_entries<'a>(
+    hooks_config: &'a std::collections::HashMap<String, Vec<rokr_config::HookEntry>>,
+    event: &str,
+    tool_name: Option<&str>,
+) -> Vec<&'a rokr_config::HookEntry> {
+    hooks_config
+        .get(event)
+        .into_iter()
+        .flatten()
+        .filter(|entry| match tool_name {
+            Some(tool_name) => entry
+                .matcher
+                .as_deref()
+                .is_none_or(|matcher| rokr_hooks::matches_tool_name(matcher, tool_name)),
+            None => true,
+        })
+        .collect()
+}
+
+/// Logs a one-line notice for a fire-and-observe hook's outcome
+/// (`PostToolUse`, `Stop`, `SessionEnd` -- none of which can veto anything,
+/// architect decision: "Stop/SessionEnd: fire-and-observe, exit codes
+/// logged, non-blocking"), extended here to `PostToolUse` for the identical
+/// reason (it always runs after the tool it's attached to has already
+/// executed, so there's nothing left to veto). A `Success` outcome is the
+/// silent default (nothing to report); `Blocked` (exit 2) is logged as an
+/// IGNORED veto attempt, since these events have no veto to honor;
+/// `NonBlockingFailure` is logged as-is.
+fn log_observational_hook_outcome(event: &str, result: &rokr_hooks::HookResult) {
+    match result {
+        rokr_hooks::HookResult::Success { .. } => {}
+        rokr_hooks::HookResult::Blocked { stderr } => {
+            eprintln!(
+                "{event} hook exited 2 (a blocking exit code), but {event} is fire-and-observe \
+                 only and cannot veto anything -- ignoring: {stderr}"
+            );
+        }
+        rokr_hooks::HookResult::NonBlockingFailure { message } => {
+            eprintln!("{event} hook failed non-blocking: {message}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -174,6 +242,44 @@ async fn main() -> ExitCode {
                 if let Some(project_context) = rokr_config::load_project_context(cwd) {
                     system_prompt.push_str("\n\n");
                     system_prompt.push_str(&project_context);
+                }
+            }
+
+            // Ticket 50 (hooks-remaining-events-and-config): loaded once
+            // here (user-scope config only -- `rokr_config::load_or_init_default`
+            // never reads a project-local file, so this can never be
+            // influenced by a cloned repo, per
+            // docs/adr/0012-hooks-execution-trust-model.md's trust
+            // boundary) and shared via `Arc` with `submit` below (a clone
+            // moved in) and with the `SessionEnd` firing point after
+            // `rokr_tui::run` returns (the original, still in scope here).
+            let hooks_config: Arc<std::collections::HashMap<String, Vec<rokr_config::HookEntry>>> =
+                Arc::new(config.hooks.clone());
+            // A separate clone for `submit` to move wholesale into its own
+            // `move` closure below -- `hooks_config` itself stays alive in
+            // this scope for the `SessionEnd` firing point after
+            // `rokr_tui::run` returns, near the bottom of this function.
+            let hooks_config_for_submit = hooks_config.clone();
+
+            // `SessionStart` (PRD "Hooks"; architect decision: "SessionStart
+            // at startup"): fires once, here, before the TUI ever renders.
+            // Every configured hook's exit-0 stdout is concatenated and
+            // folded into the system prompt exactly like AGENTS.md project
+            // context above -- "follow existing context-assembly patterns"
+            // (architect decision). A hook that fails (non-blocking) or
+            // exits 2 never blocks startup: `SessionStart` has no veto
+            // semantics (there is nothing yet to veto), so both outcomes
+            // just log a one-line notice via `log_observational_hook_outcome`
+            // and startup continues.
+            for entry in matching_hook_entries(&hooks_config, "SessionStart", None) {
+                match run_hook_entry(entry, &rokr_hooks::HookPayload::SessionStart).await {
+                    rokr_hooks::HookResult::Success { stdout } => {
+                        if !stdout.trim().is_empty() {
+                            system_prompt.push_str("\n\n");
+                            system_prompt.push_str(stdout.trim());
+                        }
+                    }
+                    other => log_observational_hook_outcome("SessionStart", &other),
                 }
             }
 
@@ -611,6 +717,7 @@ async fn main() -> ExitCode {
                 let mcp_server_handles = mcp_server_handles.clone();
                 let mcp_tools_frozen = mcp_tools_frozen.clone();
                 let mcp_http_origins = mcp_http_origins.clone();
+                let hooks_config = hooks_config_for_submit.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -901,12 +1008,64 @@ async fn main() -> ExitCode {
                     // `read` tool's own io-error-to-failure behavior: any
                     // read error (missing file, permissions, non-UTF-8,
                     // ...) is treated as `NotFound`.
-                    let expanded_input = rokr_core::mentions::expand_mentions(&input, |path| {
-                        match std::fs::read_to_string(path) {
-                            Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
-                            Err(_) => rokr_core::mentions::MentionResolution::NotFound,
+                    let mut expanded_input =
+                        rokr_core::mentions::expand_mentions(&input, |path| {
+                            match std::fs::read_to_string(path) {
+                                Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
+                                Err(_) => rokr_core::mentions::MentionResolution::NotFound,
+                            }
+                        });
+
+                    // `UserPromptSubmit` (PRD "Hooks"; architect decision:
+                    // "UserPromptSubmit before each prompt is sent"): runs
+                    // BEFORE this turn's user message joins the transcript
+                    // at all, so a blocking deny (exit 2, unless the entry
+                    // opts out via `blocking: false`) can short-circuit the
+                    // whole submission with an early `Err` -- same "denied
+                    // before anything is recorded" shape `PreToolUse`'s
+                    // ordering rule gives tool calls, just one level up.
+                    // Every matching hook's exit-0 stdout is concatenated
+                    // and appended to `expanded_input`, injecting fresh
+                    // context into THIS turn's own user message (reusing
+                    // the plain user-text path, same reasoning as the
+                    // `@path`-mention expansion above: at least one
+                    // supported provider rejects an orphan tool-role
+                    // message on the wire).
+                    let mut injected_user_prompt_context = String::new();
+                    for entry in matching_hook_entries(&hooks_config, "UserPromptSubmit", None) {
+                        let payload = rokr_hooks::HookPayload::UserPromptSubmit {
+                            prompt: expanded_input.clone(),
+                        };
+                        match run_hook_entry(entry, &payload).await {
+                            rokr_hooks::HookResult::Success { stdout } => {
+                                if !stdout.trim().is_empty() {
+                                    if !injected_user_prompt_context.is_empty() {
+                                        injected_user_prompt_context.push_str("\n\n");
+                                    }
+                                    injected_user_prompt_context.push_str(stdout.trim());
+                                }
+                            }
+                            rokr_hooks::HookResult::Blocked { stderr } => {
+                                if entry.blocking.unwrap_or(true) {
+                                    return Err(stderr);
+                                }
+                                eprintln!(
+                                    "UserPromptSubmit hook exited 2 but its config entry sets \
+                                     blocking: false, allowing the prompt through: {stderr}"
+                                );
+                            }
+                            rokr_hooks::HookResult::NonBlockingFailure { message } => {
+                                eprintln!(
+                                    "UserPromptSubmit hook failed non-blocking, continuing \
+                                     without its injected context: {message}"
+                                );
+                            }
                         }
-                    });
+                    }
+                    if !injected_user_prompt_context.is_empty() {
+                        expanded_input =
+                            format!("{expanded_input}\n\n{injected_user_prompt_context}");
+                    }
 
                     let mut transcript = transcript.lock().await;
                     // Schema v2 (architect ruling, phase-5): capture the
@@ -921,62 +1080,93 @@ async fn main() -> ExitCode {
 
                     let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
 
-                    // Ticket 49 (hooks-tracer-bullet): interim, throwaway
-                    // wiring for exactly one `PreToolUse` hook, configured
-                    // via a single env var holding the hook's shell command
-                    // (e.g. `ROKR_PRETOOLUSE_HOOK="/path/to/hook.sh"`, run
-                    // verbatim via `sh -c`, no matcher/multiple-hooks
-                    // support) -- ticket 50 replaces this wholesale with
-                    // the real `hooks` config schema (per-event hook
-                    // lists, glob matcher, per-hook `timeout_ms`), mirroring
-                    // ticket 44's `ROKR_MCP_SERVER` interim pattern (later
-                    // replaced by ticket 45's `mcp` config schema). A
-                    // missing env var means no hook is configured: every
-                    // tool call is allowed through unchanged, at the cost
-                    // of one cheap `std::env::var` lookup per tool call
-                    // (never a subprocess spawn) rather than reading it
-                    // once up front -- this closure runs fresh per
-                    // `run_tool_loop` tool-call iteration, so re-reading
-                    // here keeps it self-contained without threading a
-                    // captured `Option<String>` through from outside.
-                    //
-                    // A hook whose exit code is 0 or any non-2 nonzero (or
-                    // that times out) degrades to `Allow` -- a one-line
-                    // `eprintln!` notice for the non-blocking-failure case,
-                    // never a crash or a wedged loop -- matching
-                    // `execute_hook`'s own non-blocking-failure contract
+                    // `PreToolUse` (ticket 49, hooks-tracer-bullet; replaced
+                    // here by ticket 50, hooks-remaining-events-and-config,
+                    // with the real `hooks` config schema -- the interim
+                    // `ROKR_PRETOOLUSE_HOOK` env var this superseded is
+                    // gone, mirroring how ticket 45's `mcp` config schema
+                    // superseded ticket 44's `ROKR_MCP_SERVER` env var):
+                    // runs every configured `PreToolUse` hook whose
+                    // `matcher` glob matches the tool name about to be
+                    // called (`matching_hook_entries`), in order, stopping
+                    // at the first that denies. A hook that exits 2 vetoes
+                    // UNLESS its own config entry sets `blocking: false`,
+                    // in which case the veto is downgraded to a logged
+                    // non-blocking notice -- see `HookEntry::blocking`'s doc
+                    // comment in `rokr-config` for why that escape hatch
+                    // exists. Any other outcome (success, non-blocking
+                    // failure, or a downgraded block) falls through to
+                    // `Allow`, matching `execute_hook`'s own
+                    // non-blocking-failure contract
                     // (`docs/adr/0012-hooks-execution-trust-model.md`).
                     let pre_tool_hook: &rokr_core::PreToolHookCallback<'_> =
                         &|request: rokr_core::PreToolHookRequest| {
+                            let hooks_config = hooks_config.clone();
                             Box::pin(async move {
-                                let Ok(command) = std::env::var("ROKR_PRETOOLUSE_HOOK") else {
-                                    return rokr_core::PreToolHookOutcome::Allow;
-                                };
-                                let payload = rokr_hooks::HookPayload::PreToolUse {
-                                    tool_name: request.tool_name,
-                                    tool_input: request.tool_input,
-                                };
-                                match rokr_hooks::execute_hook(
-                                    &command,
-                                    &payload,
-                                    rokr_hooks::DEFAULT_TIMEOUT,
-                                )
-                                .await
-                                {
-                                    rokr_hooks::HookResult::Success { .. } => {
-                                        rokr_core::PreToolHookOutcome::Allow
+                                let entries = matching_hook_entries(
+                                    &hooks_config,
+                                    "PreToolUse",
+                                    Some(&request.tool_name),
+                                );
+                                for entry in entries {
+                                    let payload = rokr_hooks::HookPayload::PreToolUse {
+                                        tool_name: request.tool_name.clone(),
+                                        tool_input: request.tool_input.clone(),
+                                    };
+                                    match run_hook_entry(entry, &payload).await {
+                                        rokr_hooks::HookResult::Success { .. } => {}
+                                        rokr_hooks::HookResult::Blocked { stderr } => {
+                                            if entry.blocking.unwrap_or(true) {
+                                                return rokr_core::PreToolHookOutcome::Deny(
+                                                    stderr,
+                                                );
+                                            }
+                                            eprintln!(
+                                                "PreToolUse hook exited 2 but its config entry \
+                                                 sets blocking: false, allowing the tool call \
+                                                 through: {stderr}"
+                                            );
+                                        }
+                                        rokr_hooks::HookResult::NonBlockingFailure { message } => {
+                                            eprintln!(
+                                                "PreToolUse hook failed non-blocking, allowing \
+                                                 the tool call through: {message}"
+                                            );
+                                        }
                                     }
-                                    rokr_hooks::HookResult::Blocked { stderr } => {
-                                        rokr_core::PreToolHookOutcome::Deny(stderr)
-                                    }
-                                    rokr_hooks::HookResult::NonBlockingFailure { message } => {
-                                        eprintln!(
-                                            "PreToolUse hook (ROKR_PRETOOLUSE_HOOK) failed \
-                                             non-blocking, allowing the tool call through: \
-                                             {message}"
-                                        );
-                                        rokr_core::PreToolHookOutcome::Allow
-                                    }
+                                }
+                                rokr_core::PreToolHookOutcome::Allow
+                            })
+                        };
+
+                    // `PostToolUse` (ticket 50, hooks-remaining-events-and-config;
+                    // PRD "Hooks", architect decision: "mirrors PreToolUse's
+                    // callback shape, non-blocking observational"): runs
+                    // every configured `PostToolUse` hook whose `matcher`
+                    // matches the tool that just ran, AFTER its result is
+                    // already decided. `PostToolHookCallback` returns `()`
+                    // (see that type's doc comment) -- nothing this closure
+                    // does can change the `ToolResult` already produced;
+                    // every outcome (including a stray exit 2) is just
+                    // logged via `log_observational_hook_outcome`.
+                    let post_tool_hook: &rokr_core::PostToolHookCallback<'_> =
+                        &|request: rokr_core::PostToolHookRequest| {
+                            let hooks_config = hooks_config.clone();
+                            Box::pin(async move {
+                                let entries = matching_hook_entries(
+                                    &hooks_config,
+                                    "PostToolUse",
+                                    Some(&request.tool_name),
+                                );
+                                for entry in entries {
+                                    let payload = rokr_hooks::HookPayload::PostToolUse {
+                                        tool_name: request.tool_name.clone(),
+                                        tool_input: request.tool_input.clone(),
+                                        tool_output: request.tool_output.clone(),
+                                        is_error: request.is_error,
+                                    };
+                                    let result = run_hook_entry(entry, &payload).await;
+                                    log_observational_hook_outcome("PostToolUse", &result);
                                 }
                             })
                         };
@@ -989,9 +1179,21 @@ async fn main() -> ExitCode {
                         &tools,
                         request_permission,
                         Some(pre_tool_hook),
+                        Some(post_tool_hook),
                     )
                     .await
                     .map_err(|err| err.to_string())?;
+
+                    // `Stop` (ticket 50, hooks-remaining-events-and-config;
+                    // PRD "Hooks", architect decision: "Stop when agent
+                    // finishes a turn"): fires here, once `run_tool_loop`
+                    // has produced this turn's final reply, fire-and-observe
+                    // like `PostToolUse` above (no veto semantics -- the
+                    // turn has already finished).
+                    for entry in matching_hook_entries(&hooks_config, "Stop", None) {
+                        let result = run_hook_entry(entry, &rokr_hooks::HookPayload::Stop).await;
+                        log_observational_hook_outcome("Stop", &result);
+                    }
 
                     // Schema v2 (architect ruling, phase-5): exactly ONE
                     // `Turn` record per submit, appended after
@@ -1309,7 +1511,26 @@ async fn main() -> ExitCode {
                 }
             };
 
-            match rokr_tui::run(submit, command, prompt_history, on_history_append, status_rx).await {
+            let run_result =
+                rokr_tui::run(submit, command, prompt_history, on_history_append, status_rx).await;
+
+            // `SessionEnd` (ticket 50, hooks-remaining-events-and-config;
+            // PRD "Hooks", architect decision: "SessionEnd at exit"): fires
+            // once, here, after the TUI has already returned control
+            // (regardless of whether it exited cleanly, hit a non-tty, or
+            // errored) and before this process' own exit code is decided.
+            // Fire-and-observe like `Stop`/`PostToolUse` -- nothing it does
+            // can change `run_result` below. `run_hook_entry`'s existing
+            // timeout contract (default 60s, per-entry override) is what
+            // keeps this from delaying process exit unboundedly; it is NOT
+            // itself further time-boxed beyond that, matching every other
+            // hook call site in this file.
+            for entry in matching_hook_entries(&hooks_config, "SessionEnd", None) {
+                let result = run_hook_entry(entry, &rokr_hooks::HookPayload::SessionEnd).await;
+                log_observational_hook_outcome("SessionEnd", &result);
+            }
+
+            match run_result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) if err.is_not_a_tty() => {
                     // Not an error in a scripting/piping context: config is

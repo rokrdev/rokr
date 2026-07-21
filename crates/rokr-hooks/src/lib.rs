@@ -30,10 +30,23 @@ pub enum HookEvent {
 /// puts the event's name in the payload as its own top-level `"event"`
 /// field, alongside whichever fields that event variant carries, so a hook
 /// script can dispatch on `.event` without rokr needing a second envelope
-/// type. Only the `PreToolUse` variant is populated by this ticket; shaped
-/// as an enum (rather than one flat struct with optional fields) so ticket
-/// 50 can add a variant per remaining v1 event additively, without touching
-/// this one's fields.
+/// type.
+///
+/// Ticket 50 (hooks-remaining-events-and-config) adds every remaining v1
+/// event variant additively, without touching `PreToolUse`'s existing
+/// fields:
+/// - `PostToolUse` mirrors `PreToolUse`'s `tool_name`/`tool_input`, plus the
+///   tool's own result (`tool_output`, `is_error`) -- fired
+///   non-blocking-observational AFTER the tool already ran (PRD "Hooks";
+///   architect decision), so there is no veto outcome to report back, only
+///   what happened.
+/// - `UserPromptSubmit` carries the raw prompt text about to be sent, so a
+///   hook script can inspect (or, on exit 2, block) it before it reaches the
+///   provider.
+/// - `SessionStart`, `Stop`, and `SessionEnd` are unit variants: none of the
+///   three needs event-specific data beyond the `"event"` tag itself
+///   (`SessionStart`'s context-injection value is its STDOUT on exit 0, not
+///   anything carried on this payload).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum HookPayload {
@@ -41,6 +54,18 @@ pub enum HookPayload {
         tool_name: String,
         tool_input: serde_json::Value,
     },
+    PostToolUse {
+        tool_name: String,
+        tool_input: serde_json::Value,
+        tool_output: String,
+        is_error: bool,
+    },
+    SessionStart,
+    UserPromptSubmit {
+        prompt: String,
+    },
+    Stop,
+    SessionEnd,
 }
 
 /// Outcome of running a hook subprocess to completion (or timing out),
@@ -67,15 +92,37 @@ pub enum HookResult {
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Whether `matcher` (a glob against the tool name, PRD "Hooks" matcher
-/// shape) matches `tool_name`. Only `"*"` (match everything) and an exact
-/// literal match are implemented -- a stub for ticket 50
-/// (hooks-remaining-events-and-config), which is expected to replace this
-/// with real glob syntax (`bash*`, `mcp__*`, ...) once the `hooks` config
-/// schema exists to drive it. Not exercised by this ticket's tests (no
-/// config/matcher wiring lands until ticket 50); kept minimal rather than
-/// building glob matching nothing calls yet.
+/// shape) matches `tool_name`. Ticket 50 (hooks-remaining-events-and-config)
+/// replaces ticket 49's exact-or-`"*"` stub with real glob syntax: `*`
+/// matches any run of characters (including none) and `?` matches exactly
+/// one character, everything else matches itself literally, and the whole
+/// pattern must match the whole tool name (implicitly anchored at both
+/// ends -- there is no partial/substring matching). This covers the PRD's
+/// namespacing shape (`mcp__*` matching every tool on any MCP server)
+/// without pulling in a `glob`/`globset` dependency for two-symbol syntax --
+/// see `Cargo.toml`'s doc comment for the "hand-rolled over new dep"
+/// rationale recorded for this ticket.
+///
+/// Ignored entirely for lifecycle events (`SessionStart`, `UserPromptSubmit`,
+/// `Stop`, `SessionEnd`) -- those fire every configured hook regardless of
+/// `matcher`, per the PRD's "Matcher shape" note. That's enforced by the
+/// caller (only `PreToolUse`/`PostToolUse` dispatch ever calls this
+/// function), not by anything in this function's own logic.
 pub fn matches_tool_name(matcher: &str, tool_name: &str) -> bool {
-    matcher == "*" || matcher == tool_name
+    fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((b'*', rest)) => {
+                glob_match(rest, text) || (!text.is_empty() && glob_match(pattern, &text[1..]))
+            }
+            Some((b'?', rest)) => !text.is_empty() && glob_match(rest, &text[1..]),
+            Some((literal, rest)) => {
+                !text.is_empty() && text[0] == *literal && glob_match(rest, &text[1..])
+            }
+        }
+    }
+
+    glob_match(matcher.as_bytes(), tool_name.as_bytes())
 }
 
 /// Runs `command` as a shell command (`sh -c command` -- never `sh -c
@@ -190,6 +237,78 @@ mod tests {
             "rokr-hooks-test-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    /// Ticket 50 (hooks-remaining-events-and-config): `matches_tool_name`
+    /// grows real glob syntax (`*`/`?`) beyond ticket 49's exact-or-`"*"`
+    /// stub, so a matcher like `mcp__*` fires for every namespaced MCP tool
+    /// without needing one config entry per tool name.
+    #[test]
+    fn glob_matcher_only_matches_configured_tool_name_pattern_for_pre_and_post_tool_use() {
+        assert!(
+            matches_tool_name("mcp__*", "mcp__myserver__search"),
+            "expected 'mcp__*' to match a namespaced MCP tool name"
+        );
+        assert!(
+            !matches_tool_name("mcp__*", "bash"),
+            "expected 'mcp__*' NOT to match a tool name outside the mcp__ namespace"
+        );
+        assert!(
+            matches_tool_name("bash", "bash"),
+            "expected an exact literal matcher to still match the identical tool name"
+        );
+        assert!(
+            !matches_tool_name("bash", "bashful"),
+            "expected an exact literal matcher NOT to match a longer tool name with it as a prefix"
+        );
+        assert!(
+            matches_tool_name("*", "anything_at_all"),
+            "expected '*' to still match every tool name"
+        );
+        assert!(
+            matches_tool_name("git_?ommit", "git_commit"),
+            "expected '?' to match exactly one character"
+        );
+        assert!(
+            !matches_tool_name("git_?ommit", "git_ommit"),
+            "expected '?' NOT to match zero characters"
+        );
+    }
+
+    /// Ticket 50: every remaining v1 `HookPayload` variant serializes with
+    /// the externally-tagged `"event"` field carrying its own variant name,
+    /// same shape `PreToolUse` already proved end-to-end via
+    /// `hook_payload_delivered_as_json_on_stdin_never_interpolated_into_command_line`
+    /// above.
+    #[test]
+    fn remaining_v1_hook_payload_variants_serialize_with_matching_event_tag() {
+        let post_tool_use = serde_json::to_value(HookPayload::PostToolUse {
+            tool_name: "bash".to_string(),
+            tool_input: serde_json::json!({"command": "ls"}),
+            tool_output: "file1\nfile2".to_string(),
+            is_error: false,
+        })
+        .unwrap();
+        assert_eq!(post_tool_use["event"], "PostToolUse");
+        assert_eq!(post_tool_use["tool_name"], "bash");
+        assert_eq!(post_tool_use["tool_output"], "file1\nfile2");
+        assert_eq!(post_tool_use["is_error"], false);
+
+        let session_start = serde_json::to_value(HookPayload::SessionStart).unwrap();
+        assert_eq!(session_start["event"], "SessionStart");
+
+        let user_prompt_submit = serde_json::to_value(HookPayload::UserPromptSubmit {
+            prompt: "hello agent".to_string(),
+        })
+        .unwrap();
+        assert_eq!(user_prompt_submit["event"], "UserPromptSubmit");
+        assert_eq!(user_prompt_submit["prompt"], "hello agent");
+
+        let stop = serde_json::to_value(HookPayload::Stop).unwrap();
+        assert_eq!(stop["event"], "Stop");
+
+        let session_end = serde_json::to_value(HookPayload::SessionEnd).unwrap();
+        assert_eq!(session_end["event"], "SessionEnd");
     }
 
     #[tokio::test]

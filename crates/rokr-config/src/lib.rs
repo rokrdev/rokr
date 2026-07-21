@@ -27,6 +27,49 @@ pub struct Config {
     /// `ROKR_MCP_SERVER` env-var interim wiring with this real schema.
     #[serde(default)]
     pub mcp: std::collections::HashMap<String, McpServerConfig>,
+    /// Configured hooks, keyed by event name (`"PreToolUse"`,
+    /// `"PostToolUse"`, `"SessionStart"`, `"UserPromptSubmit"`, `"Stop"`,
+    /// `"SessionEnd"`). Additive-optional (ADR 0010): an existing file
+    /// missing this field gets an empty map at runtime; the field is never
+    /// written back. Keyed by a plain `String` rather than
+    /// `rokr_hooks::HookEvent` so this crate stays dependency-free of
+    /// `rokr-hooks`, matching how `mcp` above defines its own
+    /// `McpServerConfig`/`McpTransport` types rather than reusing
+    /// `rokr-mcp`'s; `crates/rokr/src/main.rs` is the one place that knows
+    /// both this string key and `rokr_hooks::HookEvent` and maps between
+    /// them. Per docs/adr/0012-hooks-execution-trust-model.md and the PRD's
+    /// "Config schema" section, `hooks` (like `mcp`) is loaded from
+    /// user-scope config ONLY -- there is no project-scope config loader
+    /// yet for either field to be read from by mistake (ticket 51 adds the
+    /// loader-level enforcement test once project-scope config exists as a
+    /// concept).
+    #[serde(default)]
+    pub hooks: std::collections::HashMap<String, Vec<HookEntry>>,
+}
+
+/// One configured hook entry (PRD "Config schema"). `matcher` is a glob
+/// against the tool name (`rokr_hooks::matches_tool_name`) for
+/// `PreToolUse`/`PostToolUse` only -- `None` behaves like `"*"` (match every
+/// tool) at the call site, and the field is ignored entirely for lifecycle
+/// events. `timeout_ms` overrides `rokr_hooks::DEFAULT_TIMEOUT` (60s) when
+/// present. `blocking` lets a hook opt out of the exit-code-2 blocking
+/// contract (`docs/adr/0012-hooks-execution-trust-model.md`'s exit-code
+/// contract) even for an event that otherwise honors it (`PreToolUse`,
+/// `UserPromptSubmit`) -- `None`/`Some(true)` keeps the default blocking
+/// behavior; `Some(false)` downgrades an exit-2 result to a non-blocking
+/// failure, e.g. for a hook script whose author wants "observe only, never
+/// actually veto" even if the script's exit code is wrong. Events that are
+/// unconditionally non-blocking by design (`PostToolUse`, `Stop`,
+/// `SessionEnd`) ignore this field.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HookEntry {
+    #[serde(default)]
+    pub matcher: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub blocking: Option<bool>,
 }
 
 fn default_context_window_size() -> u32 {
@@ -242,6 +285,7 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
         context_window_size: default_context_window_size(),
         auto_compact_threshold: default_auto_compact_threshold(),
         mcp: std::collections::HashMap::new(),
+        hooks: std::collections::HashMap::new(),
     };
     let json = serde_json::to_string_pretty(&config).expect("Config serialization is infallible");
     std::fs::write(&file_path, json)?;
@@ -496,6 +540,57 @@ mod tests {
         let config: Config = serde_json::from_str(json_with_auto_approve).unwrap();
         let server = config.mcp.get("my-server").expect("expected my-server entry");
         assert_eq!(server.auto_approve, vec!["tool_a".to_string()]);
+    }
+
+    /// Ticket 50 (hooks-remaining-events-and-config), PRD "Config schema":
+    /// `hooks` is additive-optional (defaults to an empty map when absent,
+    /// mirroring `mcp`'s own default test above) and, when present, is a map
+    /// of event name -> list of `{ matcher?, command, timeout_ms?, blocking? }`
+    /// entries.
+    #[test]
+    fn hooks_config_field_deserializes_per_event_entries_and_defaults_to_empty() {
+        let json_without_hooks = r#"{"version": 1}"#;
+        let config: Config = serde_json::from_str(json_without_hooks).unwrap();
+        assert!(
+            config.hooks.is_empty(),
+            "expected empty hooks map when field absent, got: {:?}",
+            config.hooks
+        );
+
+        let json_with_hooks = r#"{
+            "version": 1,
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "bash*", "command": "/path/to/hook.sh", "timeout_ms": 5000 }
+                ],
+                "SessionStart": [
+                    { "command": "/path/to/session-start.sh" }
+                ]
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json_with_hooks).unwrap();
+
+        let pre_tool_use = config
+            .hooks
+            .get("PreToolUse")
+            .expect("expected PreToolUse entry");
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(pre_tool_use[0].matcher.as_deref(), Some("bash*"));
+        assert_eq!(pre_tool_use[0].command, "/path/to/hook.sh");
+        assert_eq!(pre_tool_use[0].timeout_ms, Some(5000));
+        assert_eq!(
+            pre_tool_use[0].blocking, None,
+            "expected blocking to default to None (unspecified) when absent"
+        );
+
+        let session_start = config
+            .hooks
+            .get("SessionStart")
+            .expect("expected SessionStart entry");
+        assert_eq!(session_start.len(), 1);
+        assert_eq!(session_start[0].matcher, None);
+        assert_eq!(session_start[0].command, "/path/to/session-start.sh");
+        assert_eq!(session_start[0].timeout_ms, None);
     }
 
     #[test]

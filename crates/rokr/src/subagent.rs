@@ -201,10 +201,11 @@ async fn run_subagent<P: rokr_core::Provider>(
         (request_permission)(tag_permission_request(request, subagent_name))
     };
 
-    // Ticket 49 (hooks-tracer-bullet): `PreToolUse` hooks fire for the
-    // main loop only in this ticket -- a subagent's own tool calls don't
-    // (yet) go through a hook check, hence the hardcoded `None` rather than
-    // threading a hook callback down from `SubagentTool`.
+    // Ticket 49 (hooks-tracer-bullet), extended by ticket 50
+    // (hooks-remaining-events-and-config): `PreToolUse`/`PostToolUse` hooks
+    // fire for the main loop only -- a subagent's own tool calls don't
+    // (yet) go through either hook check, hence the hardcoded `None`s
+    // rather than threading hook callbacks down from `SubagentTool`.
     let (reply, _usage) = rokr_core::run_tool_loop(
         provider,
         subagent_prompt,
@@ -212,6 +213,7 @@ async fn run_subagent<P: rokr_core::Provider>(
         &mut transcript,
         tools,
         tagged_request_permission,
+        None,
         None,
     )
     .await

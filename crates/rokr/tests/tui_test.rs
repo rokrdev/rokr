@@ -2870,10 +2870,13 @@ async fn bash_tool_call_skips_execution_on_reject() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
-/// Ticket 49 (hooks-tracer-bullet) acceptance test: a real shell-script
-/// `PreToolUse` hook (wired via the interim `ROKR_PRETOOLUSE_HOOK` env var
-/// -- see `main.rs`'s doc comment on that wiring) that exits 2 must veto a
-/// `bash` tool call before the permission prompt ever renders. Mirrors
+/// Ticket 49 (hooks-tracer-bullet) acceptance test, updated by ticket 50
+/// (hooks-remaining-events-and-config) to configure the hook via a real
+/// `rokr.json` `hooks.PreToolUse` entry (`write_hooks_config`) instead of
+/// ticket 49's interim `ROKR_PRETOOLUSE_HOOK` env var, which ticket 50
+/// removes entirely from `main.rs`: a real shell-command `PreToolUse` hook
+/// that exits 2 must veto a `bash` tool call before the permission prompt
+/// ever renders. Mirrors
 /// `bash_tool_call_renders_permission_prompt_and_runs_on_accept`/
 /// `bash_tool_call_skips_execution_on_reject`'s structure, but asserts the
 /// ABSENCE of the permission prompt (the marker path text, which only ever
@@ -2949,6 +2952,13 @@ async fn pretooluse_hook_script_denies_bash_call_before_permission_prompt_appear
 
     let home = unique_temp_dir("home-hook-veto");
     let xdg_config_home = unique_temp_dir("xdg-config-home-hook-veto");
+    // The hook: reads (and discards) its JSON stdin payload, then always
+    // exits 2 -- a blocking veto regardless of which tool call it saw.
+    write_hooks_config(
+        &xdg_config_home,
+        "PreToolUse",
+        "cat >/dev/null; echo 'vetoed: no bash allowed' >&2; exit 2",
+    );
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -2966,12 +2976,6 @@ async fn pretooluse_hook_script_denies_bash_call_before_permission_prompt_appear
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
-    // The hook: reads (and discards) its JSON stdin payload, then always
-    // exits 2 -- a blocking veto regardless of which tool call it saw.
-    cmd.env(
-        "ROKR_PRETOOLUSE_HOOK",
-        "cat >/dev/null; echo 'vetoed: no bash allowed' >&2; exit 2",
-    );
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -3054,6 +3058,645 @@ async fn pretooluse_hook_script_denies_bash_call_before_permission_prompt_appear
     assert!(
         !marker_path.exists(),
         "the bash command must never run after the PreToolUse hook vetoed it"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config) acceptance test: a
+/// `rokr.json` with a `SessionStart` hook whose command echoes distinctive
+/// text to stdout must have that text folded into the outgoing system
+/// prompt at startup -- proven the same way
+/// `agents_md_content_appears_in_outgoing_system_prompt` proves AGENTS.md's
+/// project-context injection: by inspecting the FIRST request's raw body
+/// via the mock server's request recording, not by scraping rendered pty
+/// bytes (ratatui's own line-wrapping of a long system prompt would make a
+/// literal on-screen substring match unreliable).
+#[tokio::test]
+async fn sessionstart_hook_stdout_appears_in_transcript_context_at_startup() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let canned_response = "MockedAssistantReplyForSessionStartHookTesting";
+    let session_start_marker = "DistinctiveSessionStartHookStdoutForTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-sessionstart-hook",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-sessionstart-hook");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-sessionstart-hook");
+    write_hooks_config(
+        &xdg_config_home,
+        "SessionStart",
+        &format!("echo '{session_start_marker}'"),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"helloworld\r")
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least 1 request to /chat/completions, got 0"
+    );
+
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+
+    assert!(
+        first_request_body.contains(session_start_marker),
+        "expected the outgoing request body to contain the SessionStart hook's stdout, proving \
+         it was injected into the conversation context at startup, got: {first_request_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config) acceptance test: a
+/// `rokr.json` with a `UserPromptSubmit` hook whose command echoes
+/// distinctive text to stdout must have that text injected into EVERY
+/// submitted turn's outgoing request, not just the first -- proven across
+/// two separate submissions (mirroring
+/// `second_prompt_includes_prior_turn_in_request_body`'s two-turn PTY
+/// structure), inspecting each turn's own raw request body via the mock
+/// server's request recording.
+#[tokio::test]
+async fn userpromptsubmit_hook_injects_context_before_each_prompt_is_sent() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let first_reply_text = "FirstReplyAfterUserPromptSubmitHookForTesting";
+    let second_reply_text = "SecondReplyAfterUserPromptSubmitHookForTesting";
+    let user_prompt_submit_marker = "DistinctiveUserPromptSubmitHookStdoutForTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-userpromptsubmit-hook-first",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": first_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-userpromptsubmit-hook-second",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": second_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-userpromptsubmit-hook");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-userpromptsubmit-hook");
+    write_hooks_config(
+        &xdg_config_home,
+        "UserPromptSubmit",
+        &format!("echo '{user_prompt_submit_marker}'"),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"firstpromptunique\r")
+        .expect("failed to write first prompt to pty");
+
+    let first_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain the first mocked assistant response, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"secondpromptunique\r")
+        .expect("failed to write second prompt to pty");
+
+    let second_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < second_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain the second mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        received_requests.len() >= 2,
+        "expected at least 2 requests to /chat/completions, got {}: {received_requests:?}",
+        received_requests.len()
+    );
+
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    let second_request_body = String::from_utf8_lossy(&received_requests[1].body).into_owned();
+
+    assert!(
+        first_request_body.contains(user_prompt_submit_marker),
+        "expected the first turn's outgoing request body to contain the UserPromptSubmit hook's \
+         stdout, got: {first_request_body}"
+    );
+    // A plain `.contains()` check here would be tautological: turn 1's
+    // injected marker is already persisted into the transcript as part of
+    // that turn's user message, and turn 2's request body carries the
+    // WHOLE transcript so far (proven separately by
+    // `second_prompt_includes_prior_turn_in_request_body`) -- so the marker
+    // would appear in the second body even if the hook never fired again.
+    // Counting occurrences is what actually proves a SECOND, fresh
+    // injection happened: one carried over from turn 1's transcript entry,
+    // one newly injected into turn 2's own user message.
+    let second_body_marker_count = second_request_body
+        .matches(user_prompt_submit_marker)
+        .count();
+    assert!(
+        second_body_marker_count >= 2,
+        "expected the SECOND turn's outgoing request body to contain the UserPromptSubmit \
+         hook's stdout TWICE (once carried over from turn 1's transcript entry, once freshly \
+         injected into turn 2's own prompt) -- it must fire before EVERY submitted prompt, not \
+         just the first; got {second_body_marker_count} occurrence(s) in: {second_request_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config) acceptance test: the glob
+/// matcher must only fire a `PreToolUse` hook for tool names it actually
+/// matches. A hook configured with `matcher: "mcp__*"` (which always exits
+/// 2, i.e. would veto everything if it fired) must NOT veto a `bash` call --
+/// mirrors `bash_tool_call_renders_permission_prompt_and_runs_on_accept`'s
+/// exact structure (permission prompt renders, accepting it lets the
+/// command actually run), the opposite assertion from
+/// `pretooluse_hook_script_denies_bash_call_before_permission_prompt_appears`
+/// above, which uses no `matcher` (defaulting to match-everything) and DOES
+/// veto.
+#[tokio::test]
+async fn pretooluse_hook_matcher_only_vetoes_matching_tool_names() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterNonMatchingHookForTesting";
+
+    let temp_dir = unique_temp_dir("hook-matcher-target");
+    let marker_path = temp_dir.join("hookmatcher-marker");
+    let marker_path_str = marker_path.to_string_lossy().into_owned();
+    let bash_command = format!("touch {marker_path_str}");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-matcher",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-matcher-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-hook-matcher");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-hook-matcher");
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+    let config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "mcp__*",
+                    "command": "cat >/dev/null; echo 'should never veto bash' >&2; exit 2"
+                }
+            ]
+        }
+    });
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"runbash\r")
+        .expect("failed to write prompt to pty");
+
+    // The non-matching hook must NOT veto: the permission prompt should
+    // still render, exactly like the no-hook-configured case.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("bash") && output.contains("hookmatcher-marker") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("bash") && output.contains("hookmatcher-marker"),
+        "expected the permission prompt to render (proving the non-matching 'mcp__*' hook did \
+         NOT veto the bash call), got: {output:?}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "the bash command must not have run before permission was granted"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply, got: {output:?}"
+    );
+    assert!(
+        marker_path.exists(),
+        "the bash command must have run after permission was granted (the non-matching hook \
+         must never have vetoed it)"
     );
 
     writer.write_all(b"q").expect("failed to write q to pty");
@@ -8495,6 +9138,36 @@ fn write_mcp_config_servers(
         );
     }
     let config = serde_json::json!({ "version": 1, "mcp": mcp });
+
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config): writes a `rokr.json`
+/// declaring exactly one hook entry for `event` into
+/// `xdg_config_home/rokr/rokr.json` BEFORE the `rokr` binary is spawned,
+/// mirroring `write_mcp_config` above (same "existing file" `load_or_init`
+/// branch, same user-scope-only trust boundary this ticket's config schema
+/// shares with `mcp`'s). `command` is a real shell command string (run via
+/// `sh -c`, same as `execute_hook`), not a script path -- matching how
+/// `pretooluse_hook_script_denies_bash_call_before_permission_prompt_appears`
+/// already inlines its hook logic as a one-line shell command rather than a
+/// separate fixture file.
+fn write_hooks_config(xdg_config_home: &std::path::Path, event: &str, command: &str) {
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+
+    let config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            event: [
+                { "command": command }
+            ]
+        }
+    });
 
     std::fs::write(
         config_dir.join("rokr.json"),
