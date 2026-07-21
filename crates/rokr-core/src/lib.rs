@@ -6,6 +6,7 @@ use std::pin::Pin;
 pub mod context;
 pub mod mentions;
 pub mod message;
+pub mod pricing;
 
 pub use message::{CacheControl, CacheControlKind, ContentBlock, Message, Role};
 

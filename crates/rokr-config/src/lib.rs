@@ -51,6 +51,24 @@ pub struct Config {
     /// test is the forward regression guard for once one exists (Phase 7).
     #[serde(default)]
     pub hooks: std::collections::HashMap<String, Vec<HookEntry>>,
+    /// Per-model USD pricing for cost calculation (ticket 56,
+    /// cost-pricing-math; ADR 0010 additive-optional field). Unlike
+    /// `mcp`/`hooks` above, an absent field does NOT default to an empty
+    /// map -- there IS a sane built-in default (a small table of known
+    /// models' published per-token rates), so a config file missing this
+    /// key still gets useful pricing out of the box. A user-supplied
+    /// `model_pricing` block in the file is honored verbatim in place of
+    /// (not merged into) these built-in defaults for any model key it
+    /// names; models the user's file doesn't mention keep no built-in
+    /// entry once the user has supplied the field at all -- same
+    /// last-value-wins semantics `serde`'s field-level default already
+    /// gives every other field here. `rokr-core`'s `calculate_cost` (which
+    /// this table feeds) is a separate, same-shaped `PricingEntry` type in
+    /// that crate -- `rokr-config` and `rokr-core` have no dependency edge
+    /// on each other, matching how `mcp`/`hooks` above already define their
+    /// own crate-local types rather than reusing another crate's.
+    #[serde(default = "default_model_pricing")]
+    pub model_pricing: std::collections::HashMap<String, ModelPricing>,
 }
 
 /// One configured hook entry (PRD "Config schema"). `matcher` is a glob
@@ -78,12 +96,59 @@ pub struct HookEntry {
     pub blocking: Option<bool>,
 }
 
+/// Per-token USD pricing for one model (PRD "Cost accounting"). One rate
+/// per token type `rokr_core::Usage` tracks: input, output, cache-read,
+/// cache-write. A separate, same-shaped type from `rokr-core`'s
+/// `PricingEntry` -- see `Config::model_pricing`'s doc comment for why.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelPricing {
+    pub input_price_per_token: f64,
+    pub output_price_per_token: f64,
+    pub cache_read_price_per_token: f64,
+    pub cache_write_price_per_token: f64,
+}
+
 fn default_context_window_size() -> u32 {
     200_000
 }
 
 fn default_auto_compact_threshold() -> f64 {
     0.7
+}
+
+/// Built-in per-model pricing defaults (ticket 56, cost-pricing-math), used
+/// when `Config::model_pricing` is absent from the file. Approximate,
+/// published per-token USD rates (converted from the commonly quoted
+/// per-million-token prices) for a couple of models already referenced
+/// elsewhere in this codebase (`crates/rokr/src/main.rs`,
+/// `crates/rokr-session`). Not exhaustive -- an unlisted model simply has no
+/// entry, which `rokr-core::calculate_cost` treats as "unpriced" and falls
+/// back to `$0.00` rather than guessing.
+fn default_model_pricing() -> std::collections::HashMap<String, ModelPricing> {
+    let mut table = std::collections::HashMap::new();
+    table.insert(
+        "claude-3-5-sonnet-20241022".to_string(),
+        ModelPricing {
+            input_price_per_token: 0.000_003,
+            output_price_per_token: 0.000_015,
+            cache_read_price_per_token: 0.000_000_3,
+            cache_write_price_per_token: 0.000_003_75,
+        },
+    );
+    table.insert(
+        "gpt-4o-mini".to_string(),
+        ModelPricing {
+            input_price_per_token: 0.000_000_15,
+            output_price_per_token: 0.000_000_6,
+            cache_read_price_per_token: 0.000_000_075,
+            // OpenAI's prompt caching has no separate publicly quoted
+            // write-side rate at time of writing -- approximated here as
+            // equal to the input rate rather than left at 0.0, so a
+            // cache-write-heavy session isn't silently under-costed.
+            cache_write_price_per_token: 0.000_000_15,
+        },
+    );
+    table
 }
 
 /// Argus F-005: an MCP server block with no explicit `enabled` key defaults
@@ -295,8 +360,13 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
                 supported: 1,
             });
         }
+        let mut model_pricing = config.model_pricing;
+        for (model, entry) in default_model_pricing() {
+            model_pricing.entry(model).or_insert(entry);
+        }
         let config = Config {
             auto_compact_threshold: sanitized_auto_compact_threshold(config.auto_compact_threshold),
+            model_pricing,
             ..config
         };
         scaffold_agent_prompts(config_dir)?;
@@ -309,6 +379,7 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
         auto_compact_threshold: default_auto_compact_threshold(),
         mcp: std::collections::HashMap::new(),
         hooks: std::collections::HashMap::new(),
+        model_pricing: default_model_pricing(),
     };
     let json = serde_json::to_string_pretty(&config).expect("Config serialization is infallible");
     std::fs::write(&file_path, json)?;
@@ -900,6 +971,94 @@ mod tests {
         assert!(
             !config.mcp.contains_key("project-injected-server"),
             "project-local mcp block leaked into the loaded config"
+        );
+    }
+
+    /// Ticket 56 (cost-pricing-math), ADR 0010 additive-optional field: an
+    /// existing `rokr.json` with no `model_pricing` key must load with the
+    /// built-in per-model pricing defaults intact (not an empty map --
+    /// unlike `mcp`/`hooks`, which default to empty since there's no sane
+    /// built-in value for those), and the file must be byte-identical after
+    /// the load, exactly like every other additive-optional field above.
+    #[test]
+    fn config_missing_model_pricing_field_loads_with_built_in_defaults_and_is_never_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        let existing = r#"{"version": 1}"#;
+        std::fs::write(&file_path, existing).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        assert_eq!(
+            config.model_pricing,
+            default_model_pricing(),
+            "expected the built-in model_pricing defaults when the field is absent, got: {:?}",
+            config.model_pricing
+        );
+        assert!(
+            !config.model_pricing.is_empty(),
+            "expected non-empty built-in defaults, not an empty map like mcp/hooks default to"
+        );
+
+        let contents_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            contents_after, existing,
+            "existing config file lacking model_pricing must not be rewritten"
+        );
+    }
+
+    /// Team-lead correction to ticket 56 (cost-pricing-math): the PRD's
+    /// settled decision is a PER-MODEL merge, not wholesale replacement --
+    /// a user's `model_pricing` entry overrides ONLY that model key; any
+    /// built-in default model the user's file doesn't mention must still
+    /// resolve. Proven here with a file naming just one of the two built-in
+    /// models with clearly-distinct custom rates: the named model's custom
+    /// rate must win, and the OTHER built-in model (unmentioned by the
+    /// user) must still be present with its built-in default rate --
+    /// wholesale replacement would silently drop it.
+    #[test]
+    fn config_model_pricing_user_entry_overrides_only_its_own_model_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        let existing = r#"{
+            "version": 1,
+            "model_pricing": {
+                "claude-3-5-sonnet-20241022": {
+                    "input_price_per_token": 0.000009,
+                    "output_price_per_token": 0.000045,
+                    "cache_read_price_per_token": 0.0000009,
+                    "cache_write_price_per_token": 0.00001125
+                }
+            }
+        }"#;
+        std::fs::write(&file_path, existing).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        let custom = config
+            .model_pricing
+            .get("claude-3-5-sonnet-20241022")
+            .expect("expected the user's custom entry for claude-3-5-sonnet-20241022");
+        assert_eq!(
+            custom.input_price_per_token, 0.000009,
+            "the user's custom rate for the model they named must win"
+        );
+
+        let expected_default_gpt = default_model_pricing()
+            .get("gpt-4o-mini")
+            .copied()
+            .expect("expected gpt-4o-mini in the built-in defaults");
+        assert_eq!(
+            config.model_pricing.get("gpt-4o-mini"),
+            Some(&expected_default_gpt),
+            "a built-in default model the user's file didn't mention must still resolve, got: {:?}",
+            config.model_pricing.get("gpt-4o-mini")
+        );
+
+        let contents_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            contents_after, existing,
+            "a partial model_pricing override must not cause the file to be rewritten"
         );
     }
 }
