@@ -479,78 +479,71 @@ async fn main() -> ExitCode {
             // ends).
             let (status_tx, status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
 
-            // Ticket 44 (mcp-tracer-bullet): interim, throwaway wiring for
-            // exactly one stdio MCP server, configured via a single env var
-            // holding the server's command line (e.g.
-            // `ROKR_MCP_SERVER="/path/to/server --flag"`, whitespace-split,
-            // no shell parsing) -- ticket 45 replaces this with the real
-            // `mcp` config schema (multiple named servers, `auto_approve`,
-            // etc.). The server name is hardcoded to `"interim"` since
-            // there's no config to read a real name from yet;
-            // `rokr_mcp::qualified_name` namespaces every tool as
-            // `mcp__interim__<tool>`.
-            //
-            // Spawned and listed here, before the TUI starts, rather than
-            // as a background task -- the PRD's preferred shape for the
-            // productionized version (ticket 45+) is a background tokio
-            // task so MCP init never delays first paint, but this tracer
-            // bullet's env-var-gated single server is opt-in (nobody sets
-            // `ROKR_MCP_SERVER` by default) and the ticket's own carve-out
-            // permits inline init here "if trivial" -- deferring the
-            // background-task version to the productionization ticket
-            // rather than gold-plating this throwaway path.
-            //
-            // A missing env var, a server that fails to spawn, or a failed
-            // `initialize`/`tools/list` round-trip all degrade to zero MCP
-            // tools (a one-line `eprintln!` notice, no crash, no blocked
-            // startup) -- matching the built-in tools' own
-            // never-crash-the-TUI-on-a-degraded-optional-feature pattern
-            // elsewhere in this function (repo-map generation, prompt
-            // history, session persistence).
-            let mcp_tools: Vec<rokr_mcp::McpTool> = match std::env::var("ROKR_MCP_SERVER") {
-                Ok(command_line) => {
-                    let mut parts = command_line.split_whitespace();
-                    match parts.next() {
-                        Some(command) => {
-                            let args: Vec<String> = parts.map(str::to_string).collect();
-                            match rokr_mcp::RmcpStdioClient::spawn(command, &args).await {
-                                Ok(client) => {
-                                    let client: Arc<dyn rokr_mcp::McpClientPort> =
-                                        Arc::new(client);
-                                    match client.list_tools().await {
-                                        Ok(defs) => defs
-                                            .into_iter()
-                                            .map(|def| {
-                                                rokr_mcp::McpTool::new(
-                                                    client.clone(),
-                                                    "interim",
-                                                    def,
-                                                )
-                                            })
-                                            .collect(),
-                                        Err(err) => {
-                                            eprintln!(
-                                                "failed to list tools from MCP server \
-                                                 (ROKR_MCP_SERVER): {err}"
-                                            );
-                                            Vec::new()
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    eprintln!(
-                                        "failed to start MCP server (ROKR_MCP_SERVER): {err}"
-                                    );
-                                    Vec::new()
-                                }
-                            }
-                        }
-                        None => Vec::new(),
+            // Ticket 45 (mcp-config-and-lifecycle): each enabled stdio
+            // server configured in user-scope rokr.json is spawned on its
+            // own background tokio task inside rokr-mcp
+            // (`rokr_mcp::spawn_stdio_server`), strictly off the render
+            // path -- first paint never waits on any MCP server (PRD "MCP
+            // lifecycle"). A server's tools become available once it
+            // reports ready (`McpServerHandle::tools`, read fresh at each
+            // `submit` below); a server whose init fails contributes zero
+            // tools and surfaces a one-line status notice instead of
+            // crashing or blocking the rest of rokr. Replaces ticket 44's
+            // `ROKR_MCP_SERVER` env-var interim wiring wholesale (see
+            // docs/adr/0011-rokr-mcp-crate-boundary.md's Consequences
+            // section).
+            let (mcp_notice_tx, mcp_notice_rx) = std::sync::mpsc::channel::<String>();
+            // Bridges rokr-mcp's plain `String` notices (rokr-mcp depends
+            // on rokr-core only -- ADR 0011 -- so it can't know about
+            // `rokr_tui::SessionStatus` itself) onto the SAME SessionStatus
+            // channel ticket 43 built for context-percent updates, so a
+            // degraded-server notice shows up in the header status line
+            // without a second render-loop channel. Reads the current
+            // last-known context percent (rather than hardcoding 0.0) so a
+            // notice arriving after a real turn has already reported usage
+            // doesn't stomp that figure back to zero. `mcp_notice_rx.recv()`
+            // blocks its thread until a notice arrives (or every sender
+            // drops), so this runs via `spawn_blocking` rather than inline
+            // in an async task, matching this codebase's existing rule
+            // (ADR 0008) that blocking work never runs on an async task
+            // that could otherwise be polled on the render thread.
+            {
+                let status_tx = status_tx.clone();
+                let last_known_usage = last_known_usage.clone();
+                tokio::task::spawn_blocking(move || {
+                    while let Ok(notice) = mcp_notice_rx.recv() {
+                        let context_percent = last_known_usage
+                            .lock()
+                            .unwrap()
+                            .map(|usage| {
+                                (usage.input_tokens + usage.output_tokens) as f64
+                                    / context_window_size as f64
+                            })
+                            .unwrap_or(0.0);
+                        let _ = status_tx.send(rokr_tui::SessionStatus {
+                            context_percent,
+                            notice: Some(notice),
+                        });
                     }
-                }
-                Err(_) => Vec::new(),
-            };
-            let mcp_tools = Arc::new(mcp_tools);
+                });
+            }
+
+            let mcp_server_handles: Arc<Vec<rokr_mcp::McpServerHandle>> = Arc::new(
+                config
+                    .mcp
+                    .iter()
+                    .filter(|(_, server)| server.enabled)
+                    .map(|(name, server)| match &server.transport {
+                        rokr_config::McpTransport::Stdio(stdio) => rokr_mcp::spawn_stdio_server(
+                            name.clone(),
+                            stdio.command.clone(),
+                            stdio.args.clone(),
+                            stdio.env.clone(),
+                            mcp_notice_tx.clone(),
+                        ),
+                    })
+                    .collect(),
+            );
 
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
@@ -563,7 +556,7 @@ async fn main() -> ExitCode {
                 let turn_index = turn_index.clone();
                 let data_dir = data_dir.clone();
                 let status_tx = status_tx.clone();
-                let mcp_tools = mcp_tools.clone();
+                let mcp_server_handles = mcp_server_handles.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -751,6 +744,27 @@ async fn main() -> ExitCode {
                         subagent_request_permission,
                     );
 
+                    // Ticket 45 (mcp-config-and-lifecycle): a fresh snapshot
+                    // of every ready server's tools, taken at submit time --
+                    // "the tool snapshot used for a given submission is
+                    // taken at submit time, so a server that finishes
+                    // initializing mid-session is picked up on the next
+                    // submission" (PRD "MCP lifecycle"). Declared here, as
+                    // owned `Arc<McpTool>`s, BEFORE `tools` below so the
+                    // `&dyn ExecutableTool` references pushed into `tools`
+                    // borrow from something that outlives the
+                    // `run_tool_loop` call. Deliberately NOT
+                    // frozen/sorted/deduplicated across the session yet --
+                    // that determinism guarantee is ticket 46
+                    // (mcp-namespace-multi-server-freeze)'s job, not this
+                    // one's.
+                    let mcp_tools_snapshot: Vec<Arc<rokr_mcp::McpTool>> =
+                        if matches!(agent, AgentTier::Build) {
+                            mcp_server_handles.iter().flat_map(|h| h.tools()).collect()
+                        } else {
+                            Vec::new()
+                        };
+
                     let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
                         AgentTier::Plan => vec![&read, &glob, &grep, &ls],
                         AgentTier::Build => {
@@ -763,14 +777,13 @@ async fn main() -> ExitCode {
                     if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
                         tools.push(websearch);
                     }
-                    // Ticket 44 (mcp-tracer-bullet): MCP tools are gated
-                    // (`McpTool::preview` always returns `Some(...)`), so
-                    // -- like bash/write/edit/webfetch above -- they only
-                    // join the tool set for the `Build` tier, never `Plan`.
-                    if let AgentTier::Build = agent {
-                        for tool in mcp_tools.iter() {
-                            tools.push(tool as &dyn rokr_core::ExecutableTool);
-                        }
+                    // MCP tools are gated (`McpTool::preview` always returns
+                    // `Some(...)`), so -- like bash/write/edit/webfetch
+                    // above -- they only join the tool set for the `Build`
+                    // tier, never `Plan` (ticket 44's original gating
+                    // behavior, preserved here).
+                    for tool in &mcp_tools_snapshot {
+                        tools.push(tool.as_ref() as &dyn rokr_core::ExecutableTool);
                     }
 
                     // Expand any `@path` mentions in the raw input BEFORE it
@@ -897,7 +910,10 @@ async fn main() -> ExitCode {
                         + effective_usage_for_percent.output_tokens)
                         as f64
                         / context_window_size as f64;
-                    let _ = status_tx.send(rokr_tui::SessionStatus { context_percent });
+                    let _ = status_tx.send(rokr_tui::SessionStatus {
+                        context_percent,
+                        notice: None,
+                    });
 
                     let notice = if rokr_core::should_compact(
                         usage,

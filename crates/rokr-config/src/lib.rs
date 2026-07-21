@@ -19,6 +19,14 @@ pub struct Config {
     /// gets the runtime default; the field is never written back.
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold: f64,
+    /// Configured MCP servers, keyed by server name. Additive-optional
+    /// (ADR 0010): an existing file missing this field gets an empty map
+    /// at runtime; the field is never written back. See
+    /// docs/adr/0011-rokr-mcp-crate-boundary.md and ticket 45
+    /// (mcp-config-and-lifecycle), which replaces ticket 44's
+    /// `ROKR_MCP_SERVER` env-var interim wiring with this real schema.
+    #[serde(default)]
+    pub mcp: std::collections::HashMap<String, McpServerConfig>,
 }
 
 fn default_context_window_size() -> u32 {
@@ -27,6 +35,38 @@ fn default_context_window_size() -> u32 {
 
 fn default_auto_compact_threshold() -> f64 {
     0.7
+}
+
+/// One configured MCP server (PRD "Config schema"). `auto_approve` (ticket
+/// 47) is deliberately not a field yet.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct McpServerConfig {
+    pub transport: McpTransport,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// A server's transport configuration. Only `Stdio` is implemented in
+/// ticket 45; `Http` (ticket 48, stretch scope) is designed to slot in
+/// additively later since this enum's default (externally-tagged) serde
+/// representation already matches the PRD's documented shape --
+/// `{"stdio": {...}}` today, `{"http": {...}}` later -- without a
+/// migration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio(StdioTransportConfig),
+}
+
+/// A stdio MCP server's launch spec: the command to spawn, its arguments,
+/// and any extra environment variables to set on the child process.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StdioTransportConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 /// Clamps an out-of-range `auto_compact_threshold` (loaded from an existing
@@ -180,6 +220,7 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
         version: 1,
         context_window_size: default_context_window_size(),
         auto_compact_threshold: default_auto_compact_threshold(),
+        mcp: std::collections::HashMap::new(),
     };
     let json = serde_json::to_string_pretty(&config).expect("Config serialization is infallible");
     std::fs::write(&file_path, json)?;
@@ -307,6 +348,49 @@ mod tests {
             config.auto_compact_threshold, 0.7,
             "an out-of-range auto_compact_threshold must be clamped to the default"
         );
+    }
+
+    #[test]
+    fn load_or_init_applies_empty_mcp_default_when_field_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        std::fs::write(&file_path, r#"{"version": 1}"#).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        assert!(
+            config.mcp.is_empty(),
+            "expected empty mcp map when field absent, got: {:?}",
+            config.mcp
+        );
+    }
+
+    #[test]
+    fn config_deserializes_stdio_mcp_server_block() {
+        let json = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": {
+                            "command": "/path/to/server",
+                            "args": ["--flag"],
+                            "env": {"KEY": "value"}
+                        }
+                    },
+                    "enabled": true
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert!(server.enabled);
+        let McpTransport::Stdio(stdio) = &server.transport;
+        assert_eq!(stdio.command, "/path/to/server");
+        assert_eq!(stdio.args, vec!["--flag".to_string()]);
+        assert_eq!(stdio.env.get("KEY"), Some(&"value".to_string()));
     }
 
     #[test]

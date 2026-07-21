@@ -34,6 +34,20 @@ pub const FIXED_RESPONSE_TEXT: &str = "fake-mcp-server-echo-response-9f3c2a";
 const TOOL_NAME: &str = "echo";
 
 fn main() {
+    // Ticket 45 (mcp-config-and-lifecycle) acceptance test support: when
+    // set, exits immediately, before reading or responding to any stdin
+    // line at all -- so the client's `initialize` request never gets a
+    // response and the handshake genuinely fails, the same way a truly
+    // broken server would. Deliberately an abrupt exit rather than a faked
+    // JSON-RPC error response for `initialize`, since that's a more
+    // realistic failure shape and simpler to produce. Not part of the
+    // wire-protocol surface this fixture otherwise exercises -- purely a
+    // test-control knob, read via `env` (ticket 45's per-server config
+    // `stdio.env` map is exactly what threads this through).
+    if std::env::var_os("FAKE_MCP_SERVER_FAIL_INIT").is_some() {
+        std::process::exit(1);
+    }
+
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 

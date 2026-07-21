@@ -85,14 +85,21 @@ pub struct RmcpStdioClient {
 }
 
 impl RmcpStdioClient {
-    /// Spawns `command args...` as a child process and completes the MCP
-    /// `initialize` handshake over its stdio. `()` as the client-side
-    /// handler (rather than a custom `ClientHandler` impl) is `rmcp`'s own
-    /// pattern for a client with no server-initiated callbacks to answer --
-    /// this tracer bullet's tools-only client needs none.
-    pub async fn spawn(command: &str, args: &[String]) -> Result<Self, McpClientError> {
+    /// Spawns `command args...` as a child process (with `env` applied on
+    /// top of the inherited environment -- ticket 45's config-driven
+    /// per-server `env` map) and completes the MCP `initialize` handshake
+    /// over its stdio. `()` as the client-side handler (rather than a
+    /// custom `ClientHandler` impl) is `rmcp`'s own pattern for a client
+    /// with no server-initiated callbacks to answer -- this crate's
+    /// tools-only client needs none.
+    pub async fn spawn(
+        command: &str,
+        args: &[String],
+        env: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, McpClientError> {
         let mut process = tokio::process::Command::new(command);
         process.args(args);
+        process.envs(env);
         let transport = rmcp::transport::TokioChildProcess::new(process)
             .map_err(|err| McpClientError::Spawn(err.to_string()))?;
         let service = rmcp::ServiceExt::serve((), transport)
@@ -100,6 +107,164 @@ impl RmcpStdioClient {
             .map_err(|err| McpClientError::Initialize(err.to_string()))?;
         Ok(Self { service })
     }
+}
+
+/// Lifecycle status of one configured MCP server (ticket 45,
+/// mcp-config-and-lifecycle). Kept introspectable (not a plain
+/// success/failure bool) so ticket 51's `/mcp` listing can report it
+/// without redesigning this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServerStatus {
+    /// Spawned and/or being taken through `initialize` -- not yet
+    /// contributing any tools.
+    Starting,
+    /// `initialize` and `tools/list` both succeeded; `McpServerHandle::tools`
+    /// reflects this server's current tool set.
+    Ready,
+    /// Every connect attempt in the bounded retry failed; this server
+    /// contributes zero tools until a future manual reconnect (ticket 51).
+    Degraded { reason: String },
+}
+
+/// Shared, introspectable state for one configured MCP server: current
+/// status plus the tools it contributes once ready. The background
+/// lifecycle task (spawned by `spawn_server_with_connector`) is the sole
+/// writer; every reader (tool-set assembly in `main.rs`, eventually ticket
+/// 51's `/mcp` command) only ever reads through the accessor methods below.
+pub struct McpServerHandle {
+    pub name: String,
+    status: Arc<std::sync::Mutex<McpServerStatus>>,
+    tools: Arc<std::sync::Mutex<Vec<Arc<McpTool>>>>,
+}
+
+impl McpServerHandle {
+    pub fn status(&self) -> McpServerStatus {
+        self.status.lock().unwrap().clone()
+    }
+
+    /// The current tool snapshot: empty before `Ready`, and permanently
+    /// empty for a `Degraded` server. Cloned out (cheap -- `Arc<McpTool>`
+    /// per entry) rather than borrowed, so a caller can build a tool-set
+    /// snapshot without holding this handle's lock.
+    pub fn tools(&self) -> Vec<Arc<McpTool>> {
+        self.tools.lock().unwrap().clone()
+    }
+}
+
+/// Bounded retry count for a server's connect+list_tools attempt (PRD "MCP
+/// lifecycle": "bounded retry with backoff... then the server is marked
+/// degraded", "no unbounded retry loop"). Ticket 51 adds a manual `/mcp
+/// reconnect` for after this is exhausted.
+const MAX_CONNECT_ATTEMPTS: u32 = 3;
+
+fn backoff_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(200 * attempt as u64)
+}
+
+/// Spawns a background tokio task that takes one MCP server through
+/// connect -> `list_tools`, publishing its status/tools into the returned
+/// `McpServerHandle` as it goes. Returns immediately -- the `tokio::spawn`
+/// call below is the only thing this function does with `connect`, so
+/// nothing here ever awaits server startup on the calling task, matching
+/// the PRD's "fully off the render path" requirement (first paint must
+/// never wait on any MCP server).
+///
+/// Generic over `connect` (rather than hardcoding `RmcpStdioClient::spawn`)
+/// so this lifecycle/retry/status logic is unit-testable without a real
+/// subprocess -- `spawn_stdio_server` below is the production entry point
+/// that supplies a real connector.
+pub fn spawn_server_with_connector<F, Fut>(
+    name: String,
+    connect: F,
+    notice_tx: std::sync::mpsc::Sender<String>,
+) -> McpServerHandle
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Arc<dyn McpClientPort>, McpClientError>> + Send + 'static,
+{
+    let status = Arc::new(std::sync::Mutex::new(McpServerStatus::Starting));
+    let tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handle = McpServerHandle {
+        name: name.clone(),
+        status: Arc::clone(&status),
+        tools: Arc::clone(&tools),
+    };
+
+    tokio::spawn(run_lifecycle(name, connect, status, tools, notice_tx));
+
+    handle
+}
+
+/// The background task body `spawn_server_with_connector` spawns: a bounded
+/// retry loop over connect+`list_tools`, publishing `Ready`+tools on
+/// success or `Degraded`+a one-line notice once attempts are exhausted.
+/// Never panics on a connect/list_tools failure -- a server that errors,
+/// exits immediately, or times out degrades this one server, never the
+/// rest of the process (PRD "MCP lifecycle": "never crashes or blocks the
+/// rest of rokr").
+async fn run_lifecycle<F, Fut>(
+    name: String,
+    connect: F,
+    status: Arc<std::sync::Mutex<McpServerStatus>>,
+    tools_out: Arc<std::sync::Mutex<Vec<Arc<McpTool>>>>,
+    notice_tx: std::sync::mpsc::Sender<String>,
+) where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<Arc<dyn McpClientPort>, McpClientError>>,
+{
+    let mut last_error = String::new();
+
+    for attempt in 1..=MAX_CONNECT_ATTEMPTS {
+        match connect().await {
+            Ok(client) => match client.list_tools().await {
+                Ok(defs) => {
+                    let built: Vec<Arc<McpTool>> = defs
+                        .into_iter()
+                        .map(|def| Arc::new(McpTool::new(client.clone(), name.clone(), def)))
+                        .collect();
+                    *tools_out.lock().unwrap() = built;
+                    *status.lock().unwrap() = McpServerStatus::Ready;
+                    return;
+                }
+                Err(err) => last_error = err.to_string(),
+            },
+            Err(err) => last_error = err.to_string(),
+        }
+
+        if attempt < MAX_CONNECT_ATTEMPTS {
+            tokio::time::sleep(backoff_delay(attempt)).await;
+        }
+    }
+
+    *status.lock().unwrap() = McpServerStatus::Degraded {
+        reason: last_error.clone(),
+    };
+    let _ = notice_tx.send(format!(
+        "MCP server '{name}' failed to start: {last_error}"
+    ));
+}
+
+/// Production entry point: spawns `command args...` (with `env` applied to
+/// the child process) as a stdio MCP server and takes it through the
+/// lifecycle above. Replaces ticket 44's inline, single-server
+/// `ROKR_MCP_SERVER` env-var wiring in `crates/rokr/src/main.rs`.
+pub fn spawn_stdio_server(
+    name: String,
+    command: String,
+    args: Vec<String>,
+    env: std::collections::HashMap<String, String>,
+    notice_tx: std::sync::mpsc::Sender<String>,
+) -> McpServerHandle {
+    let connect = move || {
+        let command = command.clone();
+        let args = args.clone();
+        let env = env.clone();
+        async move {
+            let client = RmcpStdioClient::spawn(&command, &args, &env).await?;
+            Ok(Arc::new(client) as Arc<dyn McpClientPort>)
+        }
+    };
+    spawn_server_with_connector(name, connect, notice_tx)
 }
 
 impl McpClientPort for RmcpStdioClient {
@@ -301,6 +466,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_spawn_task_never_blocks_before_ready_signal() {
+        use std::time::{Duration, Instant};
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let gate_rx = Arc::new(std::sync::Mutex::new(Some(gate_rx)));
+        let connect = move || {
+            let gate_rx = Arc::clone(&gate_rx);
+            async move {
+                // Blocks until the test explicitly releases the gate --
+                // proves spawn_server_with_connector doesn't await this
+                // future on the calling task, since the assertion right
+                // after the call below runs before the gate is ever
+                // released.
+                let rx = gate_rx.lock().unwrap().take().expect("connect called once");
+                let _ = rx.await;
+                let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
+                    content: Vec::new(),
+                    is_error: false,
+                });
+                Ok(client)
+            }
+        };
+
+        let (notice_tx, _notice_rx) = std::sync::mpsc::channel::<String>();
+        let before = Instant::now();
+        let handle = spawn_server_with_connector("srv".to_string(), connect, notice_tx);
+
+        assert!(
+            before.elapsed() < Duration::from_millis(50),
+            "spawn_server_with_connector blocked on connect instead of returning immediately"
+        );
+        assert_eq!(handle.status(), McpServerStatus::Starting);
+
+        let _ = gate_tx.send(());
+        // Let the spawned task run to completion now that the gate is open.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(handle.status(), McpServerStatus::Ready);
+    }
+
+    #[tokio::test]
     async fn mcp_tool_flattens_text_content_and_maps_is_error() {
         let client = Arc::new(FakeClient {
             content: vec![
@@ -336,3 +541,4 @@ mod tests {
         }
     }
 }
+

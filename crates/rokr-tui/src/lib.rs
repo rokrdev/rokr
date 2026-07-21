@@ -121,12 +121,21 @@ pub enum PermissionDetail {
 /// and sends it across a status-update channel as this primitive struct --
 /// mirroring how `PermissionRequest`/`PermissionHandle` round-trip a
 /// primitive shape rather than a rokr-core type directly.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionStatus {
     /// Fraction (not a whole percent) of the context window used by the
     /// most recent turn's reported usage: `(input_tokens + output_tokens) /
     /// context_window_size`. Rendered multiplied by 100 in `draw`.
     pub context_percent: f64,
+    /// Ticket 45 (mcp-config-and-lifecycle): a one-line status notice (e.g.
+    /// an MCP server that failed to start) surfaced through this same
+    /// channel/struct ticket 43 built for context-percent updates,
+    /// appended to the header status line. `None` when there's nothing to
+    /// report. A `String` field means this struct can no longer be `Copy`
+    /// (dropped from the derive below) -- the one call site that used to
+    /// match `state.session_status` by value now matches `&state
+    /// .session_status` instead (see `status_line_text`).
+    pub notice: Option<String>,
 }
 
 /// Handle for requesting permission mid-`submit`, round-tripped through the
@@ -289,13 +298,22 @@ fn format_elapsed(elapsed: Duration) -> String {
 /// `AppState` so it's unit-testable the same way `draw`'s other helpers are.
 fn status_line_text(state: &AppState) -> String {
     let elapsed = format_elapsed(state.elapsed);
-    match state.session_status {
+    let mut text = match &state.session_status {
         Some(status) => {
             let percent = (status.context_percent * 100.0).round() as i64;
             format!("{elapsed} | context {percent}%")
         }
         None => elapsed,
+    };
+    // Ticket 45 (mcp-config-and-lifecycle): appended after the elapsed/
+    // context-percent text, not in place of it -- a notice (e.g. a failed
+    // MCP server) is additional information, not a replacement for the
+    // existing status line.
+    if let Some(notice) = state.session_status.as_ref().and_then(|s| s.notice.as_deref()) {
+        text.push_str(" | ");
+        text.push_str(notice);
     }
+    text
 }
 
 /// Renders `old` and `new` as a naive line-level diff: every line of `old`
@@ -1640,6 +1658,36 @@ mod tests {
         );
     }
 
+    /// Ticket 45 (mcp-config-and-lifecycle): a `SessionStatus.notice` (e.g.
+    /// an MCP server that failed to start) renders appended to the header
+    /// status line, alongside the existing elapsed/context-percent text.
+    #[test]
+    fn status_line_renders_notice_when_present() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            elapsed: Duration::from_secs(5),
+            session_status: Some(SessionStatus {
+                context_percent: 0.0,
+                notice: Some("MCP server 'flaky' failed to start: boom".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("MCP server 'flaky' failed to start: boom"),
+            "expected the notice text in the rendered header, got: {rendered}"
+        );
+    }
+
     /// Ticket 43 (mouse-scroll-status-line): the Header block's status line
     /// renders elapsed session time (formatted mm:ss, or hh:mm:ss once past
     /// an hour) and a context-usage percentage derived from
@@ -1650,7 +1698,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState {
             elapsed: Duration::from_secs(125), // 02:05
-            session_status: Some(SessionStatus { context_percent: 0.42 }),
+            session_status: Some(SessionStatus {
+                context_percent: 0.42,
+                notice: None,
+            }),
             ..Default::default()
         };
 
