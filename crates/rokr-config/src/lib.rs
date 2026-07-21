@@ -329,6 +329,51 @@ pub fn load_project_context(cwd: &Path) -> Option<String> {
     }
 }
 
+/// One labeled memory segment, as returned by [`load_memory`]. Kept
+/// separate (rather than concatenated into one `String`, the way
+/// `load_project_context` folds AGENTS.md/CLAUDE.md today) so a future
+/// change can put each segment behind its own cache-control breakpoint
+/// without re-splitting a blob back apart.
+#[derive(Debug, Clone)]
+pub struct MemorySegment {
+    pub label: &'static str,
+    pub content: String,
+}
+
+/// Loads memory for both scopes rokr currently supports, in a fixed order:
+/// user-scope first, project-scope last.
+///
+/// - User scope: `AGENTS.md` directly under `config_dir` (typically
+///   [`default_config_dir`]'s result) -- always loaded when present,
+///   regardless of `cwd`. Unlike project scope, there is no CLAUDE.md
+///   fallback for user scope.
+/// - Project scope: unchanged existing behavior, delegating to
+///   [`load_project_context`] (AGENTS.md under `cwd`, falling back to
+///   CLAUDE.md) rather than duplicating its fallback logic.
+///
+/// Either, both, or neither may be present; the returned `Vec` contains
+/// only the segments that were actually found, still in user-then-project
+/// order.
+pub fn load_memory(config_dir: &Path, cwd: &Path) -> Vec<MemorySegment> {
+    let mut segments = Vec::new();
+
+    if let Ok(user_content) = std::fs::read_to_string(config_dir.join("AGENTS.md")) {
+        segments.push(MemorySegment {
+            label: "User memory",
+            content: user_content,
+        });
+    }
+
+    if let Some(project_content) = load_project_context(cwd) {
+        segments.push(MemorySegment {
+            label: "Project memory",
+            content: project_content,
+        });
+    }
+
+    segments
+}
+
 /// Load config from `config_dir/rokr.json`, creating it with `"version": 1`
 /// if it does not already exist. Never overwrites an existing file; an
 /// existing file is parsed and returned as-is.
@@ -899,6 +944,68 @@ mod tests {
             context, None,
             "a non-NotFound read error on AGENTS.md must yield no project context"
         );
+    }
+
+    /// Ticket 61 (memory-file-loading-user-and-project-scope): with both a
+    /// user-scope AGENTS.md (under the config dir) and a project-scope
+    /// AGENTS.md present, `load_memory` must return exactly two segments,
+    /// user-scope first and project-scope last, each carrying its own
+    /// distinct content untouched -- proving the fixed load order the
+    /// ticket specifies, not just "both present somewhere".
+    #[test]
+    fn load_memory_returns_user_then_project_segments_in_order_when_both_present() {
+        let temp_cwd = tempfile::tempdir().unwrap();
+        let temp_config = tempfile::tempdir().unwrap();
+        let user_content = "# User AGENTS.md\nDistinctiveUserMemoryContent.";
+        let project_content = "# Project AGENTS.md\nDistinctiveProjectMemoryContent.";
+        std::fs::write(temp_config.path().join("AGENTS.md"), user_content).unwrap();
+        std::fs::write(temp_cwd.path().join("AGENTS.md"), project_content).unwrap();
+
+        let segments = load_memory(temp_config.path(), temp_cwd.path());
+
+        assert_eq!(segments.len(), 2, "expected two segments when both scopes present, got: {segments:?}");
+        assert_eq!(segments[0].content, user_content, "user segment must come first");
+        assert_eq!(segments[1].content, project_content, "project segment must come last");
+        assert_ne!(segments[0].label, segments[1].label, "segments must carry distinct labels");
+    }
+
+    /// Ticket 61 (memory-file-loading-user-and-project-scope): the
+    /// neither/one-only combinations `load_memory_returns_user_then_project_
+    /// segments_in_order_when_both_present` doesn't cover -- neither scope
+    /// present yields an empty `Vec` (not an error, not a placeholder
+    /// segment), and either scope present alone yields exactly one segment
+    /// carrying that scope's own content.
+    #[test]
+    fn load_memory_returns_single_segment_when_only_one_scope_present_and_empty_when_neither() {
+        let temp_cwd_neither = tempfile::tempdir().unwrap();
+        let temp_config_neither = tempfile::tempdir().unwrap();
+        let segments = load_memory(temp_config_neither.path(), temp_cwd_neither.path());
+        assert!(
+            segments.is_empty(),
+            "expected empty segments when neither scope has a memory file, got: {segments:?}"
+        );
+
+        let temp_cwd_user_only = tempfile::tempdir().unwrap();
+        let temp_config_user_only = tempfile::tempdir().unwrap();
+        let user_content = "# User AGENTS.md\nUser-only memory content.";
+        std::fs::write(temp_config_user_only.path().join("AGENTS.md"), user_content).unwrap();
+        let segments = load_memory(temp_config_user_only.path(), temp_cwd_user_only.path());
+        assert_eq!(
+            segments.len(), 1,
+            "expected exactly one segment when only user scope present, got: {segments:?}"
+        );
+        assert_eq!(segments[0].content, user_content);
+
+        let temp_cwd_project_only = tempfile::tempdir().unwrap();
+        let temp_config_project_only = tempfile::tempdir().unwrap();
+        let project_content = "# Project AGENTS.md\nProject-only memory content.";
+        std::fs::write(temp_cwd_project_only.path().join("AGENTS.md"), project_content).unwrap();
+        let segments = load_memory(temp_config_project_only.path(), temp_cwd_project_only.path());
+        assert_eq!(
+            segments.len(), 1,
+            "expected exactly one segment when only project scope present, got: {segments:?}"
+        );
+        assert_eq!(segments[0].content, project_content);
     }
 
     /// Ticket 51 (mcp-hooks-introspection), docs/adr/0012-hooks-execution-trust-model.md

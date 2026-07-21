@@ -157,16 +157,21 @@ async fn main() -> ExitCode {
             // treated the same as no project context / no repo map.
             let cwd: Option<std::path::PathBuf> = std::env::current_dir().ok();
 
-            // One-time, unconditional, side-effect-free read of project-level
-            // context (AGENTS.md, falling back to CLAUDE.md) from the
-            // current working directory, folded into the system prompt
-            // alongside the active agent tier's prompt. Not a tool, not
-            // permission-gated — this is how the system prompt is built, not
-            // a model-invoked action.
+            // Ticket 61 (memory-file-loading-user-and-project-scope):
+            // one-time, unconditional, side-effect-free read of memory for
+            // both scopes rokr supports today -- user-scope AGENTS.md
+            // (under `config_dir`, always loaded when present) and
+            // project-scope AGENTS.md/CLAUDE.md (under the current working
+            // directory, `load_project_context`'s existing fallback) --
+            // folded into the system prompt as separate labeled segments,
+            // user-then-project order, alongside the active agent tier's
+            // prompt. Not a tool, not permission-gated — this is how the
+            // system prompt is built, not a model-invoked action.
             if let Some(cwd) = cwd.as_deref() {
-                if let Some(project_context) = rokr_config::load_project_context(cwd) {
+                for segment in rokr_config::load_memory(&config_dir, cwd) {
                     system_prompt.push_str("\n\n");
-                    system_prompt.push_str(&project_context);
+                    system_prompt.push_str(&format!("# {}\n", segment.label));
+                    system_prompt.push_str(&segment.content);
                 }
             }
 

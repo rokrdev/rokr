@@ -268,9 +268,10 @@ pub async fn run_result_object(
         .map_err(|err| BootstrapError::Other(format!("failed to read agent prompt: {err}")))?;
 
     if let Some(cwd) = cwd.as_deref() {
-        if let Some(project_context) = rokr_config::load_project_context(cwd) {
+        for segment in rokr_config::load_memory(&config_dir, cwd) {
             system_prompt.push_str("\n\n");
-            system_prompt.push_str(&project_context);
+            system_prompt.push_str(&format!("# {}\n", segment.label));
+            system_prompt.push_str(&segment.content);
         }
     }
 
