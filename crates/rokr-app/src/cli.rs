@@ -62,6 +62,14 @@ pub struct Cli {
     #[arg(long = "continue")]
     pub continue_session: bool,
 
+    /// Run headless: send this single prompt to the agent, print only the
+    /// final assistant text to stdout, and exit -- no TUI. A value of `-`
+    /// reads the prompt from stdin instead of using `-` itself as the
+    /// prompt text. Absent, this launches the TUI unchanged (ticket 54:
+    /// headless-print-mode-text-output).
+    #[arg(short = 'p', long = "print", value_name = "prompt")]
+    pub print: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -144,14 +152,14 @@ mod tests {
         assert!(cli.command.is_none());
 
         // `--agent build` selects the Build tier.
-        let cli = Cli::try_parse_from(["rokr", "--agent", "build"])
-            .expect("--agent build should parse");
+        let cli =
+            Cli::try_parse_from(["rokr", "--agent", "build"]).expect("--agent build should parse");
         assert!(matches!(cli.agent, Some(AgentTier::Build)));
         assert!(matches!(cli.resume_mode(), ResumeMode::None));
 
         // `--agent plan` selects the Plan tier explicitly.
-        let cli = Cli::try_parse_from(["rokr", "--agent", "plan"])
-            .expect("--agent plan should parse");
+        let cli =
+            Cli::try_parse_from(["rokr", "--agent", "plan"]).expect("--agent plan should parse");
         assert!(matches!(cli.agent, Some(AgentTier::Plan)));
 
         // `--resume <id>` resolves to ResumeMode::Id, carrying the id.
@@ -163,8 +171,7 @@ mod tests {
         }
 
         // `--continue` resolves to ResumeMode::Continue.
-        let cli =
-            Cli::try_parse_from(["rokr", "--continue"]).expect("--continue should parse");
+        let cli = Cli::try_parse_from(["rokr", "--continue"]).expect("--continue should parse");
         assert!(matches!(cli.resume_mode(), ResumeMode::Continue));
 
         // Resume flags compose with `--agent` in any position, exactly as
@@ -181,8 +188,7 @@ mod tests {
         // `auth login` parses as the Auth/Login subcommand (the same
         // literal positional pair the old `[a, b] if a == "auth" && b ==
         // "login"` arm matched), NOT as a flag.
-        let cli =
-            Cli::try_parse_from(["rokr", "auth", "login"]).expect("auth login should parse");
+        let cli = Cli::try_parse_from(["rokr", "auth", "login"]).expect("auth login should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Auth {

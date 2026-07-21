@@ -8,10 +8,12 @@
 //! there is no dependency cycle.
 
 pub mod cli;
+pub mod headless;
 pub mod runner;
 pub mod subagent;
 
 pub use cli::{AgentTier, AuthAction, Cli, Command, ResumeMode};
+pub use headless::{select_mode, DenyAllPermissions, Mode};
 pub use runner::{
     accumulate_user_turn, append_compaction_record, capture_checkpoint_if_granted_diff,
     format_tool_call_permission_text, log_observational_hook_outcome, matching_hook_entries,

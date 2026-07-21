@@ -2,12 +2,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use rokr_core::ExecutableTool;
 use rokr_app::cli::{completions_script, AuthAction, Cli, Command};
 use rokr_app::{
-    append_compaction_record, log_observational_hook_outcome, matching_hook_entries,
-    now_timestamp, run_hook_entry, AgentTier, ResumeMode, SessionRunner, SharedProvider,
+    append_compaction_record, log_observational_hook_outcome, matching_hook_entries, now_timestamp,
+    run_hook_entry, select_mode, AgentTier, DenyAllPermissions, Mode, ResumeMode, SessionRunner,
+    SharedProvider,
 };
+use rokr_core::ExecutableTool;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -47,6 +48,17 @@ async fn main() -> ExitCode {
         // absent (the old `parse_agent_tier([])` behavior);
         // `--resume` / `--continue` resolve via `Cli::resume_mode`.
         None => {
+            // Ticket 54 (headless-print-mode-text-output): `-p`/`--print`
+            // runs a single prompt headless -- no TUI -- and exits, checked
+            // before any of the TUI-specific startup below so a
+            // scripted/piped invocation never waits on a terminal.
+            // `Cli::print`'s value of `-` reads the prompt from stdin
+            // instead of literally being the prompt text (see
+            // `rokr_app::headless::select_mode`).
+            if let Mode::Headless(prompt) = select_mode(cli.print.as_deref(), std::io::stdin()) {
+                return run_headless(prompt).await;
+            }
+
             let agent = cli.agent.unwrap_or(AgentTier::Plan);
             let resume_mode = cli.resume_mode();
 
@@ -65,16 +77,14 @@ async fn main() -> ExitCode {
             // already makes for the top-level agent tier's prompt.
             let config_dir = rokr_config::default_config_dir();
 
-            let mut system_prompt = match rokr_config::read_agent_prompt(
-                &config_dir,
-                agent.prompt_name(),
-            ) {
-                Ok(prompt) => prompt,
-                Err(err) => {
-                    eprintln!("failed to read agent prompt: {err}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            let mut system_prompt =
+                match rokr_config::read_agent_prompt(&config_dir, agent.prompt_name()) {
+                    Ok(prompt) => prompt,
+                    Err(err) => {
+                        eprintln!("failed to read agent prompt: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
 
             // Resolved once at startup and reused for both the project-
             // context load below and repo-map (re)generation (F-001 fix):
@@ -207,29 +217,32 @@ async fn main() -> ExitCode {
             // comment on why), so it must be read off `built.selected`
             // (the plain `AnyProvider` `BuiltProvider` also returns) right
             // here.
-            let (provider, provider_name, model_name): (Result<SharedProvider, String>, String, String) =
-                match built {
-                    Ok(built) => {
-                        let (provider_name, model_name) = match &built.selected {
-                            rokr_provider::AnyProvider::OpenAi(_) => (
-                                "openai".to_string(),
-                                std::env::var(rokr_provider::openai::ENV_MODEL)
-                                    .unwrap_or_else(|_| "unknown".to_string()),
-                            ),
-                            rokr_provider::AnyProvider::Anthropic(_) => (
-                                "anthropic".to_string(),
-                                std::env::var(rokr_provider::anthropic::ENV_MODEL)
-                                    .unwrap_or_else(|_| "unknown".to_string()),
-                            ),
-                        };
-                        (
-                            Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
-                            provider_name,
-                            model_name,
-                        )
-                    }
-                    Err(err) => (Err(err), "unknown".to_string(), "unknown".to_string()),
-                };
+            let (provider, provider_name, model_name): (
+                Result<SharedProvider, String>,
+                String,
+                String,
+            ) = match built {
+                Ok(built) => {
+                    let (provider_name, model_name) = match &built.selected {
+                        rokr_provider::AnyProvider::OpenAi(_) => (
+                            "openai".to_string(),
+                            std::env::var(rokr_provider::openai::ENV_MODEL)
+                                .unwrap_or_else(|_| "unknown".to_string()),
+                        ),
+                        rokr_provider::AnyProvider::Anthropic(_) => (
+                            "anthropic".to_string(),
+                            std::env::var(rokr_provider::anthropic::ENV_MODEL)
+                                .unwrap_or_else(|_| "unknown".to_string()),
+                        ),
+                    };
+                    (
+                        Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
+                        provider_name,
+                        model_name,
+                    )
+                }
+                Err(err) => (Err(err), "unknown".to_string(), "unknown".to_string()),
+            };
 
             // Ticket 34 (persist-new-sessions) / ticket 35 (resume-session):
             // constructed once at startup, central storage (not
@@ -835,8 +848,14 @@ async fn main() -> ExitCode {
                 }
             };
 
-            let run_result =
-                rokr_tui::run(submit, command, prompt_history, on_history_append, status_rx).await;
+            let run_result = rokr_tui::run(
+                submit,
+                command,
+                prompt_history,
+                on_history_append,
+                status_rx,
+            )
+            .await;
 
             // `SessionEnd` (ticket 50, hooks-remaining-events-and-config;
             // PRD "Hooks", architect decision: "SessionEnd at exit"): fires
@@ -869,6 +888,95 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+    }
+}
+
+/// Ticket 54 (headless-print-mode-text-output): drives ONE prompt through
+/// `SessionRunner` with no terminal UI, forced to the read-only `Plan` tier
+/// (this slice's stated default -- see the ticket's `## Context`), and
+/// prints only the final assistant text to stdout on success. Deliberately
+/// skips session persistence, hooks, and MCP -- all optional,
+/// gracefully-degraded `SessionRunner` inputs elsewhere in this file
+/// (`session_handle: None`, empty `hooks_config`/`mcp_server_handles`) --
+/// this is the thinnest possible slice: mode selection, stdin support, and
+/// text output only. Output formats other than plain text, `--permission-mode`,
+/// and the exit-code contract beyond "0 on success" are ticket 55's scope.
+async fn run_headless(prompt: String) -> ExitCode {
+    let agent = AgentTier::Plan;
+
+    let config = match rokr_config::load_or_init_default() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("failed to initialize config: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let config_dir = rokr_config::default_config_dir();
+
+    let mut system_prompt = match rokr_config::read_agent_prompt(&config_dir, agent.prompt_name()) {
+        Ok(prompt) => prompt,
+        Err(err) => {
+            eprintln!("failed to read agent prompt: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let cwd: Option<std::path::PathBuf> = std::env::current_dir().ok();
+    if let Some(cwd) = cwd.as_deref() {
+        if let Some(project_context) = rokr_config::load_project_context(cwd) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&project_context);
+        }
+    }
+
+    let repo_map: Option<String> = cwd.as_deref().map(rokr_tools::repo_map::generate);
+
+    let token_store = rokr_provider::auth::default_token_store(&config_dir);
+    let resolved_auth = rokr_provider::auth::resolve_auth(
+        None,
+        token_store.as_ref(),
+        rokr_provider::anthropic::ENV_API_KEY,
+    );
+    let built =
+        rokr_provider::build_provider(None, resolved_auth, rokr_provider::RetryPolicy::default());
+    let provider: Result<SharedProvider, String> = match built {
+        Ok(built) => Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
+        Err(err) => Err(err),
+    };
+
+    let (status_tx, _status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
+    let (mcp_notice_tx, _mcp_notice_rx) = std::sync::mpsc::channel::<String>();
+
+    let runner = SessionRunner {
+        provider,
+        transcript: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        system_prompt,
+        repo_map: Arc::new(std::sync::Mutex::new(repo_map)),
+        last_known_usage: Arc::new(std::sync::Mutex::new(None)),
+        config_dir,
+        session_handle: Arc::new(tokio::sync::RwLock::new(None)),
+        turn_index: Arc::new(std::sync::Mutex::new(0)),
+        data_dir: default_data_dir(),
+        status_tx,
+        mcp_server_handles: Arc::new(Vec::new()),
+        mcp_notice_tx,
+        mcp_http_origins: Arc::new(std::collections::HashMap::new()),
+        hooks_config: Arc::new(std::collections::HashMap::new()),
+        agent,
+        context_window_size: config.context_window_size,
+        auto_compact_threshold: config.auto_compact_threshold,
+    };
+
+    match runner.run_submission(prompt, DenyAllPermissions).await {
+        Ok(reply) => {
+            println!("{reply}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -1034,7 +1142,11 @@ fn format_hooks_listing(
     let mut lines = Vec::new();
     for event in events {
         let active = SUPPORTED_HOOK_EVENTS.contains(&event.as_str());
-        let state = if active { "state=active" } else { "state=inactive" };
+        let state = if active {
+            "state=active"
+        } else {
+            "state=inactive"
+        };
         for entry in &hooks_config[event] {
             let matcher = entry.matcher.as_deref().unwrap_or("*");
             let timeout_ms = entry
@@ -1161,7 +1273,9 @@ async fn handle_resume_command(
     };
 
     let indexed_entry = match store.list_sessions() {
-        Ok(entries) => entries.into_iter().find(|entry| entry.session_id == target_id),
+        Ok(entries) => entries
+            .into_iter()
+            .find(|entry| entry.session_id == target_id),
         Err(err) => return format!("failed to look up session {target_id}: {err}"),
     };
 
@@ -1304,9 +1418,7 @@ async fn handle_rollback_command(
     };
 
     if target >= current_turn_index {
-        return format!(
-            "turn {target} is out of range (only turns 0..{current_turn_index} exist)"
-        );
+        return format!("turn {target} is out of range (only turns 0..{current_turn_index} exist)");
     }
 
     let session_handle_guard = session_handle.read().await;
@@ -1404,7 +1516,9 @@ fn default_data_dir() -> std::path::PathBuf {
 /// before the switch) instead of resetting to `RetryPolicy::default()` on
 /// every switch.
 async fn set_active_provider(
-    active_provider: &tokio::sync::RwLock<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>,
+    active_provider: &tokio::sync::RwLock<
+        rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
+    >,
     config_dir: &std::path::Path,
     name: &str,
 ) -> Result<(), String> {
@@ -1433,8 +1547,7 @@ async fn set_active_provider(
 mod tests {
     use super::*;
     use rokr_app::{
-        accumulate_user_turn, capture_checkpoint_if_granted_diff,
-        COMPACTION_SUMMARY_WRAPPER_PREFIX,
+        accumulate_user_turn, capture_checkpoint_if_granted_diff, COMPACTION_SUMMARY_WRAPPER_PREFIX,
     };
     use rokr_core::{Message, Provider, Role};
     use rokr_session::UsageRecord;
@@ -1506,20 +1619,25 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_test",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
             .mount(&mock_server)
             .await;
 
         let config_dir = unique_temp_dir("model-switch-env");
         std::env::set_var(rokr_provider::auth::ENV_FORCE_FILE_STORE, "1");
         std::env::set_var(rokr_provider::anthropic::ENV_BASE_URL, mock_server.uri());
-        std::env::set_var(rokr_provider::anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        std::env::set_var(
+            rokr_provider::anthropic::ENV_MODEL,
+            "claude-3-5-sonnet-20241022",
+        );
         std::env::set_var(rokr_provider::anthropic::ENV_API_KEY, "test-key");
 
         let initial = rokr_provider::AnyProvider::OpenAi(rokr_provider::OpenAiProvider::new(
@@ -1561,20 +1679,25 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_test",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
             .mount(&mock_server)
             .await;
 
         let config_dir = unique_temp_dir("model-switch-oauth");
         std::env::set_var(rokr_provider::auth::ENV_FORCE_FILE_STORE, "1");
         std::env::set_var(rokr_provider::anthropic::ENV_BASE_URL, mock_server.uri());
-        std::env::set_var(rokr_provider::anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        std::env::set_var(
+            rokr_provider::anthropic::ENV_MODEL,
+            "claude-3-5-sonnet-20241022",
+        );
         // Deliberately absent -- this is the whole point of the test.
         std::env::remove_var(rokr_provider::anthropic::ENV_API_KEY);
 
@@ -1671,7 +1794,10 @@ mod tests {
             &current_session_id,
         )
         .await;
-        assert_eq!(already_on_reply, format!("already on session {current_session_id}"));
+        assert_eq!(
+            already_on_reply,
+            format!("already on session {current_session_id}")
+        );
         assert_eq!(
             transcript.lock().await.as_slice(),
             &[Message::user_text("existing turn")],
@@ -1844,7 +1970,11 @@ mod tests {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
-                .open(dir.join("sessions").join(&target_session_id).join("session.jsonl"))
+                .open(
+                    dir.join("sessions")
+                        .join(&target_session_id)
+                        .join("session.jsonl"),
+                )
                 .expect("target session.jsonl should be appendable");
             let line = serde_json::to_string(&rokr_session::SessionRecord::Compaction {
                 summary: "target session compacted summary".to_string(),
@@ -1883,7 +2013,10 @@ mod tests {
             &format!("{target_session_id} --yes"),
         )
         .await;
-        assert_eq!(reply, format!("Resumed {target_session_id}; continuing from its context"));
+        assert_eq!(
+            reply,
+            format!("Resumed {target_session_id}; continuing from its context")
+        );
         assert_eq!(
             *turn_index.lock().unwrap(),
             3,
@@ -1897,7 +2030,10 @@ mod tests {
                 .expect("resume_session should succeed for assembling the expected fixture");
             (messages, resume_state.last_known_usage)
         };
-        assert_eq!(transcript.lock().await.as_slice(), expected_messages.as_slice());
+        assert_eq!(
+            transcript.lock().await.as_slice(),
+            expected_messages.as_slice()
+        );
         assert!(
             transcript
                 .lock()
@@ -1920,7 +2056,9 @@ mod tests {
         // session.jsonl, not the origin's.
         {
             let guard = session_handle.read().await;
-            let handle = guard.as_ref().expect("session_handle should be repointed to target");
+            let handle = guard
+                .as_ref()
+                .expect("session_handle should be repointed to target");
             handle.append_turn(
                 vec![Message::user_text("post-jump new turn")],
                 UsageRecord {
@@ -1935,7 +2073,9 @@ mod tests {
         }
 
         let target_contents = std::fs::read_to_string(
-            dir.join("sessions").join(&target_session_id).join("session.jsonl"),
+            dir.join("sessions")
+                .join(&target_session_id)
+                .join("session.jsonl"),
         )
         .expect("target session.jsonl should exist");
         assert!(
@@ -1944,7 +2084,9 @@ mod tests {
         );
 
         let origin_contents = std::fs::read_to_string(
-            dir.join("sessions").join(&current_session_id).join("session.jsonl"),
+            dir.join("sessions")
+                .join(&current_session_id)
+                .join("session.jsonl"),
         )
         .expect("origin session.jsonl should still exist");
         assert!(
@@ -2002,7 +2144,10 @@ mod tests {
         // whose "old" is already the post-write content -- must be a no-op,
         // not a second Checkpoint record.
         capture_checkpoint_if_granted_diff(
-            Some((target_path.clone(), "intermediate-post-write-content".to_string())),
+            Some((
+                target_path.clone(),
+                "intermediate-post-write-content".to_string(),
+            )),
             &dir,
             &session_handle,
             &turn_index,
@@ -2048,7 +2193,9 @@ mod tests {
     async fn append_compaction_record_derives_replaced_through_and_stores_raw_summary() {
         let dir = unique_temp_dir("append-compaction-derivation");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -2084,7 +2231,11 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
             .filter(|record| matches!(record, rokr_session::SessionRecord::Compaction { .. }))
             .collect();
-        assert_eq!(compaction_records.len(), 1, "expected exactly one Compaction record");
+        assert_eq!(
+            compaction_records.len(),
+            1,
+            "expected exactly one Compaction record"
+        );
         match &compaction_records[0] {
             rokr_session::SessionRecord::Compaction {
                 summary,
@@ -2111,7 +2262,9 @@ mod tests {
     async fn append_compaction_record_skips_when_fewer_than_two_turns() {
         let dir = unique_temp_dir("append-compaction-guard");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -2158,7 +2311,9 @@ mod tests {
     async fn rollback_command_refuses_target_at_or_before_last_compaction_without_mutating() {
         let dir = unique_temp_dir("rollback-compaction-guard");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -2222,7 +2377,11 @@ mod tests {
             &[Message::user_text("live transcript")],
             "a refused rollback must not mutate the transcript"
         );
-        assert_eq!(*turn_index.lock().unwrap(), 3, "turn_index must be untouched");
+        assert_eq!(
+            *turn_index.lock().unwrap(),
+            3,
+            "turn_index must be untouched"
+        );
         session_handle.read().await.as_ref().unwrap().flush().await;
         let log_after =
             std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
@@ -2251,7 +2410,9 @@ mod tests {
     async fn rollback_command_refuses_when_compaction_enqueued_but_not_yet_flushed() {
         let dir = unique_temp_dir("rollback-compaction-unflushed");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -2319,7 +2480,11 @@ mod tests {
             &[Message::user_text("live transcript")],
             "a refused rollback must not mutate the transcript"
         );
-        assert_eq!(*turn_index.lock().unwrap(), 3, "turn_index must be untouched");
+        assert_eq!(
+            *turn_index.lock().unwrap(),
+            3,
+            "turn_index must be untouched"
+        );
         session_handle.read().await.as_ref().unwrap().flush().await;
         let log_after =
             std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
@@ -2501,8 +2666,8 @@ mod tests {
     /// here depends on there being no other OS thread that could race the
     /// writer task independently of this test's own explicit yield points.
     #[tokio::test]
-    async fn jump_flushes_origin_session_before_swapping_so_a_later_rejump_sees_the_pending_append(
-    ) {
+    async fn jump_flushes_origin_session_before_swapping_so_a_later_rejump_sees_the_pending_append()
+    {
         let dir = unique_temp_dir("resume-command-flush-before-jump");
         let store = rokr_session::SessionStore::open(&dir);
 
