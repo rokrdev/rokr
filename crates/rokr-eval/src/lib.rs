@@ -11,6 +11,7 @@
 pub mod assertions;
 pub mod case;
 pub mod judge;
+pub mod report;
 
 use std::path::PathBuf;
 
@@ -32,6 +33,16 @@ pub struct CaseOutcome {
     /// gate.
     pub judge_scores: Vec<judge::JudgeScore>,
     pub run_error: Option<String>,
+    /// Ticket 60 (eval-report-json-and-ci-gate): this case's own headless
+    /// result's `cost_usd`/`num_turns`/`usage` (ticket 55's `ResultObject`
+    /// fields), threaded straight through so `report::build_report` can sum
+    /// them across every case without re-deriving anything. Defaults to
+    /// `0.0`/`0`/`UsageObject::default()` on any `run_error` path (bypass
+    /// denied without the operator flag, or a `BootstrapError`) -- there is
+    /// no headless run to read these from in that case.
+    pub cost_usd: f64,
+    pub num_turns: u32,
+    pub usage: rokr_app::result_schema::UsageObject,
 }
 
 /// Runs every case file under `cases_dir` (see `case::load_cases`) and
@@ -110,41 +121,71 @@ pub async fn run_eval(
         // own. A bypass-requesting case with no operator flag never reaches
         // `run_result_object` at all -- it fails immediately with a clear
         // `run_error` instead.
-        let (run_error, headless_result_text): (Option<String>, Option<String>) =
-            if case_requests_bypass && !dangerously_skip_permissions {
-                (
-                    Some(
-                        "case requests bypass but --dangerously-skip-permissions was not passed"
-                            .to_string(),
-                    ),
-                    None,
-                )
-            } else {
-                // `dangerously_skip_permissions` is only ever forwarded as
-                // `true` for a case that is actually `Bypass` mode -- a
-                // `Deny`/`AcceptEdits` case never needs it, regardless of
-                // whether the operator passed the run-level flag.
-                let run_result = rokr_app::headless::run_result_object(
-                    agent,
-                    permission_mode,
-                    case_requests_bypass,
-                    loaded_case.case.prompt.clone(),
-                    Some(fixture_dir.path().to_path_buf()),
-                )
-                .await;
+        let (run_error, headless_result_text, cost_usd, num_turns, usage): (
+            Option<String>,
+            Option<String>,
+            f64,
+            u32,
+            rokr_app::result_schema::UsageObject,
+        ) = if case_requests_bypass && !dangerously_skip_permissions {
+            (
+                Some(
+                    "case requests bypass but --dangerously-skip-permissions was not passed"
+                        .to_string(),
+                ),
+                None,
+                0.0,
+                0,
+                rokr_app::result_schema::UsageObject::default(),
+            )
+        } else {
+            // `dangerously_skip_permissions` is only ever forwarded as
+            // `true` for a case that is actually `Bypass` mode -- a
+            // `Deny`/`AcceptEdits` case never needs it, regardless of
+            // whether the operator passed the run-level flag.
+            let run_result = rokr_app::headless::run_result_object(
+                agent,
+                permission_mode,
+                case_requests_bypass,
+                loaded_case.case.prompt.clone(),
+                Some(fixture_dir.path().to_path_buf()),
+            )
+            .await;
 
-                match run_result {
-                    // Ticket 59: the final result text is now captured
-                    // (rather than discarded, as before this ticket) as the
-                    // "transcript" a judge-rubric assertion scores against
-                    // -- see `judge`'s doc comment for why this is the
-                    // final headless result text specifically, not the
-                    // full per-turn message list.
-                    Ok(outcome) => (None, Some(outcome.result_object.result)),
-                    Err(rokr_app::headless::BootstrapError::CliMisuse(err)) => (Some(err), None),
-                    Err(rokr_app::headless::BootstrapError::Other(err)) => (Some(err), None),
-                }
-            };
+            match run_result {
+                // Ticket 59: the final result text is now captured
+                // (rather than discarded, as before this ticket) as the
+                // "transcript" a judge-rubric assertion scores against
+                // -- see `judge`'s doc comment for why this is the
+                // final headless result text specifically, not the
+                // full per-turn message list.
+                //
+                // Ticket 60: cost_usd/num_turns/usage are threaded
+                // through from the SAME `ResultObject` here too, rather
+                // than being discarded as before this ticket.
+                Ok(outcome) => (
+                    None,
+                    Some(outcome.result_object.result),
+                    outcome.result_object.cost_usd,
+                    outcome.result_object.num_turns,
+                    outcome.result_object.usage,
+                ),
+                Err(rokr_app::headless::BootstrapError::CliMisuse(err)) => (
+                    Some(err),
+                    None,
+                    0.0,
+                    0,
+                    rokr_app::result_schema::UsageObject::default(),
+                ),
+                Err(rokr_app::headless::BootstrapError::Other(err)) => (
+                    Some(err),
+                    None,
+                    0.0,
+                    0,
+                    rokr_app::result_schema::UsageObject::default(),
+                ),
+            }
+        };
 
         // Ticket 59: a judge-rubric assertion is routed to
         // `judge::score_rubric` instead of `assertions::check_assertion` --
@@ -183,6 +224,9 @@ pub async fn run_eval(
             assertion_outcomes,
             judge_scores,
             run_error,
+            cost_usd,
+            num_turns,
+            usage,
         });
         // `fixture_dir` (a `tempfile::TempDir`) drops here, at the end of
         // this case's iteration -- deleting the fresh fixture dir from disk

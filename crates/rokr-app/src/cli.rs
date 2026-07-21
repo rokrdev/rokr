@@ -70,6 +70,21 @@ pub enum PermissionMode {
     Bypass,
 }
 
+/// Ticket 60 (eval-report-json-and-ci-gate): the `rokr eval --report` flag.
+/// `Text` (the default, absent selects it -- the caller applies that
+/// default, mirroring `OutputFormat`'s existing pattern) is today's
+/// unchanged per-case `PASS <name>`/`FAIL <name>` human output, still
+/// exiting nonzero if any case failed. `Json` instead prints one aggregate
+/// [`crate`] report (see `rokr_eval::report::Report`) and exits according
+/// to `--pass-threshold` (a threshold comparison on the aggregate
+/// deterministic pass rate, never exact-match on any single case) instead
+/// of any-case-failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ReportFormat {
+    Text,
+    Json,
+}
+
 /// The full `rokr` command-line surface.
 #[derive(Parser, Debug)]
 #[command(
@@ -161,6 +176,27 @@ pub enum Command {
         /// running.
         #[arg(long)]
         dangerously_skip_permissions: bool,
+
+        /// Ticket 60 (eval-report-json-and-ci-gate): how to report the
+        /// run's outcome. Absent selects `text` (the caller applies that
+        /// default, matching `output_format`'s existing pattern) -- today's
+        /// unchanged PASS/FAIL-per-case printing and any-case-failed exit
+        /// code. `json` instead prints one aggregate report and exits
+        /// according to `--pass-threshold` below.
+        #[arg(long = "report", value_enum)]
+        report: Option<ReportFormat>,
+
+        /// Only meaningful with `--report json` (see `report` above): the
+        /// aggregate deterministic pass-rate threshold (0.0-1.0) the JSON
+        /// report's exit code gates on -- `pass_rate >= pass_threshold`
+        /// exits 0, otherwise nonzero (a threshold comparison, never
+        /// exact-match on any single case -- see `rokr_eval::report::Report::exit_code`).
+        /// ASSUMPTION: the ticket does not state a default, so this
+        /// defaults to `1.0` (every case must pass) -- the closest
+        /// equivalent to the `--report text`/absent path's existing
+        /// any-case-failed exit-code semantics.
+        #[arg(long = "pass-threshold", default_value_t = 1.0)]
+        pass_threshold: f64,
     },
 }
 
@@ -333,6 +369,70 @@ mod tests {
         assert!(
             Cli::try_parse_from(["rokr", "-p", "hi", "--permission-mode", "bogus"]).is_err(),
             "an unknown --permission-mode value must be a parse error"
+        );
+    }
+
+    /// Ticket 60 (eval-report-json-and-ci-gate): `--report text|json` and
+    /// `--pass-threshold <N>` on `rokr eval` -- not one of the ticket's
+    /// three named failing tests, but kept for parity with every other flag
+    /// in this file having its own parse coverage. Absent `--report` parses
+    /// as `None` (caller defaults to `Text`, matching `output_format`'s
+    /// existing pattern) and absent `--pass-threshold` defaults to `1.0`
+    /// (this crate's documented assumption -- see `Command::Eval`'s
+    /// `pass_threshold` doc comment).
+    #[test]
+    fn report_and_pass_threshold_flags_parse_on_eval_command() {
+        let cli = Cli::try_parse_from(["rokr", "eval", "cases"])
+            .expect("no-flag eval parse should succeed");
+        match cli.command {
+            Some(Command::Eval {
+                report,
+                pass_threshold,
+                ..
+            }) => {
+                assert!(report.is_none(), "absent --report must parse as None");
+                assert_eq!(
+                    pass_threshold, 1.0,
+                    "absent --pass-threshold must default to 1.0"
+                );
+            }
+            other => panic!("expected Command::Eval, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rokr",
+            "eval",
+            "cases",
+            "--report",
+            "json",
+            "--pass-threshold",
+            "0.8",
+        ])
+        .expect("--report json --pass-threshold 0.8 should parse");
+        match cli.command {
+            Some(Command::Eval {
+                report,
+                pass_threshold,
+                ..
+            }) => {
+                assert!(matches!(report, Some(ReportFormat::Json)));
+                assert_eq!(pass_threshold, 0.8);
+            }
+            other => panic!("expected Command::Eval, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["rokr", "eval", "cases", "--report", "text"])
+            .expect("--report text should parse");
+        match cli.command {
+            Some(Command::Eval { report, .. }) => {
+                assert!(matches!(report, Some(ReportFormat::Text)))
+            }
+            other => panic!("expected Command::Eval, got: {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["rokr", "eval", "cases", "--report", "bogus"]).is_err(),
+            "an unknown --report value must be a parse error"
         );
     }
 

@@ -2,7 +2,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use rokr_app::cli::{completions_script, AuthAction, Cli, Command};
+use rokr_app::cli::{completions_script, AuthAction, Cli, Command, ReportFormat};
 use rokr_app::{
     append_compaction_record, default_data_dir, log_observational_hook_outcome,
     matching_hook_entries, now_timestamp, run_hook_entry, select_mode, AgentTier, Mode, ResumeMode,
@@ -52,35 +52,55 @@ async fn main() -> ExitCode {
         // `rokr_eval::run_eval`; this arm just prints its per-case report
         // and maps the outcome to an exit code (0 iff every case passed and
         // the run itself didn't hit a whole-run error, 1 otherwise).
+        //
+        // Ticket 60 (eval-report-json-and-ci-gate): `report`/`pass_threshold`
+        // are new. `report == Some(ReportFormat::Json)` branches to the
+        // aggregate, threshold-gated report instead -- built entirely by
+        // `rokr_eval::report::build_report` (this arm just prints it and
+        // returns its `exit_code()`). `None`/`Some(ReportFormat::Text)`
+        // (the ticket's "unchanged" path) falls through to the exact same
+        // per-case PASS/FAIL printing and any-case-failed exit code as
+        // before this ticket.
         Some(Command::Eval {
             cases_dir,
             dangerously_skip_permissions,
+            report,
+            pass_threshold,
         }) => match rokr_eval::run_eval(&cases_dir, dangerously_skip_permissions).await {
             Ok(outcomes) => {
-                let mut any_failed = false;
-                for outcome in &outcomes {
-                    if outcome.passed {
-                        println!("PASS {}", outcome.name);
-                    } else {
-                        any_failed = true;
-                        println!("FAIL {}", outcome.name);
-                        if let Some(err) = &outcome.run_error {
-                            println!("  run error: {err}");
-                        }
-                        for assertion in &outcome.assertion_outcomes {
-                            if !assertion.passed {
-                                println!(
-                                    "  assertion failed: {} ({})",
-                                    assertion.description, assertion.detail
-                                );
+                if matches!(report, Some(ReportFormat::Json)) {
+                    let report = rokr_eval::report::build_report(&outcomes, pass_threshold);
+                    match serde_json::to_string(&report) {
+                        Ok(json) => println!("{json}"),
+                        Err(err) => eprintln!("failed to serialize report: {err}"),
+                    }
+                    report.exit_code()
+                } else {
+                    let mut any_failed = false;
+                    for outcome in &outcomes {
+                        if outcome.passed {
+                            println!("PASS {}", outcome.name);
+                        } else {
+                            any_failed = true;
+                            println!("FAIL {}", outcome.name);
+                            if let Some(err) = &outcome.run_error {
+                                println!("  run error: {err}");
+                            }
+                            for assertion in &outcome.assertion_outcomes {
+                                if !assertion.passed {
+                                    println!(
+                                        "  assertion failed: {} ({})",
+                                        assertion.description, assertion.detail
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                if any_failed {
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
+                    if any_failed {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
                 }
             }
             Err(err) => {
