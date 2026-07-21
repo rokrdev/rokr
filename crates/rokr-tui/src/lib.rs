@@ -680,13 +680,28 @@ fn run_memory_command(
 /// hard-coding `cwd.join("AGENTS.md")` itself) so this crate stays
 /// decoupled from cwd/AGENTS.md specifics, mirroring why `command` takes a
 /// literal `String` rather than rokr-tui knowing what `/compact` means.
-pub async fn run<F, Fut, C, Fut2, M>(
+///
+/// `resolve_custom_command` (ticket 63,
+/// custom-command-discovery-and-registry) is called synchronously, on the
+/// crossterm-polling thread, for every `/`-prefixed input that reaches
+/// [`InputRoute::Command`] (see [`event_loop`]) -- it returns `Some(expanded
+/// prompt text)` when `input` names a discovered custom command, `None`
+/// otherwise. A `None` leaves the existing `command`-closure dispatch
+/// (built-ins, then "unknown command: ...") completely unchanged; a `Some`
+/// is only ever actually used if `command`'s own dispatch, run to
+/// completion first, falls all the way through to its "unknown command: "
+/// arm -- so built-ins keep winning by construction, not by rokr-tui
+/// duplicating `main.rs`'s built-in list. Kept as a plain sync closure
+/// (mirroring `resolve_memory_path`) so rokr-tui stays decoupled from
+/// `rokr-app`'s `CommandRegistry`/config-dir specifics.
+pub async fn run<F, Fut, C, Fut2, M, M2>(
     submit: F,
     command: C,
     history: Vec<String>,
     on_history_append: impl Fn(String) + Send + Sync + 'static,
     status_rx: mpsc::Receiver<SessionStatus>,
     resolve_memory_path: M,
+    resolve_custom_command: M2,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -694,6 +709,7 @@ where
     C: Fn(String) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
     M: Fn() -> io::Result<PathBuf> + Send + 'static,
+    M2: Fn(&str) -> Option<String> + Send + 'static,
 {
     if !io::stdout().is_terminal() {
         return Err(TuiError::NotATty);
@@ -716,13 +732,14 @@ where
             on_history_append,
             status_rx,
             resolve_memory_path,
+            resolve_custom_command,
         )
     })
     .await
     .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
-fn run_blocking<F, Fut, C, Fut2, M>(
+fn run_blocking<F, Fut, C, Fut2, M, M2>(
     handle: tokio::runtime::Handle,
     submit: F,
     command: C,
@@ -730,6 +747,7 @@ fn run_blocking<F, Fut, C, Fut2, M>(
     on_history_append: Arc<dyn Fn(String) + Send + Sync>,
     status_rx: mpsc::Receiver<SessionStatus>,
     resolve_memory_path: M,
+    resolve_custom_command: M2,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -737,6 +755,7 @@ where
     C: Fn(String) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
     M: Fn() -> io::Result<PathBuf> + Send + 'static,
+    M2: Fn(&str) -> Option<String> + Send + 'static,
 {
     install_panic_hook();
     let guard = TerminalGuard::enter()?;
@@ -766,10 +785,11 @@ where
         start_instant,
         status_rx,
         &resolve_memory_path,
+        &resolve_custom_command,
     )
 }
 
-fn event_loop<F, Fut, C, Fut2, M>(
+fn event_loop<F, Fut, C, Fut2, M, M2>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
     handle: &tokio::runtime::Handle,
@@ -780,6 +800,7 @@ fn event_loop<F, Fut, C, Fut2, M>(
     start_instant: Instant,
     status_rx: mpsc::Receiver<SessionStatus>,
     resolve_memory_path: &M,
+    resolve_custom_command: &M2,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
@@ -787,6 +808,7 @@ where
     C: Fn(String) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
     M: Fn() -> io::Result<PathBuf> + Send + 'static,
+    M2: Fn(&str) -> Option<String> + Send + 'static,
 {
     // Carries the outcome of a spawned `submit` call back into the blocking
     // event loop without blocking it: each iteration does a non-blocking
@@ -974,10 +996,59 @@ where
                                         });
                                     }
                                     InputRoute::Command(input) => {
-                                        let command_fut = command(input);
+                                        // Ticket 63
+                                        // (custom-command-discovery-and-registry):
+                                        // `resolve_custom_command` is
+                                        // consulted EAGERLY (synchronously,
+                                        // right here) so the resulting
+                                        // `submit_fut_if_custom` -- an owned,
+                                        // 'static future returned by calling
+                                        // `submit` -- can be moved into the
+                                        // spawned task below. `submit`
+                                        // itself is only a `&F` reference
+                                        // borrowed for this `event_loop`
+                                        // call, so it can't be captured
+                                        // *inside* a `handle.spawn`'d 'static
+                                        // async block; calling it here,
+                                        // outside the spawn, sidesteps that
+                                        // without needing `Arc<F>` plumbing.
+                                        // Calling `submit` doesn't start the
+                                        // real work (async fns/blocks are
+                                        // lazy until polled) -- if the
+                                        // built-in `command` dispatch below
+                                        // ends up matching a REAL built-in
+                                        // (not falling through to "unknown
+                                        // command"), this future is simply
+                                        // dropped unpolled, so no request
+                                        // ever goes out. This is also why
+                                        // built-ins keep winning "by
+                                        // construction": the `command`
+                                        // closure's own match runs to
+                                        // completion first (awaited below),
+                                        // and only ITS OWN "unknown command:
+                                        // {input}" fallthrough output
+                                        // (produced by the existing,
+                                        // unmodified match in `main.rs`)
+                                        // triggers use of the pre-built
+                                        // custom-command future.
+                                        let submit_fut_if_custom =
+                                            resolve_custom_command(&input).map(|expanded| {
+                                                let permission = PermissionHandle {
+                                                    tx: perm_tx.clone(),
+                                                };
+                                                submit(expanded, permission)
+                                            });
+                                        let command_fut = command(input.clone());
                                         let tx = tx.clone();
                                         handle.spawn(async move {
                                             let outcome = command_fut.await;
+                                            if outcome == format!("unknown command: {input}") {
+                                                if let Some(submit_fut) = submit_fut_if_custom {
+                                                    let result = submit_fut.await;
+                                                    let _ = tx.send(result);
+                                                    return;
+                                                }
+                                            }
                                             let _ = tx.send(Ok(outcome));
                                         });
                                     }

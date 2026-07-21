@@ -27,3 +27,10 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+# Ticket 63 (custom-command-discovery-and-registry): not in that ticket's
+# `files-touched` list, but mechanically required -- `commands.rs`'s
+# discovery unit tests (also listed in `files-touched`) need a scratch
+# directory to write fixture `commands/*.md` files into. Same
+# mechanical-necessity precedent as the Cargo.toml comments above (ticket 55)
+# and in `crates/rokr/Cargo.toml` (tickets 44/49).
+tempfile = { workspace = true }

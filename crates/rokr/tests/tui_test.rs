@@ -12563,3 +12563,189 @@ async fn memory_command_suspends_tui_and_opens_project_memory_file_in_scripted_e
     let _ = std::fs::remove_dir_all(&project_dir);
     let _ = std::fs::remove_dir_all(&editor_script_dir);
 }
+
+/// Ticket 63 (custom-command-discovery-and-registry) acceptance test: a
+/// user-scope `commands/my-command.md` template containing `$ARGUMENTS`,
+/// when invoked as `/my-command foo bar`, must expand and be submitted
+/// through the SAME path an ordinary typed prompt takes -- not merely
+/// displayed as a command-status string. Mirrors
+/// `typing_model_command_switches_active_provider_for_next_turn`'s harness
+/// (PTY spawn, wiremock mock server, ROKR_OPENAI_* env vars), differing
+/// only in: (1) pre-seeding a fixture `commands/my-command.md` file under
+/// `XDG_CONFIG_HOME/rokr/` before spawning, and (2) asserting on the
+/// captured request body (via `mock_server.received_requests()`) that the
+/// EXPANDED template text ("Handle: foo bar"), not the raw typed command
+/// string, is what went out over the wire -- the strongest possible signal
+/// that expansion actually routed through the ordinary submit path (which
+/// alone talks to the provider) rather than the `command` status-string
+/// path (which never does).
+#[tokio::test]
+async fn typing_discovered_user_command_expands_template_and_submits_through_ordinary_path() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let canned_response = "MockedAssistantReplyForCustomCommandTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-custom-command",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-custom-command");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-custom-command");
+
+    // rokr_config::default_config_dir() resolves to `$XDG_CONFIG_HOME/rokr`
+    // -- the user-scope `commands/` subdirectory this ticket discovers from
+    // lives directly under that same root, not under a new convention.
+    let commands_dir = xdg_config_home.join("rokr").join("commands");
+    std::fs::create_dir_all(&commands_dir).expect("failed to create fixture commands directory");
+    std::fs::write(
+        commands_dir.join("my-command.md"),
+        "---\ndescription: test\n---\nHandle: $ARGUMENTS",
+    )
+    .expect("failed to write fixture my-command.md");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-openai-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/my-command foo bar\r")
+        .expect("failed to write custom command invocation to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, proving a real \
+         request/response round trip happened through the ordinary submit path (a status-only \
+         `command` response never talks to the provider); got: {output:?}"
+    );
+    assert!(
+        !output.contains("unknown command: /my-command"),
+        "expected the discovered custom command to be recognized rather than falling through \
+         to the built-in dispatcher's \"unknown command\" arm; got: {output:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains("Handle: foo bar"),
+        "expected the outgoing request body to contain the EXPANDED template text \
+         ('Handle: foo bar'), not the raw '/my-command foo bar' input, proving template \
+         expansion happened before submission; got body: {first_request_body:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}

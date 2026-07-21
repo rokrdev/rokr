@@ -8,12 +8,14 @@
 //! there is no dependency cycle.
 
 pub mod cli;
+pub mod commands;
 pub mod headless;
 pub mod result_schema;
 pub mod runner;
 pub mod subagent;
 
 pub use cli::{AgentTier, AuthAction, Cli, Command, OutputFormat, PermissionMode, ResumeMode};
+pub use commands::{CommandRegistry, CustomCommand};
 pub use headless::{build_permission_requester, select_mode, HeadlessPermissionRequester, Mode};
 pub use result_schema::{ResultObject, Subtype, UsageObject};
 pub use runner::{

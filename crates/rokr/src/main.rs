@@ -515,6 +515,15 @@ async fn main() -> ExitCode {
             // takes ownership of the original binding, same reasoning as
             // `command_provider` above.
             let command_config_dir = config_dir.clone();
+            // Ticket 63 (custom-command-discovery-and-registry): discovered
+            // once here, before `config_dir` is moved wholesale into the
+            // `SessionRunner` struct literal below (same reasoning as the
+            // `command_config_dir`/`memory_command_config_dir` clones around
+            // it) -- `CommandRegistry::discover_user_scope` only needs a
+            // borrow, not ownership, so no `.clone()` is required. Consulted
+            // via the `resolve_custom_command` closure built below, right
+            // before the `rokr_tui::run` call.
+            let command_registry = rokr_app::CommandRegistry::discover_user_scope(&config_dir);
             // Ticket 62 (memory-slash-command-opens-editor): `/memory`'s
             // path-resolver closure (built below, after `submit`/`command`)
             // needs its own clones of `cwd` and `config_dir` -- cloned here,
@@ -988,6 +997,16 @@ async fn main() -> ExitCode {
                 resolve_memory_path(dir)
             };
 
+            // Ticket 63 (custom-command-discovery-and-registry): a plain
+            // sync lookup+expand into the registry discovered above --
+            // rokr-tui's `event_loop` only calls this AFTER the `command`
+            // closure's own dispatch (built above, unmodified) has already
+            // run to completion and fallen through to its "unknown command:
+            // ..." arm, so a discovered user command can never shadow a
+            // built-in.
+            let resolve_custom_command =
+                move |input: &str| command_registry.expand(input);
+
             let run_result = rokr_tui::run(
                 submit,
                 command,
@@ -995,6 +1014,7 @@ async fn main() -> ExitCode {
                 on_history_append,
                 status_rx,
                 resolve_memory_path_for_tui,
+                resolve_custom_command,
             )
             .await;
 
