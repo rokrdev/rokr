@@ -8205,3 +8205,260 @@ async fn zero_usage_turn_leaves_context_percentage_at_previous_known_value() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// The fake stdio MCP server fixture's fixed `tools/call` response text
+/// (`crates/rokr-mcp/tests/fixtures/fake_mcp_server.rs::FIXED_RESPONSE_TEXT`).
+/// A bin target's items aren't importable from another crate, so this is a
+/// deliberate duplicate literal, not a shared constant -- keep both sides
+/// in sync if either changes.
+const FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT: &str = "fake-mcp-server-echo-response-9f3c2a";
+
+/// The fake stdio MCP server fixture's `[[bin]]` executable
+/// (`crates/rokr-mcp/Cargo.toml`) lives in a sibling crate, so
+/// `CARGO_BIN_EXE_fake_mcp_server` (only populated for bin targets of the
+/// package under test) isn't available here. The whole workspace shares
+/// one `target/<profile>/` directory, so deriving the path from the
+/// already-available `CARGO_BIN_EXE_rokr` (same directory, different
+/// filename) is reliable without depending on that env var. Requires the
+/// fixture to have actually been built -- true whenever the fixture ran as
+/// part of a full workspace `cargo test`, which is how this suite is meant
+/// to be run.
+fn fake_mcp_server_path() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_BIN_EXE_rokr"));
+    path.set_file_name(if cfg!(windows) {
+        "fake_mcp_server.exe"
+    } else {
+        "fake_mcp_server"
+    });
+    assert!(
+        path.exists(),
+        "fake_mcp_server fixture binary not found at {path:?} -- run a full workspace \
+         `cargo test` (not `cargo test -p rokr` alone) so rokr-mcp's [[bin]] fixture gets built"
+    );
+    path
+}
+
+/// Ticket 44 (mcp-tracer-bullet) acceptance test: a model tool-call to a
+/// fake stdio MCP server's tool, driven end-to-end through the running
+/// rokr binary, produces a real `ToolResult` via the new `McpTool:
+/// ExecutableTool` adapter after a permission prompt is accepted. Same PTY
+/// + wiremock harness as `bash_tool_call_renders_permission_prompt_and_runs_on_accept`
+/// above, with one added strictness: the SECOND mock (the provider's
+/// post-tool-call reply) only matches if the outgoing request body
+/// actually contains the fixture's fixed response text -- so unless
+/// `McpTool::execute_boxed` really carried that exact text from the real
+/// `rmcp` client, through the permission-gated tool loop, into the
+/// `ToolResult` sent back on the wire, no mock matches, the loop errors,
+/// and the PTY never renders `final_reply_text` -- the test times out and
+/// fails instead of silently passing on a stub.
+#[tokio::test]
+async fn mcp_tool_call_renders_permission_prompt_and_returns_result_from_fake_stdio_server() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterMcpAcceptForTesting";
+
+    // Ticket 44's interim wiring (crates/rokr/src/main.rs) hardcodes the
+    // server name "interim" for the one env-var-configured MCP server;
+    // `rokr_mcp::qualified_name` is the SAME function that wiring calls,
+    // so this can't drift from what main.rs actually computes.
+    let qualified_tool_name = rokr_mcp::qualified_name("interim", "echo");
+
+    // First call: the model asks to invoke the MCP tool.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-accept",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_tool_name,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Second call: only matches if the tool result the loop fed back
+    // actually contains the fixture's real response text -- see this
+    // test's doc comment.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-accept-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-accept");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-accept");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.env("ROKR_MCP_SERVER", fake_mcp_server_path());
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call the mcp tool\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the permission prompt to render, showing the qualified MCP
+    // tool name -- every MCP call is gated (`McpTool::preview` always
+    // returns `Some(...)`), before we've granted anything.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_tool_name) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(&qualified_tool_name),
+        "expected pty output to contain the qualified MCP tool name '{qualified_tool_name}' in \
+         a permission prompt, got: {output:?}"
+    );
+    assert!(
+        !output.contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT),
+        "the MCP tool must not have run before permission was granted, but its response text \
+         already appears in the output: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the MCP tool \
+         call, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}

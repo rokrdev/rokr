@@ -1,0 +1,36 @@
+[package]
+name = "rokr-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Pinned to an exact version (architect decision, ticket 44): rmcp is
+# pre-1.0 and its client API is not yet stable across minor releases.
+# `docs/adr/0011-rokr-mcp-crate-boundary.md` records the spike that
+# validated this version's client + stdio transport against the fake
+# server fixture. Only the `client` (Peer::list_tools/call_tool) and
+# `transport-child-process` (spawning + piping a stdio subprocess)
+# features are enabled -- this crate never acts as an MCP *server*.
+rmcp = { version = "=2.2.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+] }
+rokr-core = { path = "../rokr-core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+# Fake stdio MCP server fixture (ticket 44): a hand-rolled, minimal
+# JSON-RPC-over-stdio server used ONLY by tests to exercise the real
+# `rmcp` client round-trip without depending on any external MCP server.
+# It deliberately does NOT use `rmcp`'s own server machinery -- the
+# constraint against hand-rolled JSON-RPC (see the ADR) is about the
+# production *client* path, not a throwaway test double playing the
+# server role.
+[[bin]]
+name = "fake_mcp_server"
+path = "tests/fixtures/fake_mcp_server.rs"

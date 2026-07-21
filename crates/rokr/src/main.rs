@@ -479,6 +479,79 @@ async fn main() -> ExitCode {
             // ends).
             let (status_tx, status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
 
+            // Ticket 44 (mcp-tracer-bullet): interim, throwaway wiring for
+            // exactly one stdio MCP server, configured via a single env var
+            // holding the server's command line (e.g.
+            // `ROKR_MCP_SERVER="/path/to/server --flag"`, whitespace-split,
+            // no shell parsing) -- ticket 45 replaces this with the real
+            // `mcp` config schema (multiple named servers, `auto_approve`,
+            // etc.). The server name is hardcoded to `"interim"` since
+            // there's no config to read a real name from yet;
+            // `rokr_mcp::qualified_name` namespaces every tool as
+            // `mcp__interim__<tool>`.
+            //
+            // Spawned and listed here, before the TUI starts, rather than
+            // as a background task -- the PRD's preferred shape for the
+            // productionized version (ticket 45+) is a background tokio
+            // task so MCP init never delays first paint, but this tracer
+            // bullet's env-var-gated single server is opt-in (nobody sets
+            // `ROKR_MCP_SERVER` by default) and the ticket's own carve-out
+            // permits inline init here "if trivial" -- deferring the
+            // background-task version to the productionization ticket
+            // rather than gold-plating this throwaway path.
+            //
+            // A missing env var, a server that fails to spawn, or a failed
+            // `initialize`/`tools/list` round-trip all degrade to zero MCP
+            // tools (a one-line `eprintln!` notice, no crash, no blocked
+            // startup) -- matching the built-in tools' own
+            // never-crash-the-TUI-on-a-degraded-optional-feature pattern
+            // elsewhere in this function (repo-map generation, prompt
+            // history, session persistence).
+            let mcp_tools: Vec<rokr_mcp::McpTool> = match std::env::var("ROKR_MCP_SERVER") {
+                Ok(command_line) => {
+                    let mut parts = command_line.split_whitespace();
+                    match parts.next() {
+                        Some(command) => {
+                            let args: Vec<String> = parts.map(str::to_string).collect();
+                            match rokr_mcp::RmcpStdioClient::spawn(command, &args).await {
+                                Ok(client) => {
+                                    let client: Arc<dyn rokr_mcp::McpClientPort> =
+                                        Arc::new(client);
+                                    match client.list_tools().await {
+                                        Ok(defs) => defs
+                                            .into_iter()
+                                            .map(|def| {
+                                                rokr_mcp::McpTool::new(
+                                                    client.clone(),
+                                                    "interim",
+                                                    def,
+                                                )
+                                            })
+                                            .collect(),
+                                        Err(err) => {
+                                            eprintln!(
+                                                "failed to list tools from MCP server \
+                                                 (ROKR_MCP_SERVER): {err}"
+                                            );
+                                            Vec::new()
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "failed to start MCP server (ROKR_MCP_SERVER): {err}"
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        }
+                        None => Vec::new(),
+                    }
+                }
+                Err(_) => Vec::new(),
+            };
+            let mcp_tools = Arc::new(mcp_tools);
+
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
@@ -490,6 +563,7 @@ async fn main() -> ExitCode {
                 let turn_index = turn_index.clone();
                 let data_dir = data_dir.clone();
                 let status_tx = status_tx.clone();
+                let mcp_tools = mcp_tools.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -688,6 +762,15 @@ async fn main() -> ExitCode {
                     };
                     if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
                         tools.push(websearch);
+                    }
+                    // Ticket 44 (mcp-tracer-bullet): MCP tools are gated
+                    // (`McpTool::preview` always returns `Some(...)`), so
+                    // -- like bash/write/edit/webfetch above -- they only
+                    // join the tool set for the `Build` tier, never `Plan`.
+                    if let AgentTier::Build = agent {
+                        for tool in mcp_tools.iter() {
+                            tools.push(tool as &dyn rokr_core::ExecutableTool);
+                        }
                     }
 
                     // Expand any `@path` mentions in the raw input BEFORE it

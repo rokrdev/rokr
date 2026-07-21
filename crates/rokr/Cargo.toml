@@ -11,6 +11,11 @@ rokr-provider = { path = "../rokr-provider" }
 rokr-tools = { path = "../rokr-tools" }
 rokr-config = { path = "../rokr-config" }
 rokr-session = { path = "../rokr-session" }
+# Ticket 44 (mcp-tracer-bullet): not in the ticket's `files-touched` list,
+# but mechanically required -- `main.rs`'s interim MCP wiring (also listed
+# in `files-touched`) cannot call into `rokr-mcp` at all without this
+# dependency edge. Flagged in the ticket report as a deviation.
+rokr-mcp = { path = "../rokr-mcp" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 

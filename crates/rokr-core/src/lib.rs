@@ -9,6 +9,16 @@ pub mod message;
 
 pub use message::{CacheControl, CacheControlKind, ContentBlock, Message, Role};
 
+/// Re-exported so `rokr-mcp` (ticket 44, mcp-tracer-bullet), which per
+/// `docs/adr/0011-rokr-mcp-crate-boundary.md` depends on `rokr-core` only
+/// (never `rokr-tools` directly), can name the error type
+/// `ExecutableTool::execute_boxed` requires without its own `rokr-tools`
+/// dependency. `rokr-core` already depends on `rokr-tools` for the
+/// built-in `impl_executable_tool!`/`impl_executable_tool_gated!` macros
+/// above, so this adds no new dependency edge -- just a narrow re-export
+/// of a type that already flows through `ExecutableTool`'s public API.
+pub use rokr_tools::ToolError;
+
 /// A tool a provider may call, described in rokr-core-native terms. The
 /// minimal shape a `Provider` needs to advertise tools on the wire: a name,
 /// a human-readable description, and a JSON Schema for its input. Built from
@@ -68,7 +78,14 @@ pub struct PermissionRequest {
 /// sees the concrete, monomorphized implementation, not a generic one.
 pub trait ExecutableTool: Send + Sync {
     /// The tool's stable, model-facing name (delegates to `Tool::name`).
-    fn name(&self) -> &'static str;
+    /// Relaxed from `-> &'static str` to `-> &str` (ticket 44,
+    /// mcp-tracer-bullet): every built-in tool's name is still a
+    /// `&'static str` literal and coerces unchanged, but `rokr-mcp`'s
+    /// `McpTool` builds its namespaced `mcp__<server>__<tool>` name at
+    /// runtime from an owned `String`, which cannot satisfy `'static`. No
+    /// other call site is affected -- `run_tool_loop`'s `tool.name() ==
+    /// name.as_str()` lookup only ever compares by value.
+    fn name(&self) -> &str;
 
     /// This tool's wire-facing description, for advertising it to the
     /// provider (delegates to `Tool::description`/`Tool::input_schema`).
@@ -1185,5 +1202,52 @@ mod tests {
             transcript, transcript_before,
             "the original transcript must be left untouched on compaction failure"
         );
+    }
+
+    /// Ticket 44 (mcp-tracer-bullet): `McpTool` in `rokr-mcp` builds its
+    /// model-facing name at runtime (`mcp__<server>__<tool>`, namespaced
+    /// per instance), so it cannot satisfy `ExecutableTool::name`'s
+    /// original `&'static str` return type. This test hand-implements
+    /// `ExecutableTool` for a type whose `name` borrows from an owned
+    /// `String` field, proving the relaxed `-> &str` signature actually
+    /// accepts a non-`'static` borrow (every existing `&'static str`
+    /// built-in impl still coerces to `&str` unchanged, so this is the one
+    /// case the relaxation newly allows). Before the relaxation, this is a
+    /// compile error (E0053: method `name` has an incompatible signature
+    /// for the trait) -- that compile failure IS this test's RED.
+    #[test]
+    fn executable_tool_name_signature_accepts_non_static_str() {
+        struct OwnedNameTool {
+            name: String,
+        }
+
+        impl ExecutableTool for OwnedNameTool {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            fn to_tool_spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: self.name.clone(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                    cache_control: None,
+                }
+            }
+
+            fn execute_boxed<'a>(
+                &'a self,
+                _input: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>>
+            {
+                Box::pin(async { Ok(String::new()) })
+            }
+        }
+
+        let tool = OwnedNameTool {
+            name: format!("dynamic-{}", 1),
+        };
+
+        assert_eq!(tool.name(), "dynamic-1");
     }
 }
