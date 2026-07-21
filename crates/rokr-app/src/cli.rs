@@ -40,6 +40,36 @@ pub enum ResumeMode {
     Continue,
 }
 
+/// Ticket 55 (headless-output-formats-and-permission-mode): the headless
+/// `--output-format` flag. `Text` (the default, absent selects it) is
+/// today's unchanged "print only the final assistant text" behavior from
+/// ticket 54. `Json` prints one `ResultObject` (`crate::result_schema`).
+/// `StreamJson` prints JSONL events followed by that same object. Only
+/// meaningful in headless mode (`-p`/`--print`); ignored by the TUI path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+    StreamJson,
+}
+
+/// Ticket 55 (headless-output-formats-and-permission-mode): the headless
+/// `--permission-mode` flag, defaulting to `Deny` when absent (the caller
+/// applies that default, matching [`Cli::agent`]'s existing pattern) -- a
+/// gated tool call is denied unless the operator opts in. `AcceptEdits`
+/// grants only write/edit (`Diff`) calls, still denying `bash` and MCP
+/// tool calls (no human is present in headless to approve those
+/// interactively). `Bypass` grants every gated call unconditionally, and
+/// additionally requires `--dangerously-skip-permissions` (see
+/// [`crate::headless::build_permission_requester`]) -- it cannot be reached
+/// by this flag alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PermissionMode {
+    Deny,
+    AcceptEdits,
+    Bypass,
+}
+
 /// The full `rokr` command-line surface.
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +99,25 @@ pub struct Cli {
     /// headless-print-mode-text-output).
     #[arg(short = 'p', long = "print", value_name = "prompt")]
     pub print: Option<String>,
+
+    /// Headless-only (see `print` above): how to print the run's outcome.
+    /// Absent selects `text` (the caller applies that default, matching
+    /// `agent`'s existing pattern) -- today's unchanged behavior.
+    #[arg(long = "output-format", value_enum)]
+    pub output_format: Option<OutputFormat>,
+
+    /// Headless-only: how a gated tool call (bash/write/edit/MCP) is
+    /// decided with no human present. Absent selects `deny` (the caller
+    /// applies that default) -- a gated tool call is denied unless the
+    /// operator opts in.
+    #[arg(long = "permission-mode", value_enum)]
+    pub permission_mode: Option<PermissionMode>,
+
+    /// Required alongside `--permission-mode bypass` to actually grant
+    /// every gated tool call unconditionally; see
+    /// `crate::headless::build_permission_requester`.
+    #[arg(long)]
+    pub dangerously_skip_permissions: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -201,6 +250,67 @@ mod tests {
         assert!(
             Cli::try_parse_from(["rokr", "--agent", "bogus"]).is_err(),
             "an unknown --agent value must be a parse error"
+        );
+    }
+
+    /// Ticket 55 (headless-output-formats-and-permission-mode): the three
+    /// new headless-only flags must parse with the exact values the ticket
+    /// documents -- `--output-format text|json|stream-json`,
+    /// `--permission-mode deny|accept-edits|bypass`, and the bare
+    /// `--dangerously-skip-permissions` bool flag -- and be absent (`None`
+    /// / `false`) when not passed, matching `agent`'s existing
+    /// caller-applies-the-default pattern.
+    #[test]
+    fn output_format_permission_mode_and_dangerously_skip_permissions_flags_parse() {
+        let cli = Cli::try_parse_from(["rokr", "-p", "hi"]).expect("no-flag parse should succeed");
+        assert!(
+            cli.output_format.is_none(),
+            "absent --output-format must parse as None"
+        );
+        assert!(
+            cli.permission_mode.is_none(),
+            "absent --permission-mode must parse as None"
+        );
+        assert!(!cli.dangerously_skip_permissions);
+
+        let cli = Cli::try_parse_from(["rokr", "-p", "hi", "--output-format", "json"])
+            .expect("--output-format json should parse");
+        assert!(matches!(cli.output_format, Some(OutputFormat::Json)));
+
+        let cli = Cli::try_parse_from(["rokr", "-p", "hi", "--output-format", "stream-json"])
+            .expect("--output-format stream-json should parse");
+        assert!(matches!(cli.output_format, Some(OutputFormat::StreamJson)));
+
+        let cli = Cli::try_parse_from(["rokr", "-p", "hi", "--output-format", "text"])
+            .expect("--output-format text should parse");
+        assert!(matches!(cli.output_format, Some(OutputFormat::Text)));
+
+        let cli = Cli::try_parse_from(["rokr", "-p", "hi", "--permission-mode", "accept-edits"])
+            .expect("--permission-mode accept-edits should parse");
+        assert!(matches!(
+            cli.permission_mode,
+            Some(PermissionMode::AcceptEdits)
+        ));
+
+        let cli = Cli::try_parse_from([
+            "rokr",
+            "-p",
+            "hi",
+            "--permission-mode",
+            "bypass",
+            "--dangerously-skip-permissions",
+        ])
+        .expect("--permission-mode bypass --dangerously-skip-permissions should parse");
+        assert!(matches!(cli.permission_mode, Some(PermissionMode::Bypass)));
+        assert!(cli.dangerously_skip_permissions);
+
+        assert!(
+            Cli::try_parse_from(["rokr", "-p", "hi", "--output-format", "bogus"]).is_err(),
+            "an unknown --output-format value must be a parse error"
+        );
+        assert!(
+            Cli::try_parse_from(["rokr", "-p", "hi", "--permission-mode", "bogus"]).is_err(),
+            "an unknown --permission-mode value must be a parse error"
         );
     }
 

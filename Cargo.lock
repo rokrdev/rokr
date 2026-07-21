@@ -2478,6 +2478,7 @@ dependencies = [
  "rokr-session",
  "rokr-tools",
  "rokr-tui",
+ "serde",
  "serde_json",
  "tokio",
  "wiremock",

@@ -985,6 +985,32 @@ pub async fn append_compaction_record(
     }
 }
 
+/// Resolves the central data directory for session persistence:
+/// `$XDG_DATA_HOME/rokr` if `XDG_DATA_HOME` is set and non-empty,
+/// otherwise `$HOME/.local/share/rokr`. Mirrors
+/// `rokr_config::default_config_dir`'s exact resolution pattern (ticket 34:
+/// persist-new-sessions -- PRD decision "Central storage, not per-project":
+/// all session data lives under `$XDG_DATA_HOME/rokr/`, not inside the
+/// project being worked on).
+///
+/// Ticket 55 (headless-output-formats-and-permission-mode): moved here from
+/// a private fn of the same name in `crates/rokr/src/main.rs` so headless's
+/// new orchestration (`crate::headless::run`) can build a
+/// `rokr_session::SessionStore`/`CheckpointStore` the same way the TUI path
+/// does, without a second private copy -- `main.rs` now imports this one
+/// instead of defining its own.
+pub fn default_data_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".local/share"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".local/share"));
+    base.join("rokr")
+}
+
 /// Returns the current time as a plain Unix-epoch-seconds string. There is
 /// no date/time-formatting crate in this workspace today (see
 /// `rokr-provider::auth`'s own `expires_at` field, which is a plain `u64`

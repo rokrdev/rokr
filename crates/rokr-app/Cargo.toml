@@ -16,6 +16,13 @@ rokr-hooks = { path = "../rokr-hooks" }
 clap = { workspace = true }
 clap_complete = "4"
 tokio = { workspace = true }
+# Ticket 55 (headless-output-formats-and-permission-mode): not in that
+# ticket's `files-touched` list, but mechanically required -- `result_schema`
+# (also listed in `files-touched`) cannot derive `Serialize` on the result
+# object without it. Same mechanical-necessity precedent as `crates/rokr/Cargo.toml`'s
+# `rokr-mcp`/`rokr-hooks` additions (see those comments and ADR 0011's
+# Consequences).
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

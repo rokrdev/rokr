@@ -4,9 +4,9 @@ use std::sync::Arc;
 use clap::Parser;
 use rokr_app::cli::{completions_script, AuthAction, Cli, Command};
 use rokr_app::{
-    append_compaction_record, log_observational_hook_outcome, matching_hook_entries, now_timestamp,
-    run_hook_entry, select_mode, AgentTier, DenyAllPermissions, Mode, ResumeMode, SessionRunner,
-    SharedProvider,
+    append_compaction_record, default_data_dir, log_observational_hook_outcome,
+    matching_hook_entries, now_timestamp, run_hook_entry, select_mode, AgentTier, Mode, ResumeMode,
+    SessionRunner, SharedProvider,
 };
 use rokr_core::ExecutableTool;
 
@@ -56,7 +56,7 @@ async fn main() -> ExitCode {
             // instead of literally being the prompt text (see
             // `rokr_app::headless::select_mode`).
             if let Mode::Headless(prompt) = select_mode(cli.print.as_deref(), std::io::stdin()) {
-                return run_headless(prompt).await;
+                return rokr_app::headless::run(&cli, prompt).await;
             }
 
             let agent = cli.agent.unwrap_or(AgentTier::Plan);
@@ -892,95 +892,6 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Ticket 54 (headless-print-mode-text-output): drives ONE prompt through
-/// `SessionRunner` with no terminal UI, forced to the read-only `Plan` tier
-/// (this slice's stated default -- see the ticket's `## Context`), and
-/// prints only the final assistant text to stdout on success. Deliberately
-/// skips session persistence, hooks, and MCP -- all optional,
-/// gracefully-degraded `SessionRunner` inputs elsewhere in this file
-/// (`session_handle: None`, empty `hooks_config`/`mcp_server_handles`) --
-/// this is the thinnest possible slice: mode selection, stdin support, and
-/// text output only. Output formats other than plain text, `--permission-mode`,
-/// and the exit-code contract beyond "0 on success" are ticket 55's scope.
-async fn run_headless(prompt: String) -> ExitCode {
-    let agent = AgentTier::Plan;
-
-    let config = match rokr_config::load_or_init_default() {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("failed to initialize config: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let config_dir = rokr_config::default_config_dir();
-
-    let mut system_prompt = match rokr_config::read_agent_prompt(&config_dir, agent.prompt_name()) {
-        Ok(prompt) => prompt,
-        Err(err) => {
-            eprintln!("failed to read agent prompt: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let cwd: Option<std::path::PathBuf> = std::env::current_dir().ok();
-    if let Some(cwd) = cwd.as_deref() {
-        if let Some(project_context) = rokr_config::load_project_context(cwd) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&project_context);
-        }
-    }
-
-    let repo_map: Option<String> = cwd.as_deref().map(rokr_tools::repo_map::generate);
-
-    let token_store = rokr_provider::auth::default_token_store(&config_dir);
-    let resolved_auth = rokr_provider::auth::resolve_auth(
-        None,
-        token_store.as_ref(),
-        rokr_provider::anthropic::ENV_API_KEY,
-    );
-    let built =
-        rokr_provider::build_provider(None, resolved_auth, rokr_provider::RetryPolicy::default());
-    let provider: Result<SharedProvider, String> = match built {
-        Ok(built) => Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
-        Err(err) => Err(err),
-    };
-
-    let (status_tx, _status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
-    let (mcp_notice_tx, _mcp_notice_rx) = std::sync::mpsc::channel::<String>();
-
-    let runner = SessionRunner {
-        provider,
-        transcript: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-        system_prompt,
-        repo_map: Arc::new(std::sync::Mutex::new(repo_map)),
-        last_known_usage: Arc::new(std::sync::Mutex::new(None)),
-        config_dir,
-        session_handle: Arc::new(tokio::sync::RwLock::new(None)),
-        turn_index: Arc::new(std::sync::Mutex::new(0)),
-        data_dir: default_data_dir(),
-        status_tx,
-        mcp_server_handles: Arc::new(Vec::new()),
-        mcp_notice_tx,
-        mcp_http_origins: Arc::new(std::collections::HashMap::new()),
-        hooks_config: Arc::new(std::collections::HashMap::new()),
-        agent,
-        context_window_size: config.context_window_size,
-        auto_compact_threshold: config.auto_compact_threshold,
-    };
-
-    match runner.run_submission(prompt, DenyAllPermissions).await {
-        Ok(reply) => {
-            println!("{reply}");
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
 /// F-002: gates `/mcp reconnect <server>` to `Degraded` servers only --
 /// reconnecting a `Starting` or already-`Ready` server would spin up a
 /// second, redundant lifecycle task racing the one already running (the
@@ -1480,24 +1391,6 @@ async fn handle_rollback_command(
         "Rolled back to turn {target}; restored {} file(s).",
         touched.len()
     )
-}
-
-/// Resolves the central data directory for session persistence:
-/// `$XDG_DATA_HOME/rokr` if `XDG_DATA_HOME` is set and non-empty,
-/// otherwise `$HOME/.local/share/rokr`. Mirrors
-/// `rokr_config::default_config_dir`'s exact resolution pattern (ticket 34:
-/// persist-new-sessions — PRD decision "Central storage, not per-project":
-/// all session data lives under `$XDG_DATA_HOME/rokr/`, not inside the
-/// project being worked on).
-fn default_data_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from(".local/share"));
-    base.join("rokr")
 }
 
 /// Resolves `name` to a concrete backend and writes it into the shared

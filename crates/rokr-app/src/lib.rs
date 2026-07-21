@@ -9,14 +9,16 @@
 
 pub mod cli;
 pub mod headless;
+pub mod result_schema;
 pub mod runner;
 pub mod subagent;
 
-pub use cli::{AgentTier, AuthAction, Cli, Command, ResumeMode};
-pub use headless::{select_mode, DenyAllPermissions, Mode};
+pub use cli::{AgentTier, AuthAction, Cli, Command, OutputFormat, PermissionMode, ResumeMode};
+pub use headless::{build_permission_requester, select_mode, HeadlessPermissionRequester, Mode};
+pub use result_schema::{ResultObject, Subtype, UsageObject};
 pub use runner::{
     accumulate_user_turn, append_compaction_record, capture_checkpoint_if_granted_diff,
-    format_tool_call_permission_text, log_observational_hook_outcome, matching_hook_entries,
-    now_timestamp, run_hook_entry, PermissionRequester, SessionRunner, SharedProvider,
-    COMPACTION_SUMMARY_WRAPPER_PREFIX,
+    default_data_dir, format_tool_call_permission_text, log_observational_hook_outcome,
+    matching_hook_entries, now_timestamp, run_hook_entry, PermissionRequester, SessionRunner,
+    SharedProvider, COMPACTION_SUMMARY_WRAPPER_PREFIX,
 };

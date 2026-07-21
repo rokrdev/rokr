@@ -113,3 +113,267 @@ async fn piped_stdin_prompt_via_dash_argument_produces_same_result_as_inline_pro
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// Ticket 55 (headless-output-formats-and-permission-mode): `--output-format
+/// json` against a scripted (tool-call-free) provider must print EXACTLY
+/// one parseable JSON object to stdout -- no framing text before or after
+/// it -- carrying all eight documented result-object fields (the
+/// acceptance line's field list; see `crates/rokr-app/src/result_schema.rs`
+/// for why "seven" in this test's own mandated name is a ticket-text
+/// drift), and exit 0.
+#[tokio::test]
+async fn json_output_format_produces_one_parseable_result_object_with_required_fields() {
+    const MARKER: &str = "HeadlessJsonReplyMarker5510";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": MARKER}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("json-home");
+    let xdg_config_home = unique_temp_dir("json-xdg-config-home");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("-p")
+        .arg("say hi")
+        .arg("--output-format")
+        .arg("json")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim_end().lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one line of stdout (one JSON result object, no framing), got: {stdout:?}"
+    );
+
+    let result: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("the single stdout line must be parseable JSON");
+    let obj = result
+        .as_object()
+        .expect("the result object must be a JSON object");
+
+    for field in [
+        "subtype",
+        "session_id",
+        "result",
+        "is_error",
+        "usage",
+        "cost_usd",
+        "num_turns",
+        "duration_ms",
+    ] {
+        assert!(
+            obj.contains_key(field),
+            "expected field `{field}` in the JSON result object, got: {result}"
+        );
+    }
+
+    assert_eq!(obj["subtype"], serde_json::json!("success"));
+    assert_eq!(obj["is_error"], serde_json::json!(false));
+    assert_eq!(obj["result"], serde_json::json!(MARKER));
+    assert!(
+        obj["session_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "expected a non-empty session_id, got: {result}"
+    );
+    assert_eq!(obj["cost_usd"], serde_json::json!(0.0));
+    assert!(obj["num_turns"].as_u64().is_some());
+    assert!(obj["duration_ms"].as_u64().is_some());
+    assert!(obj["usage"].is_object());
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 55: `--output-format stream-json` against the same kind of
+/// scripted provider must print JSONL -- every line but the last a
+/// parseable JSON "event" object -- with the LAST line being a full,
+/// parseable result object matching the exact same schema/values
+/// `--output-format json` alone would produce for this run (subtype,
+/// session_id, result, is_error, usage, cost_usd, num_turns, duration_ms).
+#[tokio::test]
+async fn stream_json_output_is_valid_jsonl_terminated_by_json_mode_result_object() {
+    const MARKER: &str = "HeadlessStreamJsonReplyMarker6621";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": MARKER}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("stream-json-home");
+    let xdg_config_home = unique_temp_dir("stream-json-xdg-config-home");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("-p")
+        .arg("say hi")
+        .arg("--output-format")
+        .arg("stream-json")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim_end().lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "expected at least one event line plus the terminating result object, got: {stdout:?}"
+    );
+
+    for line in &lines[..lines.len() - 1] {
+        let event: serde_json::Value =
+            serde_json::from_str(line).expect("every non-terminal JSONL line must be valid JSON");
+        assert!(
+            event.get("type").is_some(),
+            "expected every event line to carry a `type` field, got: {event}"
+        );
+    }
+
+    let result: serde_json::Value = serde_json::from_str(lines[lines.len() - 1])
+        .expect("the terminating line must be a parseable JSON result object");
+    let obj = result
+        .as_object()
+        .expect("the terminating line must be a JSON object");
+
+    for field in [
+        "subtype",
+        "session_id",
+        "result",
+        "is_error",
+        "usage",
+        "cost_usd",
+        "num_turns",
+        "duration_ms",
+    ] {
+        assert!(
+            obj.contains_key(field),
+            "expected field `{field}` in the terminating result object, got: {result}"
+        );
+    }
+    assert_eq!(obj["subtype"], serde_json::json!("success"));
+    assert_eq!(obj["is_error"], serde_json::json!(false));
+    assert_eq!(obj["result"], serde_json::json!(MARKER));
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 55: with `--agent build` (so a gated tool -- `bash` -- is actually
+/// in the tool set) and NO `--permission-mode` flag, a gated tool call the
+/// model attempts must be denied by default -- never silently allowed --
+/// and the run must exit 1 with `subtype: "error_permission"`. Proven two
+/// ways: the JSON result object carries that subtype, AND the marker file
+/// the scripted bash command would have created never appears on disk.
+#[tokio::test]
+async fn default_permission_mode_denies_gated_tool_call_without_flag() {
+    let mock = MockServer::start().await;
+
+    let temp_dir = unique_temp_dir("denied-bash-marker");
+    let marker_file = temp_dir.join("should-never-be-created.txt");
+    let marker_path = marker_file.to_string_lossy().into_owned();
+
+    // First call: the model asks to run a `bash` command that would touch
+    // the marker file. `up_to_n_times(1)` plus insertion-order priority
+    // means this stops matching after its one hit (mirrors
+    // `tui_test.rs`'s tool-call mock pattern).
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-tool-call",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": serde_json::json!({
+                                "command": format!("touch {marker_path}")
+                            }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock)
+        .await;
+
+    // Second call: the loop feeds the (denied) tool result back and the
+    // model replies with a final, tool-call-free text answer.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "acknowledged the denial"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("denied-home");
+    let xdg_config_home = unique_temp_dir("denied-xdg-config-home");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("--agent")
+        .arg("build")
+        .arg("-p")
+        .arg("please run a command")
+        .arg("--output-format")
+        .arg("json")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .failure()
+        .code(1);
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(stdout.trim_end())
+        .expect("even a denied-permission run must print one parseable JSON result object");
+    assert_eq!(result["subtype"], serde_json::json!("error_permission"));
+    assert_eq!(result["is_error"], serde_json::json!(true));
+
+    assert!(
+        !marker_file.exists(),
+        "the denied bash command must never have executed -- found marker file at {marker_path}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
