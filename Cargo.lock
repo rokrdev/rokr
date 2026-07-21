@@ -2453,6 +2453,7 @@ dependencies = [
  "rokr-app",
  "rokr-config",
  "rokr-core",
+ "rokr-eval",
  "rokr-hooks",
  "rokr-mcp",
  "rokr-provider",
@@ -2502,6 +2503,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "rokr-eval"
+version = "0.1.0"
+dependencies = [
+ "rokr-app",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]

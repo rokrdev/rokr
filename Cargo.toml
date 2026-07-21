@@ -11,6 +11,7 @@ members = [
     "crates/rokr-session",
     "crates/rokr-mcp",
     "crates/rokr-hooks",
+    "crates/rokr-eval",
 ]
 
 [workspace.package]

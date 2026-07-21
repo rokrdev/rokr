@@ -112,6 +112,31 @@ impl crate::runner::PermissionRequester for HeadlessPermissionRequester {
 /// since neither ever grants everything unconditionally. A pure function
 /// (no I/O, no process exit) so it's directly unit-testable without
 /// spawning the `rokr` binary.
+/// Ticket 58 (eval-case-runner-and-deterministic-assertions): the CLI-misuse
+/// (exit 2, e.g. `--permission-mode bypass` without
+/// `--dangerously-skip-permissions`) vs. any other bootstrap failure (exit
+/// 1) distinction [`run`] used to collapse straight into an `ExitCode`
+/// inline. Pulled out as its own error type so [`run_result_object`] (which
+/// has no `ExitCode` to return -- callers like `rokr-eval` need the
+/// distinction, not a process exit code) can still report it.
+pub enum BootstrapError {
+    /// A flag/parameter combination that's invalid before any session,
+    /// provider, or hook setup even starts (maps to exit code 2 in [`run`]).
+    CliMisuse(String),
+    /// Any other bootstrap failure -- config load, prompt read, etc. (maps
+    /// to `ExitCode::FAILURE` in [`run`]).
+    Other(String),
+}
+
+/// The result of one headless turn: the [`crate::result_schema::ResultObject`]
+/// plus the full message transcript that produced it (needed for
+/// `--output-format stream-json`'s event replay in [`run`]; `rokr-eval`
+/// callers of [`run_result_object`] only need `result_object`).
+pub struct HeadlessRunOutcome {
+    pub result_object: crate::result_schema::ResultObject,
+    pub transcript: Vec<rokr_core::Message>,
+}
+
 /// Drives ONE headless run end to end: session bootstrap (mirroring the TUI
 /// startup path in `crates/rokr/src/main.rs`), permission-requester
 /// selection by `cli.permission_mode`, real `hooks_config` wiring (from
@@ -122,14 +147,108 @@ impl crate::runner::PermissionRequester for HeadlessPermissionRequester {
 /// returns this function's `ExitCode` -- see this ticket's report for why
 /// the real orchestration lives here instead ("real orchestration ...
 /// belongs in rokr-app ... fully unit-testable without the binary").
+///
+/// Ticket 58: this is now itself a thin wrapper around
+/// [`run_result_object`] -- resolve the three flag defaults + the real cwd,
+/// call it, then print per `output_format` and map to an `ExitCode`. The
+/// bootstrap/run/result-object-construction logic lives in
+/// `run_result_object` so `rokr-eval` can drive one isolated headless turn
+/// per eval case (explicit pinned agent tier/permission mode + a fresh temp
+/// fixture dir as `cwd`) without going through a `Cli` struct or this
+/// process's real `std::env::current_dir()`.
 pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCode {
-    let started_at = std::time::Instant::now();
-
     let permission_mode = cli
         .permission_mode
         .unwrap_or(crate::cli::PermissionMode::Deny);
     let output_format = cli.output_format.unwrap_or(crate::cli::OutputFormat::Text);
     let agent = cli.agent.unwrap_or(crate::cli::AgentTier::Plan);
+    let cwd = std::env::current_dir().ok();
+
+    let outcome = match run_result_object(
+        agent,
+        permission_mode,
+        cli.dangerously_skip_permissions,
+        prompt,
+        cwd,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(BootstrapError::CliMisuse(err)) => {
+            eprintln!("{err}");
+            return std::process::ExitCode::from(2);
+        }
+        Err(BootstrapError::Other(err)) => {
+            eprintln!("{err}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result_object = outcome.result_object;
+
+    match output_format {
+        // Unchanged from ticket 54: only the final assistant text, on
+        // stdout on success / stderr on failure, no framing.
+        crate::cli::OutputFormat::Text => match result_object.subtype {
+            crate::result_schema::Subtype::Success => println!("{}", result_object.result),
+            _ => eprintln!("{}", result_object.result),
+        },
+        // JSON output is always on stdout, success or failure -- a
+        // machine-parseable result is exactly what a caller needs from a
+        // failed run too (which subtype, which message), so it's never
+        // routed to stderr the way plain text framing is.
+        crate::cli::OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&result_object)
+                    .expect("ResultObject serialization cannot fail")
+            );
+        }
+        // Post-hoc, not live (documented simplification -- see this
+        // ticket's report and docs/adr/0013-headless-output-schema.md):
+        // there is no live event-streaming hook available without touching
+        // `runner.rs`/`rokr-core` (out of this ticket's scope), so this
+        // replays the transcript `run_submission` already produced --
+        // genuine per-message data, just delivered after the fact rather
+        // than incrementally.
+        crate::cli::OutputFormat::StreamJson => {
+            for message in &outcome.transcript {
+                let event_type = match message.role {
+                    rokr_core::Role::User => "user",
+                    rokr_core::Role::Assistant => "assistant",
+                    rokr_core::Role::System => "system",
+                };
+                let event = serde_json::json!({ "type": event_type, "message": message });
+                println!(
+                    "{}",
+                    serde_json::to_string(&event).expect("event serialization cannot fail")
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&result_object)
+                    .expect("ResultObject serialization cannot fail")
+            );
+        }
+    }
+
+    result_object.exit_code()
+}
+
+/// Ticket 58: the bootstrap-and-run logic [`run`] used to have inlined,
+/// taking explicit params instead of `&crate::cli::Cli` +
+/// `std::env::current_dir()` so a caller (headless `main.rs`'s [`run`]
+/// wrapper, or `rokr-eval`'s per-case driver) can pin exactly which agent
+/// tier / permission mode / cwd this ONE turn runs with. Byte-for-byte the
+/// same bootstrap/run/result-object construction `run` used to do inline;
+/// only the parameter source changed (explicit args here, `&Cli` there).
+pub async fn run_result_object(
+    agent: crate::cli::AgentTier,
+    permission_mode: crate::cli::PermissionMode,
+    dangerously_skip_permissions: bool,
+    prompt: String,
+    cwd: Option<std::path::PathBuf>,
+) -> Result<HeadlessRunOutcome, BootstrapError> {
+    let started_at = std::time::Instant::now();
 
     // CLI misuse (exit 2, per the ticket's exit-code contract): caught
     // before any session/provider/hook setup below, mirroring how clap
@@ -137,34 +256,17 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
     // -- `--permission-mode bypass` without `--dangerously-skip-permissions`
     // is a combination clap's own `ValueEnum`/`bool` flags can't express,
     // so it's checked here instead.
-    let permission =
-        match build_permission_requester(permission_mode, cli.dangerously_skip_permissions) {
-            Ok(permission) => permission,
-            Err(err) => {
-                eprintln!("{err}");
-                return std::process::ExitCode::from(2);
-            }
-        };
+    let permission = build_permission_requester(permission_mode, dangerously_skip_permissions)
+        .map_err(BootstrapError::CliMisuse)?;
 
-    let config = match rokr_config::load_or_init_default() {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("failed to initialize config: {err}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+    let config = rokr_config::load_or_init_default()
+        .map_err(|err| BootstrapError::Other(format!("failed to initialize config: {err}")))?;
 
     let config_dir = rokr_config::default_config_dir();
 
-    let mut system_prompt = match rokr_config::read_agent_prompt(&config_dir, agent.prompt_name()) {
-        Ok(prompt) => prompt,
-        Err(err) => {
-            eprintln!("failed to read agent prompt: {err}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+    let mut system_prompt = rokr_config::read_agent_prompt(&config_dir, agent.prompt_name())
+        .map_err(|err| BootstrapError::Other(format!("failed to read agent prompt: {err}")))?;
 
-    let cwd: Option<std::path::PathBuf> = std::env::current_dir().ok();
     if let Some(cwd) = cwd.as_deref() {
         if let Some(project_context) = rokr_config::load_project_context(cwd) {
             system_prompt.push_str("\n\n");
@@ -299,9 +401,12 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
     };
     let is_error = subtype != crate::result_schema::Subtype::Success;
 
-    let num_turns = transcript
-        .lock()
-        .await
+    // Snapshotted once here (rather than filtering for `num_turns` and
+    // separately re-locking for `HeadlessRunOutcome::transcript` /
+    // `run`'s stream-json replay) -- a single faithful, non-fabricated
+    // record of exactly this run's exchange.
+    let transcript_snapshot = transcript.lock().await.clone();
+    let num_turns = transcript_snapshot
         .iter()
         .filter(|message| message.role == rokr_core::Role::Assistant)
         .count() as u32;
@@ -330,54 +435,10 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
         duration_ms,
     };
 
-    match output_format {
-        // Unchanged from ticket 54: only the final assistant text, on
-        // stdout on success / stderr on failure, no framing.
-        crate::cli::OutputFormat::Text => match subtype {
-            crate::result_schema::Subtype::Success => println!("{}", result_object.result),
-            _ => eprintln!("{}", result_object.result),
-        },
-        // JSON output is always on stdout, success or failure -- a
-        // machine-parseable result is exactly what a caller needs from a
-        // failed run too (which subtype, which message), so it's never
-        // routed to stderr the way plain text framing is.
-        crate::cli::OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string(&result_object)
-                    .expect("ResultObject serialization cannot fail")
-            );
-        }
-        // Post-hoc, not live (documented simplification -- see this
-        // ticket's report and docs/adr/0013-headless-output-schema.md):
-        // there is no live event-streaming hook available without touching
-        // `runner.rs`/`rokr-core` (out of this ticket's scope), so this
-        // replays the transcript `run_submission` already produced --
-        // genuine per-message data, just delivered after the fact rather
-        // than incrementally.
-        crate::cli::OutputFormat::StreamJson => {
-            let transcript_snapshot = transcript.lock().await.clone();
-            for message in &transcript_snapshot {
-                let event_type = match message.role {
-                    rokr_core::Role::User => "user",
-                    rokr_core::Role::Assistant => "assistant",
-                    rokr_core::Role::System => "system",
-                };
-                let event = serde_json::json!({ "type": event_type, "message": message });
-                println!(
-                    "{}",
-                    serde_json::to_string(&event).expect("event serialization cannot fail")
-                );
-            }
-            println!(
-                "{}",
-                serde_json::to_string(&result_object)
-                    .expect("ResultObject serialization cannot fail")
-            );
-        }
-    }
-
-    result_object.exit_code()
+    Ok(HeadlessRunOutcome {
+        result_object,
+        transcript: transcript_snapshot,
+    })
 }
 
 pub fn build_permission_requester(

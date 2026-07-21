@@ -44,6 +44,50 @@ async fn main() -> ExitCode {
             println!("{}", completions_script(shell));
             ExitCode::SUCCESS
         }
+        // Ticket 58 (eval-case-runner-and-deterministic-assertions): runs
+        // every eval case file in `cases_dir` and exits -- the same
+        // "run and exit, no TUI" shape as `auth login`/`completions` above.
+        // A thin adapter: all the orchestration (fresh fixture dir per
+        // case, fresh headless session, assertion checking) lives in
+        // `rokr_eval::run_eval`; this arm just prints its per-case report
+        // and maps the outcome to an exit code (0 iff every case passed and
+        // the run itself didn't hit a whole-run error, 1 otherwise).
+        Some(Command::Eval {
+            cases_dir,
+            dangerously_skip_permissions,
+        }) => match rokr_eval::run_eval(&cases_dir, dangerously_skip_permissions).await {
+            Ok(outcomes) => {
+                let mut any_failed = false;
+                for outcome in &outcomes {
+                    if outcome.passed {
+                        println!("PASS {}", outcome.name);
+                    } else {
+                        any_failed = true;
+                        println!("FAIL {}", outcome.name);
+                        if let Some(err) = &outcome.run_error {
+                            println!("  run error: {err}");
+                        }
+                        for assertion in &outcome.assertion_outcomes {
+                            if !assertion.passed {
+                                println!(
+                                    "  assertion failed: {} ({})",
+                                    assertion.description, assertion.detail
+                                );
+                            }
+                        }
+                    }
+                }
+                if any_failed {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(err) => {
+                eprintln!("eval failed: {err}");
+                ExitCode::FAILURE
+            }
+        },
         // No subcommand: launch the TUI. `--agent` defaults to `Plan` when
         // absent (the old `parse_agent_tier([])` behavior);
         // `--resume` / `--continue` resolve via `Cli::resume_mode`.

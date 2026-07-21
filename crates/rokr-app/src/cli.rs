@@ -140,6 +140,28 @@ pub enum Command {
         /// Which shell's completion script to generate.
         shell: clap_complete::Shell,
     },
+    // Ticket 58 (eval-case-runner-and-deterministic-assertions): each case
+    // is isolated in a fresh temp fixture dir, a fresh headless session,
+    // and an explicit pinned model/permission mode -- no case inherits
+    // ambient config or another case's state. Delegates to
+    // `rokr_eval::run_eval`.
+    /// Run every eval case file under `cases_dir`, reporting pass/fail per
+    /// case (`eval <cases-dir>`).
+    Eval {
+        /// Directory containing eval case files (`*.json`).
+        cases_dir: std::path::PathBuf,
+
+        /// Required for a case file requesting `permission_mode: bypass` to
+        /// actually be honored -- mirrors the top-level
+        /// `Cli::dangerously_skip_permissions` flag (see its doc comment):
+        /// a case file is data, not operator intent, so it must never be
+        /// able to grant itself the equivalent of
+        /// `--dangerously-skip-permissions` on its own. Without this flag, a
+        /// bypass-requesting case fails with a clear error instead of
+        /// running.
+        #[arg(long)]
+        dangerously_skip_permissions: bool,
+    },
 }
 
 /// Ticket 53 (shell-completions-subcommand): renders the full [`Cli`]

@@ -1,0 +1,19 @@
+[package]
+name = "rokr-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Ticket 58 (eval-case-runner-and-deterministic-assertions): depends only on
+# rokr-app (not the reverse), keeping eval-only dependencies off every
+# shipped binary's path -- rokr-eval is driven by `rokr eval <cases-dir>`
+# but is never itself a dependency of the `rokr` TUI/headless path.
+rokr-app = { path = "../rokr-app" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
