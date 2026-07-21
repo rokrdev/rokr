@@ -53,16 +53,17 @@ pub struct McpServerConfig {
     pub auto_approve: Vec<String>,
 }
 
-/// A server's transport configuration. Only `Stdio` is implemented in
-/// ticket 45; `Http` (ticket 48, stretch scope) is designed to slot in
-/// additively later since this enum's default (externally-tagged) serde
-/// representation already matches the PRD's documented shape --
-/// `{"stdio": {...}}` today, `{"http": {...}}` later -- without a
-/// migration.
+/// A server's transport configuration. `Stdio` is ticket 45's; `Http`
+/// (ticket 48, stretch scope) slots in additively as this enum's default
+/// (externally-tagged) serde representation already anticipated --
+/// `{"stdio": {...}}` or `{"http": {...}}` -- with no migration. `Http`
+/// carries a static bearer/env-token `headers` map only -- no OAuth 2.1
+/// (PRD "Out of Scope").
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
     Stdio(StdioTransportConfig),
+    Http(HttpTransportConfig),
 }
 
 /// A stdio MCP server's launch spec: the command to spawn, its arguments,
@@ -74,6 +75,19 @@ pub struct StdioTransportConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+}
+
+/// A Streamable HTTP MCP server's launch spec (ticket 48,
+/// mcp-http-transport, stretch scope): the server's URL and any static
+/// HTTP headers to send with every request (e.g. `"Authorization": "Bearer
+/// ..."`). No OAuth 2.1 support -- PRD "Out of Scope" -- so `headers` is
+/// deliberately a plain string map the caller already resolved, not a
+/// token-refresh flow.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HttpTransportConfig {
+    pub url: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 /// Clamps an out-of-range `auto_compact_threshold` (loaded from an existing
@@ -394,10 +408,54 @@ mod tests {
 
         let server = config.mcp.get("my-server").expect("expected my-server entry");
         assert!(server.enabled);
-        let McpTransport::Stdio(stdio) = &server.transport;
-        assert_eq!(stdio.command, "/path/to/server");
-        assert_eq!(stdio.args, vec!["--flag".to_string()]);
-        assert_eq!(stdio.env.get("KEY"), Some(&"value".to_string()));
+        match &server.transport {
+            McpTransport::Stdio(stdio) => {
+                assert_eq!(stdio.command, "/path/to/server");
+                assert_eq!(stdio.args, vec!["--flag".to_string()]);
+                assert_eq!(stdio.env.get("KEY"), Some(&"value".to_string()));
+            }
+            other => panic!("expected McpTransport::Stdio, got {other:?}"),
+        }
+    }
+
+    /// Ticket 48 (mcp-http-transport), PRD "Config schema": the `http`
+    /// transport variant ticket 45's `McpTransport` doc comment designed
+    /// for -- `{"url": "...", "headers": {...}}`, externally tagged
+    /// alongside `stdio` with no migration needed. `headers` carries a
+    /// static bearer/env-token value the caller already resolved (no
+    /// OAuth 2.1 -- PRD "Out of Scope"), so this is a plain string map,
+    /// deserialized the same way `StdioTransportConfig.env` already is.
+    #[test]
+    fn mcp_server_transport_deserializes_http_variant_with_headers() {
+        let json = r#"{
+            "version": 1,
+            "mcp": {
+                "remote-server": {
+                    "transport": {
+                        "http": {
+                            "url": "https://example.com/mcp",
+                            "headers": {"Authorization": "Bearer test-token"}
+                        }
+                    },
+                    "enabled": true
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let server = config.mcp.get("remote-server").expect("expected remote-server entry");
+        assert!(server.enabled);
+        match &server.transport {
+            McpTransport::Http(http) => {
+                assert_eq!(http.url, "https://example.com/mcp");
+                assert_eq!(
+                    http.headers.get("Authorization"),
+                    Some(&"Bearer test-token".to_string())
+                );
+            }
+            other => panic!("expected McpTransport::Http, got {other:?}"),
+        }
     }
 
     #[test]

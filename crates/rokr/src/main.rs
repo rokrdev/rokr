@@ -545,6 +545,40 @@ async fn main() -> ExitCode {
                             mcp_notice_tx.clone(),
                             server.auto_approve.clone(),
                         ),
+                        // Ticket 48 (mcp-http-transport, stretch scope):
+                        // same lifecycle machinery as the stdio arm above,
+                        // via `rokr_mcp::spawn_http_server`.
+                        rokr_config::McpTransport::Http(http) => rokr_mcp::spawn_http_server(
+                            name.clone(),
+                            http.url.clone(),
+                            http.headers.clone(),
+                            mcp_notice_tx.clone(),
+                            server.auto_approve.clone(),
+                        ),
+                    })
+                    .collect(),
+            );
+
+            // Ticket 48 (mcp-http-transport), PRD "MCP permissions": an
+            // HTTP server's origin is a data-exfiltration signal, so it's
+            // surfaced in the permission-prompt text
+            // (`format_tool_call_permission_text` below) for a
+            // `PermissionPayload::ToolCall` whose server is HTTP-transport.
+            // Built once here (server name -> URL, HTTP servers only)
+            // rather than adding an `origin` field to
+            // `PermissionPayload::ToolCall` itself (`rokr-core`) -- that
+            // type's own doc comment (ticket 47) already anticipated this
+            // exact bridge-side lookup as the intended seam, so this is
+            // the smallest change that satisfies it.
+            let mcp_http_origins: Arc<std::collections::HashMap<String, String>> = Arc::new(
+                config
+                    .mcp
+                    .iter()
+                    .filter_map(|(name, server)| match &server.transport {
+                        rokr_config::McpTransport::Http(http) => {
+                            Some((name.clone(), http.url.clone()))
+                        }
+                        rokr_config::McpTransport::Stdio(_) => None,
                     })
                     .collect(),
             );
@@ -576,6 +610,7 @@ async fn main() -> ExitCode {
                 let status_tx = status_tx.clone();
                 let mcp_server_handles = mcp_server_handles.clone();
                 let mcp_tools_frozen = mcp_tools_frozen.clone();
+                let mcp_http_origins = mcp_http_origins.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -650,9 +685,11 @@ async fn main() -> ExitCode {
                     let request_permission_session_handle = session_handle.clone();
                     let request_permission_turn_index = turn_index.clone();
                     let request_permission_data_dir = data_dir.clone();
+                    let request_permission_mcp_http_origins = mcp_http_origins.clone();
                     let subagent_request_permission_session_handle = session_handle.clone();
                     let subagent_request_permission_turn_index = turn_index.clone();
                     let subagent_request_permission_data_dir = data_dir.clone();
+                    let subagent_request_permission_mcp_http_origins = mcp_http_origins.clone();
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
@@ -673,6 +710,7 @@ async fn main() -> ExitCode {
                         let session_handle = request_permission_session_handle.clone();
                         let turn_index = request_permission_turn_index.clone();
                         let data_dir = request_permission_data_dir.clone();
+                        let mcp_http_origins = request_permission_mcp_http_origins.clone();
                         async move {
                             let (detail, diff_path_and_old) = match request.payload {
                                 rokr_core::PermissionPayload::Command(command) => {
@@ -689,16 +727,20 @@ async fn main() -> ExitCode {
                                     server,
                                     tool,
                                     input_pretty,
-                                } => (
-                                    rokr_tui::PermissionDetail::Text(
-                                        format_tool_call_permission_text(
-                                            &server,
-                                            &tool,
-                                            &input_pretty,
+                                } => {
+                                    let origin = mcp_http_origins.get(&server).map(String::as_str);
+                                    (
+                                        rokr_tui::PermissionDetail::Text(
+                                            format_tool_call_permission_text(
+                                                &server,
+                                                &tool,
+                                                &input_pretty,
+                                                origin,
+                                            ),
                                         ),
-                                    ),
-                                    None,
-                                ),
+                                        None,
+                                    )
+                                }
                             };
                             let granted = permission
                                 .request(rokr_tui::PermissionRequest {
@@ -737,6 +779,8 @@ async fn main() -> ExitCode {
                             let session_handle = subagent_request_permission_session_handle.clone();
                             let turn_index = subagent_request_permission_turn_index.clone();
                             let data_dir = subagent_request_permission_data_dir.clone();
+                            let mcp_http_origins =
+                                subagent_request_permission_mcp_http_origins.clone();
                             Box::pin(async move {
                                 let (detail, diff_path_and_old) = match request.payload {
                                     rokr_core::PermissionPayload::Command(command) => {
@@ -753,16 +797,21 @@ async fn main() -> ExitCode {
                                         server,
                                         tool,
                                         input_pretty,
-                                    } => (
-                                        rokr_tui::PermissionDetail::Text(
-                                            format_tool_call_permission_text(
-                                                &server,
-                                                &tool,
-                                                &input_pretty,
+                                    } => {
+                                        let origin =
+                                            mcp_http_origins.get(&server).map(String::as_str);
+                                        (
+                                            rokr_tui::PermissionDetail::Text(
+                                                format_tool_call_permission_text(
+                                                    &server,
+                                                    &tool,
+                                                    &input_pretty,
+                                                    origin,
+                                                ),
                                             ),
-                                        ),
-                                        None,
-                                    ),
+                                            None,
+                                        )
+                                    }
                                 };
                                 let granted = permission
                                     .request(rokr_tui::PermissionRequest {
@@ -1230,13 +1279,29 @@ fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String)
 /// into the `rokr_tui::PermissionDetail::Text` shown in the permission
 /// prompt -- one `label: value` line per field, server then tool then the
 /// pretty-printed input. Kept as discrete lines (rather than one
-/// interpolated blob) so ticket 48 (Streamable HTTP) can prepend/append an
+/// interpolated blob) so ticket 48 (Streamable HTTP) can append an
 /// `origin: ...` line for a remote server's permission prompt without
 /// reshaping this format. Shared by both `request_permission` and
 /// `subagent_request_permission` below, which build identical prompt text
 /// for a `ToolCall` payload.
-fn format_tool_call_permission_text(server: &str, tool: &str, input_pretty: &str) -> String {
-    format!("server: {server}\ntool: {tool}\ninput: {input_pretty}")
+///
+/// Ticket 48 (mcp-http-transport), PRD "MCP permissions": `origin` is
+/// `Some(url)` when `server` is an HTTP-transport MCP server (looked up by
+/// the caller from config, NOT carried on `PermissionPayload::ToolCall`
+/// itself -- see `mcp_http_origins`'s doc comment above for why), `None`
+/// for a stdio server. An HTTP server's origin is a data-exfiltration
+/// signal, so it's appended as its own line when present.
+fn format_tool_call_permission_text(
+    server: &str,
+    tool: &str,
+    input_pretty: &str,
+    origin: Option<&str>,
+) -> String {
+    let mut text = format!("server: {server}\ntool: {tool}\ninput: {input_pretty}");
+    if let Some(origin) = origin {
+        text.push_str(&format!("\norigin: {origin}"));
+    }
+    text
 }
 
 /// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management

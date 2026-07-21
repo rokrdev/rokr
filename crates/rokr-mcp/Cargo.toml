@@ -9,20 +9,52 @@ license.workspace = true
 # pre-1.0 and its client API is not yet stable across minor releases.
 # `docs/adr/0011-rokr-mcp-crate-boundary.md` records the spike that
 # validated this version's client + stdio transport against the fake
-# server fixture. Only the `client` (Peer::list_tools/call_tool) and
-# `transport-child-process` (spawning + piping a stdio subprocess)
-# features are enabled -- this crate never acts as an MCP *server*.
+# server fixture. Only the `client` (Peer::list_tools/call_tool),
+# `transport-child-process` (spawning + piping a stdio subprocess), and
+# (ticket 48, mcp-http-transport, stretch scope) `reqwest` +
+# `transport-streamable-http-client-reqwest` features are enabled -- this
+# crate never acts as an MCP *server*. `reqwest` (rmcp's own feature,
+# distinct from the `reqwest` crate dep below) is required in ADDITION to
+# `transport-streamable-http-client-reqwest`: read directly from rmcp
+# 2.2.0's vendored Cargo.toml, the latter alone only pulls in the optional
+# `reqwest` dependency (`dep:reqwest`) without enabling a TLS backend
+# feature on it (`default-features = false` on rmcp's own reqwest dep) --
+# `reqwest` maps to `reqwest?/rustls`, giving the HTTP transport a working
+# TLS backend for `https://` MCP servers.
 rmcp = { version = "=2.2.0", default-features = false, features = [
     "client",
     "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
 ] }
 rokr-core = { path = "../rokr-core" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# Ticket 48 (mcp-http-transport): needed to NAME the `reqwest::Client` type
+# rmcp's `StreamableHttpClientTransport<reqwest::Client>` is generic over
+# (`StreamableHttpClientTransport::from_config` is only implemented for
+# that concrete type param). Pinned to the same major version as rmcp
+# 2.2.0's own internal (optional) reqwest dependency (0.13.2, read from its
+# vendored Cargo.toml) so Cargo resolves both to the SAME compiled crate --
+# this is a SEPARATE major version from the workspace's own `reqwest`
+# (0.12, used by rokr-provider/rokr-tools); the two coexist independently,
+# which is expected, not an error.
+reqwest = { version = "0.13", default-features = false }
+# Ticket 48: `StreamableHttpClientTransportConfig::custom_headers` is typed
+# `HashMap<http::HeaderName, http::HeaderValue>` (`http` 1.x, matching
+# rmcp's own vendored dependency) -- needed directly to build that map from
+# `rokr_config::HttpTransportConfig`'s plain `HashMap<String, String>`.
+http = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Ticket 48 (mcp-http-transport): fake HTTP MCP server fixture for
+# `http_transport_sends_static_token_header_on_every_request` -- mirrors
+# how `crates/rokr/tests/tui_test.rs` already uses wiremock for its own
+# fake-server fixtures. Not a rokr-mcp dep until this ticket, since the
+# stdio track's fixture is a real subprocess, not an HTTP mock.
+wiremock = { workspace = true }
 
 # Fake stdio MCP server fixture (ticket 44): a hand-rolled, minimal
 # JSON-RPC-over-stdio server used ONLY by tests to exercise the real

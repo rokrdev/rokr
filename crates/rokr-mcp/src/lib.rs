@@ -109,6 +109,51 @@ impl RmcpStdioClient {
     }
 }
 
+/// The Streamable HTTP `McpClientPort` implementation (ticket 48,
+/// mcp-http-transport, stretch scope): connects to a remote MCP server
+/// over HTTP instead of spawning a subprocess. Same `RunningService`
+/// field shape as `RmcpStdioClient` -- `rmcp`'s `RunningService<R, S>` is
+/// generic over the role/handler, not the transport, so both clients hold
+/// the identical type once `initialize` completes; only how each gets
+/// there (`connect` below vs. `spawn` above) differs.
+pub struct RmcpHttpClient {
+    service: rmcp::service::RunningService<rmcp::RoleClient, ()>,
+}
+
+impl RmcpHttpClient {
+    /// Connects to `url` and completes the MCP `initialize` handshake,
+    /// sending `headers` as literal HTTP headers on every request. Static
+    /// bearer/env-token auth only (the caller resolves the token value
+    /// into `headers` itself) -- no OAuth 2.1 (PRD "Out of Scope"), so
+    /// this is a plain header pass-through, not a token-refresh flow. `()`
+    /// as the client-side handler mirrors `RmcpStdioClient::spawn`'s
+    /// reasoning -- see its doc comment.
+    pub async fn connect(
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, McpClientError> {
+        let mut custom_headers = std::collections::HashMap::new();
+        for (name, value) in headers {
+            let header_name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
+                McpClientError::Spawn(format!("invalid HTTP header name {name:?}: {err}"))
+            })?;
+            let header_value = http::HeaderValue::from_str(value).map_err(|err| {
+                McpClientError::Spawn(format!("invalid HTTP header value for {name:?}: {err}"))
+            })?;
+            custom_headers.insert(header_name, header_value);
+        }
+        let config = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
+            url.to_string(),
+        )
+        .custom_headers(custom_headers);
+        let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
+        let service = rmcp::ServiceExt::serve((), transport)
+            .await
+            .map_err(|err| McpClientError::Initialize(err.to_string()))?;
+        Ok(Self { service })
+    }
+}
+
 /// Lifecycle status of one configured MCP server (ticket 45,
 /// mcp-config-and-lifecycle). Kept introspectable (not a plain
 /// success/failure bool) so ticket 51's `/mcp` listing can report it
@@ -304,33 +349,100 @@ pub fn spawn_stdio_server(
     spawn_server_with_connector(name, connect, notice_tx, Arc::new(auto_approve))
 }
 
+/// Production entry point for a Streamable HTTP MCP server (ticket 48,
+/// mcp-http-transport, stretch scope): mirrors `spawn_stdio_server` above,
+/// substituting `RmcpHttpClient::connect` for `RmcpStdioClient::spawn` --
+/// same lifecycle/retry/status machinery either way, since
+/// `spawn_server_with_connector` is generic over the connector, not the
+/// transport.
+pub fn spawn_http_server(
+    name: String,
+    url: String,
+    headers: std::collections::HashMap<String, String>,
+    notice_tx: std::sync::mpsc::Sender<String>,
+    auto_approve: Vec<String>,
+) -> McpServerHandle {
+    let connect = move || {
+        let url = url.clone();
+        let headers = headers.clone();
+        async move {
+            let client = RmcpHttpClient::connect(&url, &headers).await?;
+            Ok(Arc::new(client) as Arc<dyn McpClientPort>)
+        }
+    };
+    spawn_server_with_connector(name, connect, notice_tx, Arc::new(auto_approve))
+}
+
+/// Shared `list_tools`/`call_tool` logic for every `McpClientPort` impl
+/// backed by a real `rmcp` `RunningService` (ticket 48, mcp-http-transport:
+/// factored out once `RmcpHttpClient` needed the exact same body
+/// `RmcpStdioClient` already had -- `RunningService<R, S>` is generic over
+/// the role/handler, not the transport, so this works unchanged for both
+/// stdio and HTTP).
+async fn list_tools_via(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> Result<Vec<McpToolDef>, McpClientError> {
+    // `list_all_tools` (rather than the single-page `list_tools`) pages
+    // through `nextCursor` automatically -- this fixture and v1's
+    // one-server wiring never paginate, but there's no reason to
+    // hand-roll cursor-following when `rmcp` already provides it.
+    let tools = service
+        .peer()
+        .list_all_tools()
+        .await
+        .map_err(|err| McpClientError::Request(err.to_string()))?;
+    Ok(tools
+        .into_iter()
+        .map(|tool| McpToolDef {
+            name: tool.name.to_string(),
+            description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
+            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+        })
+        .collect())
+}
+
+async fn call_tool_via(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<RawCallResult, McpClientError> {
+    let arguments = match arguments {
+        serde_json::Value::Object(map) => Some(map),
+        serde_json::Value::Null => None,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("value".to_string(), other);
+            Some(map)
+        }
+    };
+    let mut params = rmcp::model::CallToolRequestParams::new(name.to_string());
+    if let Some(arguments) = arguments {
+        params = params.with_arguments(arguments);
+    }
+    let result = service
+        .peer()
+        .call_tool(params)
+        .await
+        .map_err(|err| McpClientError::Request(err.to_string()))?;
+    let content = result
+        .content
+        .into_iter()
+        .map(|item| match item {
+            rmcp::model::ContentBlock::Text(text) => RawContentItem::Text(text.text),
+            _ => RawContentItem::NonText,
+        })
+        .collect();
+    Ok(RawCallResult {
+        content,
+        is_error: result.is_error.unwrap_or(false),
+    })
+}
+
 impl McpClientPort for RmcpStdioClient {
     fn list_tools<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<McpToolDef>, McpClientError>> + Send + 'a>> {
-        Box::pin(async move {
-            // `list_all_tools` (rather than the single-page `list_tools`)
-            // pages through `nextCursor` automatically -- this fixture and
-            // v1's one-server wiring never paginate, but there's no reason
-            // to hand-roll cursor-following when `rmcp` already provides it.
-            let tools = self
-                .service
-                .peer()
-                .list_all_tools()
-                .await
-                .map_err(|err| McpClientError::Request(err.to_string()))?;
-            Ok(tools
-                .into_iter()
-                .map(|tool| McpToolDef {
-                    name: tool.name.to_string(),
-                    description: tool
-                        .description
-                        .map(|d| d.to_string())
-                        .unwrap_or_default(),
-                    input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
-                })
-                .collect())
-        })
+        Box::pin(list_tools_via(&self.service))
     }
 
     fn call_tool<'a>(
@@ -338,39 +450,23 @@ impl McpClientPort for RmcpStdioClient {
         name: &'a str,
         arguments: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<RawCallResult, McpClientError>> + Send + 'a>> {
-        Box::pin(async move {
-            let arguments = match arguments {
-                serde_json::Value::Object(map) => Some(map),
-                serde_json::Value::Null => None,
-                other => {
-                    let mut map = serde_json::Map::new();
-                    map.insert("value".to_string(), other);
-                    Some(map)
-                }
-            };
-            let mut params = rmcp::model::CallToolRequestParams::new(name.to_string());
-            if let Some(arguments) = arguments {
-                params = params.with_arguments(arguments);
-            }
-            let result = self
-                .service
-                .peer()
-                .call_tool(params)
-                .await
-                .map_err(|err| McpClientError::Request(err.to_string()))?;
-            let content = result
-                .content
-                .into_iter()
-                .map(|item| match item {
-                    rmcp::model::ContentBlock::Text(text) => RawContentItem::Text(text.text),
-                    _ => RawContentItem::NonText,
-                })
-                .collect();
-            Ok(RawCallResult {
-                content,
-                is_error: result.is_error.unwrap_or(false),
-            })
-        })
+        Box::pin(call_tool_via(&self.service, name, arguments))
+    }
+}
+
+impl McpClientPort for RmcpHttpClient {
+    fn list_tools<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<McpToolDef>, McpClientError>> + Send + 'a>> {
+        Box::pin(list_tools_via(&self.service))
+    }
+
+    fn call_tool<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<RawCallResult, McpClientError>> + Send + 'a>> {
+        Box::pin(call_tool_via(&self.service, name, arguments))
     }
 }
 
@@ -610,6 +706,93 @@ mod tests {
             }
             Ok(text) => panic!("expected an error result (isError: true), got Ok({text})"),
         }
+    }
+
+
+    /// Ticket 48 (mcp-http-transport): a minimal wiremock-backed fake
+    /// Streamable HTTP MCP server. Mirrors
+    /// `tests/fixtures/fake_mcp_server.rs`'s stdio fixture's JSON-RPC
+    /// result shapes for `initialize`/`tools/list` exactly, but replies
+    /// over HTTP instead of stdio -- proving `RmcpHttpClient` speaks the
+    /// same wire protocol `RmcpStdioClient` does, just over a different
+    /// transport. Only handles POST requests: with
+    /// `StreamableHttpClientTransportConfig::allow_stateless` defaulted to
+    /// `true` and no `Mcp-Session-Id` response header set below, the real
+    /// `rmcp` client never opens a GET/SSE stream (gated on a session id
+    /// being present), so a GET handler isn't needed.
+    struct FakeHttpMcpResponder;
+
+    impl wiremock::Respond for FakeHttpMcpResponder {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = request.body_json().unwrap_or(serde_json::Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let Some(id) = body.get("id").cloned() else {
+                // A notification (e.g. `notifications/initialized`) has no
+                // "id" and gets no JSON-RPC reply -- 202 Accepted with no
+                // body is what `post_message`'s reqwest impl treats as
+                // `StreamableHttpPostResponse::Accepted`.
+                return wiremock::ResponseTemplate::new(202);
+            };
+            let result = match method {
+                "initialize" => serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "fake-http-mcp-server", "version": "0.1.0" }
+                }),
+                "tools/list" => serde_json::json!({
+                    "tools": [
+                        {
+                            "name": "echo",
+                            "description": "Echoes back a fixed marker string.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        }
+                    ]
+                }),
+                _ => serde_json::json!({}),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result
+            }))
+        }
+    }
+
+    /// Ticket 48 (mcp-http-transport) unit test: every HTTP request
+    /// `RmcpHttpClient` makes over the course of `initialize` +
+    /// `notifications/initialized` + `tools/list` carries the configured
+    /// static header -- the ONE mock mounted below requires it on every
+    /// match, so if any request in that sequence were missing it, that
+    /// request would 404 (no mock matches), the client would error, and
+    /// `connect`/`list_tools` would return `Err` instead of the tool list
+    /// asserted below.
+    #[tokio::test]
+    async fn http_transport_sends_static_token_header_on_every_request() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer test-token-abc"))
+            .respond_with(FakeHttpMcpResponder)
+            .mount(&mock_server)
+            .await;
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer test-token-abc".to_string());
+
+        let client = RmcpHttpClient::connect(&mock_server.uri(), &headers)
+            .await
+            .expect("expected the HTTP MCP client to connect and complete initialize");
+
+        let tools = client
+            .list_tools()
+            .await
+            .expect("expected list_tools to succeed");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
     }
 
 

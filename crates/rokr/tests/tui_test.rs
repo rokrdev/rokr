@@ -8522,6 +8522,345 @@ async fn mcp_tool_call_renders_permission_prompt_and_returns_result_from_fake_st
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
 
+/// Ticket 48 (mcp-http-transport) stretch-scope: the `tools/call` fixed
+/// response text a fake Streamable HTTP MCP server (below) returns.
+/// Distinct from `FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT` (the stdio
+/// fixture's) so a test can't accidentally pass by matching the wrong
+/// transport's marker.
+const FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT: &str = "fake-http-mcp-server-echo-response-7e1b4d";
+
+/// Ticket 48: a minimal wiremock-backed fake Streamable HTTP MCP server,
+/// duplicated (not shared) from `rokr-mcp`'s own copy of this responder --
+/// the two crates' test doubles can't share code across the crate
+/// boundary, mirroring this file's existing
+/// `FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT` duplicate-literal precedent.
+/// Mirrors `tests/fixtures/fake_mcp_server.rs`'s JSON-RPC result shapes
+/// exactly, replying over HTTP instead of stdio. Only handles POST --
+/// `StreamableHttpClientTransportConfig::allow_stateless` defaults to
+/// `true` and no `Mcp-Session-Id` response header is set below, so the
+/// real `rmcp` client never opens a GET/SSE stream.
+struct FakeHttpMcpResponder;
+
+impl wiremock::Respond for FakeHttpMcpResponder {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let body: serde_json::Value = request.body_json().unwrap_or(serde_json::Value::Null);
+        let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let Some(id) = body.get("id").cloned() else {
+            // A notification (e.g. `notifications/initialized`) gets no
+            // JSON-RPC reply -- 202 Accepted with no body is what
+            // `post_message`'s reqwest impl treats as
+            // `StreamableHttpPostResponse::Accepted`.
+            return wiremock::ResponseTemplate::new(202);
+        };
+        let result = match method {
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "fake-http-mcp-server", "version": "0.1.0" }
+            }),
+            "tools/list" => serde_json::json!({
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": "Echoes back a fixed marker string.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": { "message": { "type": "string" } }
+                        }
+                    }
+                ]
+            }),
+            "tools/call" => serde_json::json!({
+                "content": [
+                    { "type": "text", "text": FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT }
+                ],
+                "isError": false
+            }),
+            _ => serde_json::json!({}),
+        };
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        }))
+    }
+}
+
+/// Writes a `rokr.json` declaring one ENABLED Streamable HTTP MCP server
+/// (ticket 48) into `xdg_config_home/rokr/rokr.json` -- the `http`
+/// transport variant's real config shape (`{"url": "...", "headers":
+/// {...}}"`), analogous to `write_mcp_config`'s stdio block above.
+fn write_http_mcp_config(
+    xdg_config_home: &std::path::Path,
+    server_name: &str,
+    url: &str,
+    bearer_token: &str,
+) {
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+
+    let config = serde_json::json!({
+        "version": 1,
+        "mcp": {
+            server_name: {
+                "transport": {
+                    "http": {
+                        "url": url,
+                        "headers": { "Authorization": format!("Bearer {bearer_token}") }
+                    }
+                },
+                "enabled": true
+            }
+        }
+    });
+
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+}
+
+/// Ticket 48 (mcp-http-transport) acceptance test -- PRD "MCP permissions":
+/// a configured Streamable HTTP MCP server with a static bearer token
+/// completes `initialize` and exposes tools identically to a stdio server
+/// (same `McpTool`/permission-gated path as
+/// `mcp_tool_call_renders_permission_prompt_and_returns_result_from_fake_stdio_server`
+/// above), with the ADDED strictness that the permission prompt text must
+/// also contain the HTTP server's origin -- a data-exfiltration signal a
+/// stdio server's prompt never carries. The fake MCP server's mock only
+/// matches requests carrying the configured bearer header, so a missing
+/// header on ANY request in the initialize/tools-list/tools-call sequence
+/// 404s and the test times out instead of silently passing.
+#[tokio::test]
+async fn http_mcp_server_tool_call_surfaces_origin_in_permission_prompt() {
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let provider_mock_server = MockServer::start().await;
+    let mcp_mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterHttpMcpAcceptForTesting";
+    let bearer_token = "test-static-bearer-token-for-http-mcp";
+    let qualified_tool_name = rokr_mcp::qualified_name("remote", "echo");
+
+    // The fake HTTP MCP server: only responds to a request carrying the
+    // configured static bearer token -- proves the token is sent, not
+    // just configured.
+    Mock::given(method("POST"))
+        .and(header("authorization", format!("Bearer {bearer_token}")))
+        .respond_with(FakeHttpMcpResponder)
+        .mount(&mcp_mock_server)
+        .await;
+
+    // First provider call: the model asks to invoke the HTTP MCP tool.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-http-mcp-accept",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_tool_name,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&provider_mock_server)
+        .await;
+
+    // Second provider call: only matches if the tool result the loop fed
+    // back actually contains the fake HTTP MCP server's real response
+    // text -- proving the HTTP-transport tool call really ran end-to-end.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-http-mcp-accept-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&provider_mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-http-mcp-accept");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-http-mcp-accept");
+    write_http_mcp_config(&xdg_config_home, "remote", &mcp_mock_server.uri(), bearer_token);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", provider_mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call the mcp tool\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the permission prompt to render, showing the qualified MCP
+    // tool name -- every MCP call is gated (`McpTool::preview` always
+    // returns `Some(...)`), before we've granted anything.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_tool_name) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(&qualified_tool_name),
+        "expected pty output to contain the qualified MCP tool name '{qualified_tool_name}' in \
+         a permission prompt, got: {output:?}"
+    );
+    // PRD "MCP permissions": a remote (HTTP) server's origin is a
+    // data-exfiltration signal, so it's surfaced in the permission-prompt
+    // text -- a stdio server's prompt never carries this. The wiremock
+    // server's own URI IS that origin, so this is the strictest possible
+    // check: the exact configured URL, not just some origin-shaped text.
+    let mcp_origin = mcp_mock_server.uri();
+    assert!(
+        output.contains(&mcp_origin),
+        "expected pty output to contain the HTTP MCP server's origin '{mcp_origin}' in the \
+         permission prompt, got: {output:?}"
+    );
+    assert!(
+        !output.contains(FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT),
+        "the HTTP MCP tool must not have run before permission was granted, but its response \
+         text already appears in the output: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the HTTP MCP \
+         tool call, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
 /// Ticket 45 (mcp-config-and-lifecycle) acceptance test: a `rokr.json` with
 /// one enabled stdio server (configured via the real `mcp` config schema,
 /// not ticket 44's `ROKR_MCP_SERVER` env var) produces that server's tools
