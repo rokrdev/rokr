@@ -8,6 +8,7 @@
 //! there is no dependency cycle.
 
 pub mod cli;
+pub mod upgrade;
 pub mod commands;
 pub mod headless;
 pub mod result_schema;

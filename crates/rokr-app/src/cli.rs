@@ -155,6 +155,10 @@ pub enum Command {
         /// Which shell's completion script to generate.
         shell: clap_complete::Shell,
     },
+    /// Check for and apply an update to the `rokr` binary itself, or
+    /// (Homebrew-managed installs) direct the user to `brew upgrade`
+    /// instead (`upgrade`). Ticket 67 (self-update-rokr-upgrade).
+    Upgrade,
     // Ticket 58 (eval-case-runner-and-deterministic-assertions): each case
     // is isolated in a fresh temp fixture dir, a fresh headless session,
     // and an explicit pinned model/permission mode -- no case inherits

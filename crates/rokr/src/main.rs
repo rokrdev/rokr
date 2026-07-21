@@ -46,6 +46,13 @@ async fn main() -> ExitCode {
             println!("{}", completions_script(shell));
             ExitCode::SUCCESS
         }
+        // Ticket 67 (self-update-rokr-upgrade): checks for (and, on a
+        // non-Homebrew install, applies) an update to the running binary,
+        // or -- on a Homebrew-managed install -- declines and directs the
+        // user to `brew upgrade` instead. Same "run and exit, no TUI" shape
+        // as `Completions`/`Auth` above. All the actual logic lives in
+        // `rokr_app::upgrade::run`; this arm is a thin adapter.
+        Some(Command::Upgrade) => rokr_app::upgrade::run().await,
         // Ticket 58 (eval-case-runner-and-deterministic-assertions): runs
         // every eval case file in `cases_dir` and exits -- the same
         // "run and exit, no TUI" shape as `auth login`/`completions` above.

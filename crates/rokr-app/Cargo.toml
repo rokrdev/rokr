@@ -24,6 +24,12 @@ tokio = { workspace = true }
 # Consequences).
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Ticket 67 (self-update-rokr-upgrade): backs the `rokr upgrade` subcommand's
+# non-Homebrew update-check/install path (see `src/upgrade.rs`). Default
+# features (`github_releases`) are sufficient -- no `tokio`/`blocking`
+# feature needed since `AxoUpdater::run()` is a plain `async fn` called from
+# this crate's own tokio runtime.
+axoupdater = "0.10.0"
 
 [dev-dependencies]
 wiremock = { workspace = true }
