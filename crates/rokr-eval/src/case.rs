@@ -83,7 +83,8 @@ impl CasePermissionMode {
 
 /// One deterministic assertion checked against the fixture dir after the
 /// headless turn completes. This ticket's slice: `file_exists`,
-/// `file_contains`, `git_diff`, `command_exit`.
+/// `file_contains`, `git_diff`, `command_exit`. Ticket 59 adds a fifth:
+/// `judge_rubric` (scored, not pass/fail -- see `judge` module).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Assertion {
@@ -102,6 +103,13 @@ pub enum Assertion {
         #[serde(default)]
         args: Vec<String>,
         expected_code: i32,
+    },
+    /// Ticket 59 (eval-llm-judge-scoring, thin glue outside that ticket's
+    /// files-touched -- see ticket frontmatter amendment): a rubric scored
+    /// by an LLM judge against the case's headless-run result text. Never a
+    /// pass/fail gate on its own -- see `judge`'s doc comment.
+    JudgeRubric {
+        rubric: String,
     },
 }
 

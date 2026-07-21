@@ -10,6 +10,7 @@
 
 pub mod assertions;
 pub mod case;
+pub mod judge;
 
 use std::path::PathBuf;
 
@@ -25,6 +26,11 @@ pub struct CaseOutcome {
     pub fixture_dir: PathBuf,
     pub passed: bool,
     pub assertion_outcomes: Vec<assertions::AssertionOutcome>,
+    /// Ticket 59: LLM-judge rubric scores for this case, kept entirely
+    /// separate from `assertion_outcomes`/`passed` -- see `judge`'s doc
+    /// comment for why a judge score is a tracked metric, never a pass/fail
+    /// gate.
+    pub judge_scores: Vec<judge::JudgeScore>,
     pub run_error: Option<String>,
 }
 
@@ -104,38 +110,69 @@ pub async fn run_eval(
         // own. A bypass-requesting case with no operator flag never reaches
         // `run_result_object` at all -- it fails immediately with a clear
         // `run_error` instead.
-        let run_error = if case_requests_bypass && !dangerously_skip_permissions {
-            Some(
-                "case requests bypass but --dangerously-skip-permissions was not passed"
-                    .to_string(),
-            )
-        } else {
-            // `dangerously_skip_permissions` is only ever forwarded as
-            // `true` for a case that is actually `Bypass` mode -- a
-            // `Deny`/`AcceptEdits` case never needs it, regardless of
-            // whether the operator passed the run-level flag.
-            let run_result = rokr_app::headless::run_result_object(
-                agent,
-                permission_mode,
-                case_requests_bypass,
-                loaded_case.case.prompt.clone(),
-                Some(fixture_dir.path().to_path_buf()),
-            )
-            .await;
+        let (run_error, headless_result_text): (Option<String>, Option<String>) =
+            if case_requests_bypass && !dangerously_skip_permissions {
+                (
+                    Some(
+                        "case requests bypass but --dangerously-skip-permissions was not passed"
+                            .to_string(),
+                    ),
+                    None,
+                )
+            } else {
+                // `dangerously_skip_permissions` is only ever forwarded as
+                // `true` for a case that is actually `Bypass` mode -- a
+                // `Deny`/`AcceptEdits` case never needs it, regardless of
+                // whether the operator passed the run-level flag.
+                let run_result = rokr_app::headless::run_result_object(
+                    agent,
+                    permission_mode,
+                    case_requests_bypass,
+                    loaded_case.case.prompt.clone(),
+                    Some(fixture_dir.path().to_path_buf()),
+                )
+                .await;
 
-            match &run_result {
-                Ok(_) => None,
-                Err(rokr_app::headless::BootstrapError::CliMisuse(err)) => Some(err.clone()),
-                Err(rokr_app::headless::BootstrapError::Other(err)) => Some(err.clone()),
+                match run_result {
+                    // Ticket 59: the final result text is now captured
+                    // (rather than discarded, as before this ticket) as the
+                    // "transcript" a judge-rubric assertion scores against
+                    // -- see `judge`'s doc comment for why this is the
+                    // final headless result text specifically, not the
+                    // full per-turn message list.
+                    Ok(outcome) => (None, Some(outcome.result_object.result)),
+                    Err(rokr_app::headless::BootstrapError::CliMisuse(err)) => (Some(err), None),
+                    Err(rokr_app::headless::BootstrapError::Other(err)) => (Some(err), None),
+                }
+            };
+
+        // Ticket 59: a judge-rubric assertion is routed to
+        // `judge::score_rubric` instead of `assertions::check_assertion` --
+        // it contributes a `judge::JudgeScore` to `judge_scores`, entirely
+        // separate from `assertion_outcomes`/`passed`, which stay
+        // deterministic-assertions-only exactly as before this ticket.
+        let mut assertion_outcomes: Vec<assertions::AssertionOutcome> = Vec::new();
+        let mut judge_scores: Vec<judge::JudgeScore> = Vec::new();
+        for assertion in &loaded_case.case.assertions {
+            match assertion {
+                case::Assertion::JudgeRubric { rubric } => {
+                    let transcript = headless_result_text.clone().unwrap_or_default();
+                    // A judge-call failure (missing env var, transport
+                    // error, unparseable verdict) is dropped rather than
+                    // surfaced as a run_error -- a judge score is a tracked
+                    // metric, not a gate, so its own failure must not fail
+                    // the case either (mirrors `session_handle`'s "degrade
+                    // gracefully" precedent in
+                    // `rokr_app::headless::run_result_object`).
+                    if let Ok(score) = judge::score_rubric(&transcript, rubric).await {
+                        judge_scores.push(score);
+                    }
+                }
+                other => {
+                    assertion_outcomes.push(assertions::check_assertion(fixture_dir.path(), other))
+                }
             }
-        };
-
-        let assertion_outcomes: Vec<assertions::AssertionOutcome> = loaded_case
-            .case
-            .assertions
-            .iter()
-            .map(|assertion| assertions::check_assertion(fixture_dir.path(), assertion))
-            .collect();
+        }
 
         let passed = run_error.is_none() && assertion_outcomes.iter().all(|o| o.passed);
 
@@ -144,6 +181,7 @@ pub async fn run_eval(
             fixture_dir: fixture_dir.path().to_path_buf(),
             passed,
             assertion_outcomes,
+            judge_scores,
             run_error,
         });
         // `fixture_dir` (a `tempfile::TempDir`) drops here, at the end of
@@ -156,4 +194,21 @@ pub async fn run_eval(
     }
 
     Ok(outcomes)
+}
+
+/// Ticket 59: the mean of every judge score recorded across `outcomes`
+/// (flattened over each case's own `judge_scores`) -- today's stand-in for
+/// the aggregate report's `mean-judge-score` field ahead of ticket 60
+/// (`eval-report-json-and-ci-gate`), which formalizes a full `report.rs`
+/// aggregate on top of this. Returns `None` when no case in `outcomes`
+/// recorded any judge score at all (avoids a divide-by-zero `NaN`).
+pub fn mean_judge_score(outcomes: &[CaseOutcome]) -> Option<f64> {
+    let scores: Vec<f64> = outcomes
+        .iter()
+        .flat_map(|outcome| outcome.judge_scores.iter().map(|score| score.score))
+        .collect();
+    if scores.is_empty() {
+        return None;
+    }
+    Some(scores.iter().sum::<f64>() / scores.len() as f64)
 }

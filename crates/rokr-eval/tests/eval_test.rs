@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Serializes every test in this file's process env var reads/writes (see
@@ -304,6 +304,115 @@ async fn eval_run_bypass_case_with_operator_flag_is_honored() {
         outcome.passed,
         "expected the bypass-requesting case to be honored (pass) when the operator flag is \
          passed, got: {outcome:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&cases_dir);
+}
+
+/// Ticket 59 (eval-llm-judge-scoring) acceptance test: a case with one
+/// passing deterministic assertion (`file_exists`) and one LLM-judge
+/// rubric assertion (scripted/mocked verdict) reports the case as PASSED
+/// on the deterministic assertion alone, and the judge's score surfaces
+/// separately via `rokr_eval::mean_judge_score` -- proving a judge score
+/// never folds into `CaseOutcome::passed`/`assertion_outcomes`.
+#[tokio::test]
+async fn case_with_scripted_judge_response_contributes_score_without_affecting_deterministic_pass_fail(
+) {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    const AGENT_MARKER: &str = "EvalJudgeScoringAgentReplyMarker5521";
+    const PROMPT: &str = "say hi for judge scoring EvalJudgeScoringPromptMarker5521";
+    const RUBRIC: &str = "Did the agent politely acknowledge the task? EvalJudgeScoringRubricMarker5521";
+
+    let mock = MockServer::start().await;
+    // The main headless turn's response -- matched by the case's own
+    // prompt text, mutually exclusive with the judge call's rubric-bearing
+    // body below so the two mocks never ambiguously both match the same
+    // request.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(PROMPT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": AGENT_MARKER}}]
+        })))
+        .mount(&mock)
+        .await;
+    // The judge's own scoring call -- matched by the rubric text, which
+    // `judge::score_rubric` embeds verbatim in its request body.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(RUBRIC))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "{\"score\": 0.6}"}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("judge-home");
+    let xdg_config_home = unique_temp_dir("judge-xdg-config-home");
+    // Safety: serialized against every other test in this file via
+    // `ENV_LOCK` (see this file's module doc comment).
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+        std::env::set_var("ROKR_OPENAI_BASE_URL", mock.uri());
+        std::env::set_var("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+        std::env::set_var("ROKR_OPENAI_API_KEY", "test-key");
+    }
+
+    let cases_dir = unique_temp_dir("judge-cases");
+    write_case(
+        &cases_dir,
+        "judge-and-deterministic.json",
+        serde_json::json!({
+            "prompt": PROMPT,
+            "agent": "plan",
+            "permission_mode": "deny",
+            "setup_files": [{"path": "expected.txt", "contents": "present"}],
+            "assertions": [
+                {"type": "file_exists", "path": "expected.txt"},
+                {"type": "judge_rubric", "rubric": RUBRIC}
+            ]
+        }),
+    );
+
+    let outcomes = rokr_eval::run_eval(&cases_dir, false)
+        .await
+        .expect("eval run should succeed");
+    assert_eq!(outcomes.len(), 1, "expected exactly one case outcome, got: {outcomes:?}");
+    let outcome = &outcomes[0];
+
+    assert!(
+        outcome.passed,
+        "expected the case to pass on its deterministic file_exists assertion alone, got: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.assertion_outcomes.len(),
+        1,
+        "expected only the deterministic assertion in assertion_outcomes (judge-rubric routed \
+         separately), got: {:?}",
+        outcome.assertion_outcomes
+    );
+
+    assert_eq!(
+        outcome.judge_scores.len(),
+        1,
+        "expected exactly one judge score recorded for the case, got: {:?}",
+        outcome.judge_scores
+    );
+    assert!(
+        (outcome.judge_scores[0].score - 0.6).abs() < f64::EPSILON,
+        "expected the scripted judge score to be recorded, got: {:?}",
+        outcome.judge_scores[0]
+    );
+
+    let mean = rokr_eval::mean_judge_score(&outcomes)
+        .expect("expected a mean judge score when at least one judge score was recorded");
+    assert!(
+        (mean - 0.6).abs() < f64::EPSILON,
+        "expected mean_judge_score to equal the single recorded score 0.6, got: {mean}"
     );
 
     let _ = std::fs::remove_dir_all(&home);

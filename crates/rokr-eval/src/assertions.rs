@@ -153,6 +153,16 @@ pub fn check_assertion(fixture_dir: &Path, assertion: &crate::case::Assertion) -
             args,
             expected_code,
         } => check_command_exit(fixture_dir, command, args, *expected_code),
+        // Ticket 59 (eval-llm-judge-scoring, thin glue outside this
+        // ticket's files-touched -- see ticket frontmatter amendment): a
+        // judge-rubric assertion is never dispatched here -- `lib.rs`'s
+        // per-case loop routes it to `judge::score_rubric` instead, before
+        // this function is ever called. Unreachable by construction, not by
+        // omission.
+        crate::case::Assertion::JudgeRubric { .. } => unreachable!(
+            "judge-rubric assertions are scored via judge::score_rubric, never dispatched \
+             through check_assertion"
+        ),
     }
 }
 
