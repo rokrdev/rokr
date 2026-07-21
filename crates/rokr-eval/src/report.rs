@@ -133,6 +133,7 @@ mod tests {
             cost_usd: 0.0,
             num_turns: 1,
             usage: UsageObject::default(),
+            fixture_note: None,
         }
     }
 

@@ -206,6 +206,9 @@ async fn run_subagent<P: rokr_core::Provider>(
     // fire for the main loop only -- a subagent's own tool calls don't
     // (yet) go through either hook check, hence the hardcoded `None`s
     // rather than threading hook callbacks down from `SubagentTool`.
+    // F-005: subagents keep the pre-existing unbounded behavior (`None`) --
+    // this batch's cap is scoped to headless/eval call paths (via
+    // `SessionRunner`) and doesn't touch subagent orchestration.
     let (reply, _usage) = rokr_core::run_tool_loop(
         provider,
         subagent_prompt,
@@ -213,6 +216,7 @@ async fn run_subagent<P: rokr_core::Provider>(
         &mut transcript,
         tools,
         tagged_request_permission,
+        None,
         None,
         None,
     )

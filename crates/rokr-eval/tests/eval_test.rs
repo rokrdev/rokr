@@ -94,6 +94,7 @@ async fn eval_run_reports_passing_and_failing_file_exists_cases_from_isolated_fi
         "passing-file-exists.json",
         serde_json::json!({
             "prompt": "say hi",
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "deny",
             "setup_files": [{"path": "expected.txt", "contents": "present"}],
@@ -105,6 +106,7 @@ async fn eval_run_reports_passing_and_failing_file_exists_cases_from_isolated_fi
         "failing-file-exists.json",
         serde_json::json!({
             "prompt": "say hi",
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "deny",
             "setup_files": [],
@@ -191,6 +193,7 @@ async fn eval_run_bypass_case_without_operator_flag_fails_and_never_runs_headles
         "bypass-case.json",
         serde_json::json!({
             "prompt": "say hi",
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "bypass",
             "setup_files": [],
@@ -279,6 +282,7 @@ async fn eval_run_bypass_case_with_operator_flag_is_honored() {
         "bypass-case.json",
         serde_json::json!({
             "prompt": "say hi",
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "bypass",
             "setup_files": [],
@@ -368,6 +372,7 @@ async fn case_with_scripted_judge_response_contributes_score_without_affecting_d
         "judge-and-deterministic.json",
         serde_json::json!({
             "prompt": PROMPT,
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "deny",
             "setup_files": [{"path": "expected.txt", "contents": "present"}],
@@ -465,6 +470,7 @@ async fn report_json_exits_nonzero_when_pass_rate_below_configured_threshold_and
         "passing-file-exists.json",
         serde_json::json!({
             "prompt": "say hi",
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "deny",
             "setup_files": [{"path": "expected.txt", "contents": "present"}],
@@ -476,6 +482,7 @@ async fn report_json_exits_nonzero_when_pass_rate_below_configured_threshold_and
         "failing-file-exists.json",
         serde_json::json!({
             "prompt": "say hi",
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "deny",
             "setup_files": [],
@@ -589,6 +596,7 @@ async fn report_json_rolls_up_cost_tokens_turns_from_each_cases_headless_result(
         "case-a.json",
         serde_json::json!({
             "prompt": PROMPT_A,
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "deny",
             "setup_files": [],
@@ -600,6 +608,7 @@ async fn report_json_rolls_up_cost_tokens_turns_from_each_cases_headless_result(
         "case-b.json",
         serde_json::json!({
             "prompt": PROMPT_B,
+            "model": "gpt-4o-mini",
             "agent": "plan",
             "permission_mode": "deny",
             "setup_files": [],
@@ -696,6 +705,294 @@ async fn report_json_rolls_up_cost_tokens_turns_from_each_cases_headless_result(
          (including cache tokens)"
     );
 
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&cases_dir);
+}
+
+/// F-002 (pre-ship review): a `setup_files` entry whose `path` tries to
+/// escape the fixture dir (here, a leading `../`) must fail THAT case with
+/// a clear `run_error` -- and, above all, must never actually write the
+/// file outside the fixture dir it was supposed to be confined to. No mock
+/// provider/env vars are configured here at all: path validation happens
+/// before any headless turn is attempted, so an invalid case never reaches
+/// that code at all.
+#[tokio::test]
+async fn eval_run_rejects_setup_file_path_that_escapes_fixture_dir() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let cases_dir = unique_temp_dir("traversal-cases");
+
+    // Every `rokr-eval-` fixture dir is minted directly under the system
+    // temp dir (`tempfile::Builder::new().prefix("rokr-eval-").tempdir()`
+    // in `lib.rs`), so `"../<name>"` from inside one would land directly in
+    // the system temp dir if the traversal weren't blocked.
+    let escape_target =
+        std::env::temp_dir().join("rokr-eval-traversal-escape-marker-8231.txt");
+    let _ = std::fs::remove_file(&escape_target); // in case a prior failed run left it
+
+    write_case(
+        &cases_dir,
+        "traversal-case.json",
+        serde_json::json!({
+            "prompt": "say hi",
+            "model": "gpt-4o-mini",
+            "agent": "plan",
+            "permission_mode": "deny",
+            "setup_files": [
+                {"path": "../rokr-eval-traversal-escape-marker-8231.txt", "contents": "should never land here"}
+            ],
+            "assertions": []
+        }),
+    );
+
+    let outcomes = rokr_eval::run_eval(&cases_dir, false)
+        .await
+        .expect("eval run should succeed at the whole-run level -- only this ONE case fails");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one case outcome, got: {outcomes:?}"
+    );
+    let outcome = &outcomes[0];
+
+    assert!(
+        !outcome.passed,
+        "expected the case with an escaping setup_file path to fail, got: {outcome:?}"
+    );
+    let run_error = outcome
+        .run_error
+        .as_ref()
+        .expect("expected a run_error reporting the path-traversal problem");
+    assert!(
+        run_error.to_lowercase().contains("..") || run_error.to_lowercase().contains("relative"),
+        "expected run_error to clearly explain the rejected path, got: {run_error:?}"
+    );
+
+    assert!(
+        !escape_target.exists(),
+        "expected the setup file to NEVER be written outside the fixture dir, but found it at {}",
+        escape_target.display()
+    );
+
+    let _ = std::fs::remove_file(&escape_target);
+    let _ = std::fs::remove_dir_all(&cases_dir);
+}
+
+/// F-008 (pre-ship review), items (2) and (3): an eval case run must not
+/// leak into ambient operator state on either axis -- the operator's real
+/// configured `UserPromptSubmit` hook must never fire during an eval case
+/// (proven by the hook's own marker-file side effect never appearing), and
+/// the case's session log must never land under the real/ambient data dir
+/// (proven by no `sessions/` directory appearing under it) -- both checked
+/// against the SAME single case run.
+#[tokio::test]
+async fn eval_run_case_never_fires_operators_hooks_or_writes_into_ambient_data_dir() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    const MARKER: &str = "EvalAmbientIsolationReplyMarker2287";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": MARKER}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("ambient-home");
+    let xdg_config_home = unique_temp_dir("ambient-xdg-config-home");
+    // Safety: serialized against every other test in this file via
+    // `ENV_LOCK` (see this file's module doc comment).
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+        std::env::set_var("ROKR_OPENAI_BASE_URL", mock.uri());
+        std::env::set_var("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+        std::env::set_var("ROKR_OPENAI_API_KEY", "test-key");
+    }
+
+    // A real `UserPromptSubmit` hook, configured exactly the way the
+    // TUI/headless paths pick one up
+    // (`rokr_config::load_or_init_default()` reads
+    // `$XDG_CONFIG_HOME/rokr/rokr.json`) -- its command touches a marker
+    // file. If it ever fired during an eval case, the marker would exist
+    // after the run.
+    let hook_marker = xdg_config_home.join("hook-fired-marker-4471.txt");
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create fake config dir");
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "UserPromptSubmit": [{"command": format!("touch {}", hook_marker.display())}]
+            }
+        })
+        .to_string(),
+    )
+    .expect("failed to write fake hooks config");
+
+    let cases_dir = unique_temp_dir("ambient-cases");
+    write_case(
+        &cases_dir,
+        "ambient-case.json",
+        serde_json::json!({
+            "prompt": "say hi",
+            "model": "gpt-4o-mini",
+            "agent": "plan",
+            "permission_mode": "deny",
+            "setup_files": [],
+            "assertions": []
+        }),
+    );
+
+    let outcomes = rokr_eval::run_eval(&cases_dir, false)
+        .await
+        .expect("eval run should succeed");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "expected exactly one case outcome, got: {outcomes:?}"
+    );
+    assert!(
+        outcomes[0].run_error.is_none(),
+        "expected no run_error, got: {:?}",
+        outcomes[0].run_error
+    );
+
+    assert!(
+        !hook_marker.exists(),
+        "expected the operator's configured UserPromptSubmit hook to NEVER fire during an eval \
+         case run, but its marker file was created at {}",
+        hook_marker.display()
+    );
+
+    let ambient_sessions_dir = home.join(".local/share/rokr/sessions");
+    assert!(
+        !ambient_sessions_dir.exists(),
+        "expected no session directory under the ambient/real data dir ({}) after an eval case \
+         run -- finding one means the eval run leaked a session into ambient state",
+        ambient_sessions_dir.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&cases_dir);
+}
+
+/// F-015 (pre-ship review): a FAILING case's fixture dir must survive the
+/// run (preserved on disk for debugging), with a `fixture_note` pointing at
+/// it; a PASSING case's fixture dir must still be cleaned up exactly as
+/// before this fix.
+#[tokio::test]
+async fn eval_run_preserves_failing_cases_fixture_dir_and_cleans_up_passing_cases() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    const MARKER: &str = "EvalFixturePreservationReplyMarker6612";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": MARKER}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("fixture-preserve-home");
+    let xdg_config_home = unique_temp_dir("fixture-preserve-xdg-config-home");
+    // Safety: serialized against every other test in this file via
+    // `ENV_LOCK` (see this file's module doc comment).
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+        std::env::set_var("ROKR_OPENAI_BASE_URL", mock.uri());
+        std::env::set_var("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+        std::env::set_var("ROKR_OPENAI_API_KEY", "test-key");
+    }
+
+    let cases_dir = unique_temp_dir("fixture-preserve-cases");
+    write_case(
+        &cases_dir,
+        "passing-file-exists.json",
+        serde_json::json!({
+            "prompt": "say hi",
+            "model": "gpt-4o-mini",
+            "agent": "plan",
+            "permission_mode": "deny",
+            "setup_files": [{"path": "expected.txt", "contents": "present"}],
+            "assertions": [{"type": "file_exists", "path": "expected.txt"}]
+        }),
+    );
+    write_case(
+        &cases_dir,
+        "failing-file-exists.json",
+        serde_json::json!({
+            "prompt": "say hi",
+            "model": "gpt-4o-mini",
+            "agent": "plan",
+            "permission_mode": "deny",
+            "setup_files": [],
+            "assertions": [{"type": "file_exists", "path": "expected.txt"}]
+        }),
+    );
+
+    let outcomes = rokr_eval::run_eval(&cases_dir, false)
+        .await
+        .expect("eval run should succeed");
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "expected exactly two case outcomes, got: {outcomes:?}"
+    );
+
+    let passing = outcomes
+        .iter()
+        .find(|outcome| outcome.name == "passing-file-exists")
+        .expect("expected an outcome named passing-file-exists");
+    let failing = outcomes
+        .iter()
+        .find(|outcome| outcome.name == "failing-file-exists")
+        .expect("expected an outcome named failing-file-exists");
+
+    assert!(
+        passing.passed,
+        "expected the passing case to report pass, got: {passing:?}"
+    );
+    assert!(
+        !failing.passed,
+        "expected the failing case to report fail, got: {failing:?}"
+    );
+
+    assert!(
+        !passing.fixture_dir.exists(),
+        "expected the PASSING case's fixture dir to be cleaned up after the run, but it still \
+         exists at {}",
+        passing.fixture_dir.display()
+    );
+    assert!(
+        passing.fixture_note.is_none(),
+        "expected no fixture_note for a passing case, got: {:?}",
+        passing.fixture_note
+    );
+
+    assert!(
+        failing.fixture_dir.exists(),
+        "expected the FAILING case's fixture dir to be PRESERVED after the run for debugging, \
+         but it was deleted (path: {})",
+        failing.fixture_dir.display()
+    );
+    let note = failing.fixture_note.as_ref().expect(
+        "expected a fixture_note pointing at the preserved fixture dir for the failing case",
+    );
+    assert!(
+        note.contains(&failing.fixture_dir.display().to_string()),
+        "expected the fixture_note to mention the preserved fixture path, got: {note:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&failing.fixture_dir);
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&cases_dir);

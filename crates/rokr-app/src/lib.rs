@@ -17,7 +17,10 @@ pub mod subagent;
 
 pub use cli::{AgentTier, AuthAction, Cli, Command, OutputFormat, PermissionMode, ResumeMode};
 pub use commands::{CommandRegistry, CustomCommand};
-pub use headless::{build_permission_requester, select_mode, HeadlessPermissionRequester, Mode};
+pub use headless::{
+    build_permission_requester, model_pricing_to_pricing_entry, select_mode,
+    HeadlessPermissionRequester, Mode,
+};
 pub use result_schema::{ResultObject, Subtype, UsageObject};
 pub use runner::{
     accumulate_user_turn, append_compaction_record, capture_checkpoint_if_granted_diff,

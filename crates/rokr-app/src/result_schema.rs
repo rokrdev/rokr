@@ -14,14 +14,15 @@ use serde::Serialize;
 /// Schema v1's outcome discriminant. `Success` is a normal completion.
 /// `ErrorPermission` is set when a gated tool call was denied during this
 /// run (see `crate::headless::HeadlessPermissionRequester`). `ErrorMaxTurns`
-/// is reserved for a future turn-count cap -- `rokr_core::run_tool_loop` has
-/// no such cap today (out of this ticket's scope to add one), so this
-/// variant is currently unreachable in practice but kept in the schema
-/// because the ticket's `## Context` documents exactly these three values;
-/// any `run_submission` error that isn't the tracked permission-denial case
-/// maps here today as the closest fit among the three documented subtypes
-/// (see `crate::headless::run`'s doc comment and this ticket's report for
-/// the reasoning).
+/// (F-005) is set when `rokr_core::run_tool_loop` exhausted its
+/// `max_iterations` cap (`crate::headless::HEADLESS_MAX_ITERATIONS`) against
+/// a provider that never stopped emitting tool calls; any OTHER
+/// `run_submission` failure that isn't the tracked permission-denial case
+/// (e.g. a genuine provider error) also maps here today, as the closest fit
+/// among the three subtypes the ticket's `## Context` documents -- the
+/// schema has no fourth "generic error" variant (see
+/// `crate::headless::run`'s doc comment and this ticket's report for the
+/// reasoning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Subtype {
@@ -68,10 +69,12 @@ pub struct ResultObject {
     pub result: String,
     pub is_error: bool,
     pub usage: UsageObject,
-    /// Provisional: always `0.0` until ticket 57's pricing math lands (the
-    /// field is present now, per the ticket's `## Context`, so downstream
-    /// tooling can rely on the key's presence today and only its value
-    /// changes when ticket 57 lands -- not a schema change).
+    /// Estimated USD cost of this run, computed by `rokr_core::pricing::calculate_cost`
+    /// against the run's own model's pricing entry (see
+    /// `crate::headless::model_pricing_to_pricing_entry` and
+    /// `Config::model_pricing`) applied to `usage` above. `$0.00` for an
+    /// unpriced/unknown model, per `calculate_cost`'s own fallback -- not a
+    /// placeholder.
     pub cost_usd: f64,
     pub num_turns: u32,
     pub duration_ms: u64,

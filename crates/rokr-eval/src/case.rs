@@ -26,6 +26,23 @@ pub struct Case {
     pub setup_files: Vec<SetupFile>,
     pub agent: CaseAgentTier,
     pub permission_mode: CasePermissionMode,
+    /// F-008 (pre-ship review): the model this case's headless turn is
+    /// pinned to, REQUIRED (no default) so a case can never silently
+    /// inherit whatever `ROKR_OPENAI_MODEL`/`ROKR_ANTHROPIC_MODEL` the
+    /// operator's shell happens to have exported -- a case file omitting
+    /// `model` fails to LOAD (a clear `serde_json` "missing field `model`"
+    /// error surfaced by `load_cases`), never silently falls through to
+    /// ambient env state at run time. Threaded into
+    /// `rokr_app::headless::HeadlessRunOverride::model` by `lib.rs`'s
+    /// per-case loop.
+    pub model: String,
+    /// The backend this case's model belongs to (`"openai"`/`"anthropic"`,
+    /// matching `rokr_provider::AnyProvider::from_name`'s own spelling).
+    /// Optional: absent means "whichever backend the operator's ambient
+    /// `ROKR_PROVIDER` selects", with `model` still pinned to this case's
+    /// value on that backend.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub assertions: Vec<Assertion>,
 }
 
@@ -150,4 +167,36 @@ pub fn load_cases(cases_dir: &Path) -> Result<Vec<LoadedCase>, String> {
             Ok(LoadedCase { name, case })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-008 (pre-ship review): a case file missing the required `model`
+    /// field must fail to LOAD, with an error that names the missing field
+    /// -- not fail later at run time with some less-specific error.
+    #[test]
+    fn case_file_missing_model_field_fails_to_load_with_clear_error() {
+        let dir = tempfile::tempdir().expect("failed to create temp cases dir");
+        std::fs::write(
+            dir.path().join("missing-model.json"),
+            serde_json::json!({
+                "prompt": "say hi",
+                "agent": "plan",
+                "permission_mode": "deny",
+                "assertions": []
+            })
+            .to_string(),
+        )
+        .expect("failed to write case file");
+
+        let err = load_cases(dir.path()).expect_err(
+            "expected load_cases to fail for a case file missing the required model field",
+        );
+        assert!(
+            err.contains("model"),
+            "expected the load error to name the missing `model` field, got: {err:?}"
+        );
+    }
 }

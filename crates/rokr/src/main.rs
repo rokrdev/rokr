@@ -7,8 +7,8 @@ use clap::Parser;
 use rokr_app::cli::{completions_script, AuthAction, Cli, Command, ReportFormat};
 use rokr_app::{
     append_compaction_record, default_data_dir, log_observational_hook_outcome,
-    matching_hook_entries, now_timestamp, run_hook_entry, select_mode, AgentTier, Mode, ResumeMode,
-    SessionRunner, SharedProvider,
+    matching_hook_entries, model_pricing_to_pricing_entry, now_timestamp, run_hook_entry,
+    select_mode, AgentTier, Mode, ResumeMode, SessionRunner, SharedProvider,
 };
 use rokr_core::ExecutableTool;
 
@@ -103,6 +103,14 @@ async fn main() -> ExitCode {
                                     );
                                 }
                             }
+                            // F-015: a failing case's fixture dir is
+                            // preserved on disk (see
+                            // `rokr_eval::CaseOutcome::fixture_note`'s doc
+                            // comment) -- surfaced here so the report
+                            // itself tells the reader where to look.
+                            if let Some(note) = &outcome.fixture_note {
+                                println!("  {note}");
+                            }
                         }
                     }
                     if any_failed {
@@ -176,12 +184,17 @@ async fn main() -> ExitCode {
             // user-then-project order, alongside the active agent tier's
             // prompt. Not a tool, not permission-gated — this is how the
             // system prompt is built, not a model-invoked action.
-            if let Some(cwd) = cwd.as_deref() {
-                for segment in rokr_config::load_memory(&config_dir, cwd) {
-                    system_prompt.push_str("\n\n");
-                    system_prompt.push_str(&format!("# {}\n", segment.label));
-                    system_prompt.push_str(&segment.content);
-                }
+            //
+            // F-011 (pre-ship review): called unconditionally, not gated
+            // behind `cwd.is_some()` -- a failed `current_dir()` above only
+            // means project-scope memory can't be found; user-scope memory
+            // (from `config_dir`) has nothing to do with cwd and must still
+            // load. `load_memory` itself skips the cwd-dependent
+            // project-scope segment when `cwd` is `None`.
+            for segment in rokr_config::load_memory(&config_dir, cwd.as_deref()) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&format!("# {}\n", segment.label));
+                system_prompt.push_str(&segment.content);
             }
 
             // Ticket 50 (hooks-remaining-events-and-config): loaded once
@@ -544,6 +557,16 @@ async fn main() -> ExitCode {
                 command_registry
                     .merge_overriding(rokr_app::CommandRegistry::discover_project_scope(cwd));
             }
+            // F-007 (PRD story 10, pre-ship review): `submit`'s closure
+            // (built below) needs its own clone of `command_registry` so it
+            // can resolve `@skill:<name>` mentions in a PLAIN prompt too
+            // (one the user typed directly, no leading `/`, so it never
+            // goes through `CommandRegistry::expand`'s own skill
+            // resolution) -- cloned here, before the original gets moved
+            // wholesale into the `resolve_custom_command` closure further
+            // below, same reasoning as the other `command_*`/`memory_*`
+            // clones around it.
+            let submit_command_registry = command_registry.clone();
             // Ticket 62 (memory-slash-command-opens-editor): `/memory`'s
             // path-resolver closure (built below, after `submit`/`command`)
             // needs its own clones of `cwd` and `config_dir` -- cloned here,
@@ -711,6 +734,7 @@ async fn main() -> ExitCode {
                 system_prompt,
                 repo_map,
                 last_known_usage,
+                last_turn_usage: Arc::new(std::sync::Mutex::new(None)),
                 config_dir,
                 session_handle,
                 turn_index,
@@ -723,6 +747,10 @@ async fn main() -> ExitCode {
                 agent,
                 context_window_size,
                 auto_compact_threshold,
+                // F-005: unbounded for the TUI -- a human at the keyboard
+                // can always interrupt, unlike headless/eval's unattended
+                // runs (see `crate::headless::HEADLESS_MAX_ITERATIONS`).
+                max_iterations: None,
             };
 
             // Ticket 52 (clap-and-sessionrunner-extraction): the submit-and-run
@@ -731,7 +759,18 @@ async fn main() -> ExitCode {
             // adapter -- `rokr_tui::run` hands it each Enter-press's prompt text
             // and a fresh `PermissionHandle`, which it forwards straight into the
             // runner (identical behavior; a pure move).
+            // F-007 (PRD story 10, pre-ship review): `@skill:<name>`
+            // mentions are resolved here, unconditionally, for every prompt
+            // that reaches `run_submission` -- both a plain user-typed
+            // prompt (`InputRoute::Submit` in rokr-tui, which never goes
+            // near `CommandRegistry::expand`) and an already-expanded
+            // custom-command template (which DID already go through
+            // `expand`'s own skill resolution -- re-running it here is a
+            // harmless no-op, since no `@skill:` markers survive a
+            // successful first pass). See `CommandRegistry::resolve_skills`'s
+            // doc comment.
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
+                let input = submit_command_registry.resolve_skills(&input);
                 runner.run_submission(input, permission)
             };
 
@@ -965,7 +1004,7 @@ async fn main() -> ExitCode {
                                 handle.session_id().to_string()
                             }) {
                                 Some(session_id) => {
-                                    let records = read_session_records(&data_dir, &session_id);
+                                    let records = store.read_records(&session_id);
                                     let (usage, model) = fold_session_usage_and_model(&records);
                                     let pricing_entry = model_pricing
                                         .get(&model)
@@ -985,7 +1024,7 @@ async fn main() -> ExitCode {
                         // model before summing dollar totals (see
                         // `format_cost_all_summary`'s doc comment for why).
                         "/cost --all" => {
-                            format_cost_all_summary(&data_dir, &store, &model_pricing).await
+                            format_cost_all_summary(&store, &model_pricing).await
                         }
                         _ => format!("unknown command: {input}"),
                     }
@@ -1018,14 +1057,34 @@ async fn main() -> ExitCode {
             };
 
             // Ticket 63 (custom-command-discovery-and-registry): a plain
-            // sync lookup+expand into the registry discovered above --
-            // rokr-tui's `event_loop` only calls this AFTER the `command`
-            // closure's own dispatch (built above, unmodified) has already
-            // run to completion and fallen through to its "unknown command:
-            // ..." arm, so a discovered user command can never shadow a
-            // built-in.
-            let resolve_custom_command =
-                move |input: &str| command_registry.expand(input);
+            // sync lookup+expand into the registry discovered above.
+            //
+            // F-004 (pre-ship review): filters by command NAME, not just
+            // call order, before ever consulting the registry -- see
+            // `is_builtin_command`'s doc comment for why call order alone
+            // (the original ticket 63/64 design, relying on `command`'s own
+            // dispatch falling through to its "unknown command: ..." arm)
+            // isn't sufficient: `command`'s match arms key off the FULL
+            // input string, so a builtin invoked with unrecognized args
+            // (e.g. `/cost --today`) falls through to that same "unknown
+            // command" arm even though its NAME ("cost") is unambiguously a
+            // builtin. Filtering here means a discovered command can now
+            // ONLY ever be reached for a name `command` doesn't claim at
+            // all, closing that gap without teaching `CommandRegistry`
+            // itself any built-in-name awareness (ADR 0014, decision 3: the
+            // registry stays name-agnostic).
+            let resolve_custom_command = move |input: &str| {
+                let name = input
+                    .strip_prefix('/')
+                    .unwrap_or(input)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if is_builtin_command(name) {
+                    return None;
+                }
+                command_registry.expand(input)
+            };
 
             let run_result = rokr_tui::run(
                 submit,
@@ -1105,6 +1164,70 @@ fn mcp_reconnect_gate(status: &rokr_mcp::McpServerStatus) -> Result<(), &'static
         rokr_mcp::McpServerStatus::Degraded { .. } => Ok(()),
         rokr_mcp::McpServerStatus::Starting => Err("starting"),
         rokr_mcp::McpServerStatus::Ready => Err("connected"),
+    }
+}
+
+/// F-004 (pre-ship review): the set of command NAMES (the token
+/// immediately after the leading `/`, before any arguments) that the
+/// `command` closure's match arms above claim, kept as a single explicit
+/// list right next to that match so the two are easy to keep in sync by
+/// eye. `CommandRegistry` gains no built-in-name awareness of its own (ADR
+/// 0014, decision 3) -- this list lives entirely here, on the caller side,
+/// and is consulted by `resolve_custom_command` (built alongside
+/// `rokr_tui::run`'s call site) before it ever looks a name up in the
+/// registry, so a discovered custom command can never win a same-named
+/// collision with a builtin regardless of what arguments follow the name.
+///
+/// `memory` is included even though bare `/memory` is actually intercepted
+/// earlier, directly in rokr-tui's `event_loop`, before `resolve_custom_command`
+/// is ever consulted -- listed here anyway so a non-bare invocation like
+/// `/memory foo` (which DOES reach `resolve_custom_command`, since it isn't
+/// the exact bare string the `event_loop` intercept matches) is still
+/// treated as a reserved name rather than falling through to a same-named
+/// discovered command.
+fn is_builtin_command(name: &str) -> bool {
+    matches!(
+        name,
+        "model"
+            | "resume"
+            | "rollback"
+            | "search"
+            | "mcp"
+            | "hooks"
+            | "cost"
+            | "sessions"
+            | "compact"
+            | "memory"
+    )
+}
+
+#[cfg(test)]
+mod is_builtin_command_tests {
+    use super::*;
+
+    /// F-004 done-when (core of the fix): a name `command`'s match arms
+    /// claim -- like "cost" -- must be recognized as a builtin regardless
+    /// of what arguments a real invocation carries, since this check only
+    /// ever sees the bare NAME, never the full input string.
+    #[test]
+    fn recognizes_every_builtin_command_name() {
+        for name in [
+            "model", "resume", "rollback", "search", "mcp", "hooks", "cost", "sessions",
+            "compact", "memory",
+        ] {
+            assert!(
+                is_builtin_command(name),
+                "expected {name:?} to be recognized as a builtin command name"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_name_no_builtin_claims() {
+        assert!(
+            !is_builtin_command("my-command"),
+            "expected an arbitrary discovered-command name to NOT be treated as a builtin"
+        );
     }
 }
 
@@ -1671,48 +1794,6 @@ fn fold_session_usage_and_model(records: &[rokr_session::SessionRecord]) -> (rok
     (usage, model)
 }
 
-/// Reads and parses one session's raw `session.jsonl` log directly off disk
-/// (`<data_dir>/sessions/<session_id>/session.jsonl`), the same
-/// read-every-line-skip-unparseable pattern `rokr_session::SessionStore`'s
-/// own `resume_session`/`search` use internally -- replicated here rather
-/// than reused because neither of those methods returns the raw
-/// `Vec<SessionRecord>` `/cost` needs (they return already-folded output),
-/// and adding a new public method to `rokr-session` is out of this ticket's
-/// files-touched scope. A missing/unreadable file yields an empty `Vec`
-/// (mirrors `SessionStore::list_sessions`'s own "not found" -> empty
-/// handling) rather than surfacing an error `/cost` would have nowhere
-/// good to show.
-fn read_session_records(
-    data_dir: &std::path::Path,
-    session_id: &str,
-) -> Vec<rokr_session::SessionRecord> {
-    let session_jsonl_path = data_dir.join("sessions").join(session_id).join("session.jsonl");
-    let contents = std::fs::read_to_string(&session_jsonl_path).unwrap_or_default();
-    contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
-        .collect()
-}
-
-/// Ticket 57: field-copy bridge from `rokr-config`'s `ModelPricing` (the
-/// on-disk-configurable pricing table entry) to `rokr-core::pricing`'s
-/// `PricingEntry` (what `calculate_cost` actually takes) -- the two crates
-/// have no dependency edge on each other (see `ModelPricing`'s own doc
-/// comment), so there's no `From`/`Into` between them to reuse. Same four
-/// fields, same names, same types; duplicated in `crates/rokr-app/src/headless.rs`
-/// for the same reason (that file already depends on both crates too).
-fn model_pricing_to_pricing_entry(
-    pricing: &rokr_config::ModelPricing,
-) -> rokr_core::pricing::PricingEntry {
-    rokr_core::pricing::PricingEntry {
-        input_price_per_token: pricing.input_price_per_token,
-        output_price_per_token: pricing.output_price_per_token,
-        cache_read_price_per_token: pricing.cache_read_price_per_token,
-        cache_write_price_per_token: pricing.cache_write_price_per_token,
-    }
-}
-
 /// Formats `/cost`'s token-by-type breakdown, cache-hit rate, and estimated
 /// dollar cost for one already-folded `usage` total. Cache-hit-rate formula
 /// mirrors `rokr-provider/src/anthropic.rs`'s own per-call calculation
@@ -1744,7 +1825,6 @@ fn format_cost_breakdown(usage: rokr_core::Usage, cost_usd: f64) -> String {
 /// summing the dollar totals -- sessions can have different models/prices,
 /// so applying one session's rate to another's tokens would misprice it.
 async fn format_cost_all_summary(
-    data_dir: &std::path::Path,
     store: &rokr_session::SessionStore,
     model_pricing: &std::collections::HashMap<String, rokr_config::ModelPricing>,
 ) -> String {
@@ -1759,7 +1839,7 @@ async fn format_cost_all_summary(
     let mut total_usage = rokr_core::Usage::default();
     let mut total_cost_usd = 0.0;
     for entry in &entries {
-        let records = read_session_records(data_dir, &entry.session_id);
+        let records = store.read_records(&entry.session_id);
         let (usage, model) = fold_session_usage_and_model(&records);
         let pricing_entry = model_pricing.get(&model).map(model_pricing_to_pricing_entry);
         total_cost_usd += rokr_core::pricing::calculate_cost(usage, pricing_entry.as_ref());
@@ -1870,6 +1950,56 @@ mod tests {
             "cache-write tokens must be summed across all turns"
         );
         assert_eq!(model, "gpt-4o-mini", "model must be resolved off the Header record");
+    }
+
+    /// F-014: an empty record slice (e.g. a brand-new session with nothing
+    /// appended yet) must fold to a zero/default `Usage` and an empty model
+    /// string, not panic or produce garbage.
+    #[test]
+    fn fold_session_usage_and_model_returns_default_for_empty_records() {
+        let (usage, model) = fold_session_usage_and_model(&[]);
+
+        assert_eq!(usage, rokr_core::Usage::default());
+        assert_eq!(model, "", "no Header record means no model to resolve");
+    }
+
+    /// F-014: a session log containing only its `Header` record (no `Turn`s
+    /// appended yet, e.g. right after session creation and before the first
+    /// exchange) must fold to zero usage without panicking -- there's simply
+    /// nothing to sum.
+    #[test]
+    fn fold_session_usage_and_model_handles_header_only_records() {
+        let records = vec![rokr_session::SessionRecord::Header {
+            schema_version: 2,
+            session_id: "sess-header-only".to_string(),
+            created_at: "0".to_string(),
+            project_path: "/tmp/project".to_string(),
+            agent_tier: "plan".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+        }];
+
+        let (usage, model) = fold_session_usage_and_model(&records);
+
+        assert_eq!(usage, rokr_core::Usage::default(), "no Turn records means no usage to sum");
+        assert_eq!(model, "claude-test", "model must still resolve off the Header record");
+    }
+
+    /// F-014: an all-zero `Usage` (e.g. a session/header-only case with
+    /// nothing spent yet) must render a "0.0%" cache-hit rate, not a NaN or
+    /// divide-by-zero artifact, and must not panic.
+    #[test]
+    fn format_cost_breakdown_renders_zero_percent_cache_rate_for_default_usage() {
+        let breakdown = format_cost_breakdown(rokr_core::Usage::default(), 0.0);
+
+        assert!(
+            breakdown.contains("0.0%"),
+            "expected a clean 0.0% cache hit rate for all-zero usage, got: {breakdown}"
+        );
+        assert!(
+            !breakdown.contains("NaN"),
+            "cache hit rate must not be NaN when total prompt tokens is zero, got: {breakdown}"
+        );
     }
 
     #[test]

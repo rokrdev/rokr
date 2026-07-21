@@ -81,9 +81,20 @@ pub struct SessionRunner {
     /// The repo map, regenerated on `/compact` (written by `command`), read
     /// here per turn.
     pub repo_map: Arc<std::sync::Mutex<Option<String>>>,
-    /// The most recent turn's real (non-zero) usage figure, shared so an
-    /// unreported turn can fall back to it.
+    /// The most recent turn's real (non-zero) FINAL-CALL usage figure
+    /// (`TurnUsage::final_call`, not `cumulative` -- see that type's doc
+    /// comment), shared so an unreported turn can fall back to it. Used only
+    /// for the auto-compaction/context-percent math below, which cares about
+    /// the live context window's occupancy, not this turn's total spend.
     pub last_known_usage: Arc<std::sync::Mutex<Option<rokr_core::Usage>>>,
+    /// F-001: the most recently completed submission's full [`rokr_core::TurnUsage`]
+    /// (both `final_call` and `cumulative`), read by `crate::headless::run_result_object`
+    /// after `run_submission` returns to report/cost the turn's TOTAL spend
+    /// (`cumulative`) rather than just its final round trip
+    /// (`last_known_usage`/`final_call`). Headless drives exactly one
+    /// submission per process, so this is unambiguously "this run's usage"
+    /// there; the TUI updates it every submit but doesn't read it back.
+    pub last_turn_usage: Arc<std::sync::Mutex<Option<rokr_core::TurnUsage>>>,
     /// The user-scope config dir, used to load a named subagent's prompt.
     pub config_dir: std::path::PathBuf,
     /// The currently-active session writer (swappable via `/resume`).
@@ -109,6 +120,12 @@ pub struct SessionRunner {
     pub context_window_size: u32,
     /// Fraction of `context_window_size` that triggers auto-compaction.
     pub auto_compact_threshold: f64,
+    /// F-005: caps `rokr_core::run_tool_loop`'s `Provider::send` round trips
+    /// for every submission this runner drives. `None` (the TUI's choice)
+    /// preserves unbounded looping, since a human at the keyboard can always
+    /// interrupt; headless/eval callers pass a conservative `Some(_)` (see
+    /// `crate::headless::HEADLESS_MAX_ITERATIONS`).
+    pub max_iterations: Option<u32>,
 }
 
 impl SessionRunner {
@@ -128,6 +145,7 @@ impl SessionRunner {
         let system_prompt = self.system_prompt.clone();
         let repo_map = self.repo_map.clone();
         let last_known_usage = self.last_known_usage.clone();
+        let last_turn_usage = self.last_turn_usage.clone();
         let config_dir = self.config_dir.clone();
         let session_handle = self.session_handle.clone();
         let turn_index = self.turn_index.clone();
@@ -140,6 +158,7 @@ impl SessionRunner {
         let agent = self.agent;
         let context_window_size = self.context_window_size;
         let auto_compact_threshold = self.auto_compact_threshold;
+        let max_iterations = self.max_iterations;
         async move {
             let provider = provider?;
             // F-003: ONE read lock, ONE clone of the current
@@ -595,7 +614,7 @@ impl SessionRunner {
                     })
                 };
 
-            let (reply, usage) = rokr_core::run_tool_loop(
+            let (reply, turn_usage) = rokr_core::run_tool_loop(
                 &provider,
                 &system_prompt,
                 repo_map_snapshot.as_deref(),
@@ -604,9 +623,19 @@ impl SessionRunner {
                 request_permission,
                 Some(pre_tool_hook),
                 Some(post_tool_hook),
+                max_iterations,
             )
             .await
             .map_err(|err| err.to_string())?;
+            // F-001: `usage` (the pre-existing local name every use below
+            // reads) is the FINAL call's figure -- compaction/context-percent
+            // math must keep seeing only that, never the cumulative total
+            // (see `TurnUsage`'s doc comment). The full `turn_usage` (both
+            // fields) is separately stashed into `last_turn_usage` below for
+            // `crate::headless::run_result_object` to report/cost the turn's
+            // TOTAL spend.
+            let usage = turn_usage.final_call;
+            *last_turn_usage.lock().unwrap() = Some(turn_usage);
 
             // `Stop` (ticket 50, hooks-remaining-events-and-config;
             // PRD "Hooks", architect decision: "Stop when agent
@@ -635,9 +664,17 @@ impl SessionRunner {
             {
                 let session_handle_guard = session_handle.read().await;
                 if let Some(session_handle) = session_handle_guard.as_ref() {
+                    // F-001: persists the turn's CUMULATIVE usage (every
+                    // `Provider::send` round trip this submission made, not
+                    // just the final one) -- `/cost`'s
+                    // `fold_session_usage_and_model` (crates/rokr/src/main.rs)
+                    // sums every `Turn` record's `UsageRecord` across a
+                    // session, so persisting `final_call` here would silently
+                    // drop every intermediate tool round-trip's tokens from
+                    // that total.
                     session_handle.append_turn(
                         transcript[start..].to_vec(),
-                        rokr_session::UsageRecord::from(usage),
+                        rokr_session::UsageRecord::from(turn_usage.cumulative),
                         now_timestamp(),
                     );
                 }
@@ -1119,6 +1156,7 @@ mod tests {
             system_prompt: "you are a test agent".to_string(),
             repo_map: Arc::new(Mutex::new(None)),
             last_known_usage: Arc::new(Mutex::new(None)),
+            last_turn_usage: Arc::new(Mutex::new(None)),
             config_dir: config_dir.clone(),
             session_handle: Arc::new(tokio::sync::RwLock::new(None)),
             turn_index: Arc::new(Mutex::new(0)),
@@ -1131,6 +1169,7 @@ mod tests {
             agent: AgentTier::Plan,
             context_window_size: 200_000,
             auto_compact_threshold: 0.7,
+            max_iterations: None,
         };
 
         let reply = runner

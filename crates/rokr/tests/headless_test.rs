@@ -468,3 +468,374 @@ async fn default_permission_mode_denies_gated_tool_call_without_flag() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+/// F-005: `rokr_core::run_tool_loop`'s `max_iterations` cap
+/// (`crate::headless::HEADLESS_MAX_ITERATIONS` in `rokr-app`) must stop an
+/// unattended headless run against a misbehaving/looping provider -- one
+/// that NEVER emits a tool-call-free reply, so without the cap the loop
+/// would run forever. Plan tier (the default agent, no `--agent` flag) is
+/// used deliberately: `read` is never gated, so every round trip actually
+/// executes and loops back to the provider, with no permission prompt ever
+/// in play to confound the assertion below with `error_permission` instead.
+#[tokio::test]
+async fn looping_provider_terminates_via_max_iterations_with_error_max_turns_subtype() {
+    let mock = MockServer::start().await;
+
+    // Every single call -- there is no second, terminating mock -- returns
+    // a fresh `read` tool call, so the loop never sees a tool-call-free
+    // reply on its own and must be stopped by the `max_iterations` cap.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-looping",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_loop",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": serde_json::json!({
+                                "path": "/nonexistent/max-iterations-probe.txt"
+                            }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("max-iter-home");
+    let xdg_config_home = unique_temp_dir("max-iter-xdg-config-home");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("-p")
+        .arg("read forever")
+        .arg("--output-format")
+        .arg("json")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .failure()
+        .code(1);
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(stdout.trim_end())
+        .expect("even a max-iterations run must print one parseable JSON result object");
+    assert_eq!(result["subtype"], serde_json::json!("error_max_turns"));
+    assert_eq!(result["is_error"], serde_json::json!(true));
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// F-006 (1/2): `--permission-mode bypass` WITHOUT the accompanying
+/// `--dangerously-skip-permissions` flag is CLI misuse
+/// (`crate::headless::build_permission_requester`) -- caught before any
+/// session/provider bootstrap even starts, so this test needs no mock
+/// provider at all. Must exit 2 (the CLI-misuse code, distinct from exit 1
+/// for an agent/runtime error) with a non-empty stderr message naming the
+/// missing flag.
+#[tokio::test]
+async fn bypass_permission_mode_without_dangerously_skip_permissions_exits_two_with_stderr_error()
+{
+    let home = unique_temp_dir("bypass-misuse-home");
+    let xdg_config_home = unique_temp_dir("bypass-misuse-xdg-config-home");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("-p")
+        .arg("say hi")
+        .arg("--permission-mode")
+        .arg("bypass")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .assert()
+        .failure()
+        .code(2);
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "expected no stdout for a CLI-misuse exit, got: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("--dangerously-skip-permissions"),
+        "expected stderr to name the missing --dangerously-skip-permissions flag, got: {stderr:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// F-006 (2/2): `--permission-mode accept-edits`'s documented behavior
+/// (`crate::headless::HeadlessPermissionRequester::request`) is "grant only
+/// a write/edit `Diff` call, still deny everything else (bash, MCP) exactly
+/// like `deny`". This is deliberately ONE test exercising BOTH halves of
+/// that `matches!` arm against a real `--agent build` run, rather than two
+/// separate tests each checking only a grant or only a denial: a test that
+/// only checked the grant half would stay green even if the arm were
+/// inverted (denying diffs, granting everything else), since an inverted
+/// arm still "grants something". Checking both halves together is what
+/// makes an inverted `matches!` arm provably fail this test.
+///
+/// The write-tool half proves the grant is REAL (the file is actually
+/// written, not just a happy-path subtype), and the bash half reuses the
+/// same marker-file non-execution proof
+/// `default_permission_mode_denies_gated_tool_call_without_flag` above
+/// uses for `deny` mode.
+#[tokio::test]
+async fn accept_edits_permission_mode_grants_file_writes_but_denies_bash_execution() {
+    // --- Half 1: a write-tool call must be GRANTED (file actually written,
+    // result subtype success). ---
+    let write_mock = MockServer::start().await;
+    let write_temp_dir = unique_temp_dir("accept-edits-write-target");
+    let target_file = write_temp_dir.join("agent-written.txt");
+    let target_path = target_file.to_string_lossy().into_owned();
+    const WRITTEN_CONTENT: &str = "written under accept-edits";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-write-call",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_write",
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": serde_json::json!({
+                                "path": target_path,
+                                "content": WRITTEN_CONTENT
+                            }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&write_mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-write-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "wrote the file"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&write_mock)
+        .await;
+
+    let write_home = unique_temp_dir("accept-edits-write-home");
+    let write_xdg_config_home = unique_temp_dir("accept-edits-write-xdg-config-home");
+
+    let mut write_cmd = Command::cargo_bin("rokr").unwrap();
+    let write_assert = write_cmd
+        .arg("--agent")
+        .arg("build")
+        .arg("--permission-mode")
+        .arg("accept-edits")
+        .arg("-p")
+        .arg("please write the file")
+        .arg("--output-format")
+        .arg("json")
+        .env("HOME", &write_home)
+        .env("XDG_CONFIG_HOME", &write_xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", write_mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    let write_output = write_assert.get_output();
+    let write_stdout = String::from_utf8_lossy(&write_output.stdout);
+    let write_result: serde_json::Value = serde_json::from_str(write_stdout.trim_end())
+        .expect("the write-grant run must print one parseable JSON result object");
+    assert_eq!(write_result["subtype"], serde_json::json!("success"));
+    assert_eq!(write_result["is_error"], serde_json::json!(false));
+    assert_eq!(
+        std::fs::read_to_string(&target_file).expect("the write call must have been granted"),
+        WRITTEN_CONTENT,
+        "accept-edits must grant a write/edit (Diff) call -- the file must actually be written"
+    );
+
+    let _ = std::fs::remove_dir_all(&write_home);
+    let _ = std::fs::remove_dir_all(&write_xdg_config_home);
+    let _ = std::fs::remove_dir_all(&write_temp_dir);
+
+    // --- Half 2: a bash call must be DENIED (marker file never created,
+    // result subtype error_permission) -- same accept-edits mode, same
+    // agent tier, only the requested tool differs. ---
+    let bash_mock = MockServer::start().await;
+    let bash_temp_dir = unique_temp_dir("accept-edits-bash-marker");
+    let marker_file = bash_temp_dir.join("should-never-be-created.txt");
+    let marker_path = marker_file.to_string_lossy().into_owned();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-bash-call",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_bash",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": serde_json::json!({
+                                "command": format!("touch {marker_path}")
+                            }).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&bash_mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-bash-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "acknowledged the denial"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&bash_mock)
+        .await;
+
+    let bash_home = unique_temp_dir("accept-edits-bash-home");
+    let bash_xdg_config_home = unique_temp_dir("accept-edits-bash-xdg-config-home");
+
+    let mut bash_cmd = Command::cargo_bin("rokr").unwrap();
+    let bash_assert = bash_cmd
+        .arg("--agent")
+        .arg("build")
+        .arg("--permission-mode")
+        .arg("accept-edits")
+        .arg("-p")
+        .arg("please run a command")
+        .arg("--output-format")
+        .arg("json")
+        .env("HOME", &bash_home)
+        .env("XDG_CONFIG_HOME", &bash_xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", bash_mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .failure()
+        .code(1);
+
+    let bash_output = bash_assert.get_output();
+    let bash_stdout = String::from_utf8_lossy(&bash_output.stdout);
+    let bash_result: serde_json::Value = serde_json::from_str(bash_stdout.trim_end())
+        .expect("the bash-denial run must print one parseable JSON result object");
+    assert_eq!(bash_result["subtype"], serde_json::json!("error_permission"));
+    assert_eq!(bash_result["is_error"], serde_json::json!(true));
+    assert!(
+        !marker_file.exists(),
+        "accept-edits must deny a bash call -- it must never actually execute, found marker \
+         file at {marker_path}"
+    );
+
+    let _ = std::fs::remove_dir_all(&bash_home);
+    let _ = std::fs::remove_dir_all(&bash_xdg_config_home);
+    let _ = std::fs::remove_dir_all(&bash_temp_dir);
+}
+
+/// F-007 (PRD story 10, pre-ship review) acceptance test: `rokr -p "<prompt
+/// with @skill:<name>>"` must resolve the mention before submission --
+/// `CommandRegistry::resolve_skills` is applied to headless's raw `-p`
+/// prompt in `run_result_object` the same way it's applied to a plain
+/// TUI-typed prompt (see `tui_test.rs`'s
+/// `plain_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing_request`).
+/// Inspects the wire-level outgoing request body the mock provider
+/// transport actually received to confirm the skill file's full contents
+/// landed there, not just the intermediate prompt string.
+#[tokio::test]
+async fn print_flag_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("skill-mention-home");
+    let xdg_config_home = unique_temp_dir("skill-mention-xdg-config-home");
+
+    // User-scope skills/ directory (config_dir/skills/) -- a headless `-p`
+    // run has no project cwd fixture wired up here, so this exercises the
+    // user-scope skill discovery path.
+    let user_skills_dir = xdg_config_home.join("rokr").join("skills");
+    std::fs::create_dir_all(&user_skills_dir)
+        .expect("failed to create fixture user-scope skills directory");
+    let skill_content = "SKILL-CONTENT-MARKER: headless plain-prompt skill resolution.";
+    std::fs::write(user_skills_dir.join("code-style.md"), skill_content)
+        .expect("failed to write fixture code-style.md");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    cmd.arg("-p")
+        .arg("Please follow @skill:code-style")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    let received_requests = mock.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains(skill_content),
+        "expected the outgoing request body to contain the skill file's full contents inlined \
+         in place of the @skill:code-style mention in headless's raw -p prompt; got body: \
+         {first_request_body:?}"
+    );
+    assert!(
+        !first_request_body.contains("@skill:code-style"),
+        "expected the @skill:code-style mention to have been replaced, not left literal; got \
+         body: {first_request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}

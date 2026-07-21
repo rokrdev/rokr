@@ -12370,6 +12370,167 @@ async fn cost_all_flag_folds_every_session_on_disk() {
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
 
+/// F-004 (pre-ship review) acceptance test: "built-in wins over custom
+/// command" must be enforced by the command NAME, not by exact-string
+/// comparison of the whole input against a hardcoded built-in literal. A
+/// user-scope `cost.md` custom command is discovered (same fixture shape as
+/// `custom_command_...` above), but typing `/cost --today` -- a real
+/// builtin name with an argument the builtin's own dispatch doesn't
+/// recognize -- must never fall through to submitting the discovered
+/// template's content as a prompt: proven two ways, (1) the custom
+/// template's distinctive marker text never appears anywhere in the
+/// rendered output, and (2) the mock provider never receives a single
+/// request (the built-in `/cost` dispatch never talks to the provider at
+/// all, so ANY request landing there would itself prove the custom
+/// template's `$ARGUMENTS`-expanded body got submitted instead).
+#[tokio::test]
+async fn builtin_command_wins_over_same_named_custom_command_even_with_unrecognized_args() {
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+
+    let home = unique_temp_dir("home-builtin-wins-by-name");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-builtin-wins-by-name");
+
+    // rokr_config::default_config_dir() resolves to `$XDG_CONFIG_HOME/rokr`
+    // -- same convention the other custom-command fixtures in this file
+    // use. "cost" collides with the real built-in `/cost` handler in
+    // `crates/rokr/src/main.rs`'s `command` closure.
+    let commands_dir = xdg_config_home.join("rokr").join("commands");
+    std::fs::create_dir_all(&commands_dir).expect("failed to create fixture commands directory");
+    std::fs::write(
+        commands_dir.join("cost.md"),
+        "---\ndescription: test\n---\nCUSTOM-COST-TEMPLATE-SHOULD-NEVER-BE-SUBMITTED $ARGUMENTS",
+    )
+    .expect("failed to write fixture cost.md");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-openai-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/cost --today\r")
+        .expect("failed to write /cost --today to pty");
+
+    // The built-in `/cost` dispatch responds synchronously with no
+    // provider round trip, so waiting for the ordinary "unknown command"
+    // wording (still the built-in dispatcher's own generic fallthrough
+    // text for an unrecognized `/cost` invocation -- see
+    // `is_builtin_command`'s doc comment in main.rs) is the deterministic
+    // signal that dispatch has settled, one way or the other.
+    let settle_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < settle_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("unknown command")
+            || output.contains("CUSTOM-COST-TEMPLATE-SHOULD-NEVER-BE-SUBMITTED")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !output.contains("CUSTOM-COST-TEMPLATE-SHOULD-NEVER-BE-SUBMITTED"),
+        "expected the discovered custom 'cost' command to NEVER be submitted as a prompt just \
+         because the built-in /cost dispatch didn't recognize '--today' -- built-ins must win \
+         by command NAME, not by exact-string match against the full input; got: {output:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        received_requests.is_empty(),
+        "expected NO outgoing request to the provider -- the built-in /cost dispatch never \
+         talks to the provider, so any request proves the custom template was wrongly \
+         submitted instead; got requests: {received_requests:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
 /// Ticket 62 (memory-slash-command-opens-editor) acceptance test: typing
 /// `/memory` and pressing Enter suspends the TUI (mirroring ticket 42's
 /// Ctrl+E editor keybinding), spawns the scripted `$EDITOR` stand-in
@@ -13354,4 +13515,181 @@ async fn command_template_with_skill_mention_inlines_skill_file_contents_in_outg
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// F-007 (PRD story 10, pre-ship review) acceptance test: `@skill:<name>`
+/// mentions must resolve in a PLAIN, directly-typed prompt too, not just
+/// inside a command template's expansion (proven for the template case
+/// above by `command_template_with_skill_mention_inlines_skill_file_contents_in_outgoing_prompt`).
+/// Types a bare prompt (no leading `/`, never touches `CommandRegistry::expand`
+/// at all) containing an `@skill:code-style` mention, and inspects the
+/// wire-level outgoing request body the mock provider transport actually
+/// received to confirm the skill file's full contents landed there.
+#[tokio::test]
+async fn plain_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let canned_response = "MockedAssistantReplyForPlainPromptSkillMentionTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-plain-prompt-skill-mention",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-plain-prompt-skill-mention");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-plain-prompt-skill-mention");
+
+    // User-scope skills/ directory (config_dir/skills/), NOT project-scope
+    // -- a plain typed prompt has no command template or project cwd
+    // involved at all, so this exercises the user-scope skill discovery
+    // path on its own.
+    let user_skills_dir = xdg_config_home.join("rokr").join("skills");
+    std::fs::create_dir_all(&user_skills_dir)
+        .expect("failed to create fixture user-scope skills directory");
+    let skill_content = "SKILL-CONTENT-MARKER: plain-prompt skill resolution, 4-space indent.";
+    std::fs::write(user_skills_dir.join("code-style.md"), skill_content)
+        .expect("failed to write fixture code-style.md");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-openai-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"Please follow @skill:code-style\r")
+        .expect("failed to write plain prompt with skill mention to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, proving the plain prompt \
+         still submitted through the ordinary path; got: {output:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains(skill_content),
+        "expected the outgoing request body to contain the skill file's full contents inlined \
+         in place of the @skill:code-style mention in a PLAIN (non-/command) prompt; got body: \
+         {first_request_body:?}"
+    );
+    assert!(
+        !first_request_body.contains("@skill:code-style"),
+        "expected the @skill:code-style mention to have been replaced, not left literal; got \
+         body: {first_request_body:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
 }

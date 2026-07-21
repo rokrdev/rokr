@@ -686,14 +686,26 @@ fn run_memory_command(
 /// crossterm-polling thread, for every `/`-prefixed input that reaches
 /// [`InputRoute::Command`] (see [`event_loop`]) -- it returns `Some(expanded
 /// prompt text)` when `input` names a discovered custom command, `None`
-/// otherwise. A `None` leaves the existing `command`-closure dispatch
-/// (built-ins, then "unknown command: ...") completely unchanged; a `Some`
-/// is only ever actually used if `command`'s own dispatch, run to
-/// completion first, falls all the way through to its "unknown command: "
-/// arm -- so built-ins keep winning by construction, not by rokr-tui
-/// duplicating `main.rs`'s built-in list. Kept as a plain sync closure
-/// (mirroring `resolve_memory_path`) so rokr-tui stays decoupled from
-/// `rokr-app`'s `CommandRegistry`/config-dir specifics.
+/// otherwise.
+///
+/// F-004 (pre-ship review): the caller (`main.rs`) is REQUIRED to filter
+/// `None` for any command NAME its own builtin dispatch claims, checked
+/// against the bare name rather than the full input string, before ever
+/// consulting the registry -- see `main.rs`'s `is_builtin_command` doc
+/// comment for why. This replaced an earlier design where `rokr-tui` ran
+/// `command`'s own dispatch first and compared its output text against an
+/// "unknown command: {input}" sentinel string to decide whether a `Some`
+/// here should be used; that string comparison was fragile (a brittle
+/// cross-crate text-format contract) AND insufficient on its own (a builtin
+/// invoked with unrecognized arguments, e.g. `/cost --today`, falls through
+/// to that same sentinel output even though its NAME is unambiguously a
+/// builtin). With the name-level filter now enforced by the closure itself,
+/// a `Some` and a builtin dispatch match can never both be true for the
+/// same `input`, so [`event_loop`] no longer needs to run `command` at all
+/// when `resolve_custom_command` returns `Some` -- see that function's
+/// `InputRoute::Command` arm. Kept as a plain sync closure (mirroring
+/// `resolve_memory_path`) so rokr-tui stays decoupled from `rokr-app`'s
+/// `CommandRegistry`/config-dir specifics.
 pub async fn run<F, Fut, C, Fut2, M, M2>(
     submit: F,
     command: C,
@@ -996,8 +1008,10 @@ where
                                         });
                                     }
                                     InputRoute::Command(input) => {
-                                        // Ticket 63
-                                        // (custom-command-discovery-and-registry):
+                                        // Ticket 63/64
+                                        // (custom-command-discovery-and-registry,
+                                        // custom-command-project-scope-and-trust-boundary),
+                                        // F-004 (pre-ship review):
                                         // `resolve_custom_command` is
                                         // consulted EAGERLY (synchronously,
                                         // right here) so the resulting
@@ -1012,25 +1026,24 @@ where
                                         // async block; calling it here,
                                         // outside the spawn, sidesteps that
                                         // without needing `Arc<F>` plumbing.
-                                        // Calling `submit` doesn't start the
-                                        // real work (async fns/blocks are
-                                        // lazy until polled) -- if the
-                                        // built-in `command` dispatch below
-                                        // ends up matching a REAL built-in
-                                        // (not falling through to "unknown
-                                        // command"), this future is simply
-                                        // dropped unpolled, so no request
-                                        // ever goes out. This is also why
-                                        // built-ins keep winning "by
-                                        // construction": the `command`
-                                        // closure's own match runs to
-                                        // completion first (awaited below),
-                                        // and only ITS OWN "unknown command:
-                                        // {input}" fallthrough output
-                                        // (produced by the existing,
-                                        // unmodified match in `main.rs`)
-                                        // triggers use of the pre-built
-                                        // custom-command future.
+                                        //
+                                        // F-004: `resolve_custom_command`
+                                        // itself now filters by command NAME
+                                        // against `main.rs`'s builtin list
+                                        // BEFORE ever consulting the
+                                        // registry (see its own doc comment
+                                        // above `run`) -- so a `Some` here
+                                        // and a builtin match inside
+                                        // `command` below can never both be
+                                        // true for the same `input`. That
+                                        // means there's no longer any need
+                                        // to run `command` at all, or
+                                        // compare its output text against a
+                                        // sentinel string, to decide which
+                                        // one "wins": whichever branch below
+                                        // applies is unambiguous by
+                                        // construction, so `command` is only
+                                        // even called in the `None` branch.
                                         let submit_fut_if_custom =
                                             resolve_custom_command(&input).map(|expanded| {
                                                 let permission = PermissionHandle {
@@ -1038,19 +1051,22 @@ where
                                                 };
                                                 submit(expanded, permission)
                                             });
-                                        let command_fut = command(input.clone());
                                         let tx = tx.clone();
-                                        handle.spawn(async move {
-                                            let outcome = command_fut.await;
-                                            if outcome == format!("unknown command: {input}") {
-                                                if let Some(submit_fut) = submit_fut_if_custom {
+                                        match submit_fut_if_custom {
+                                            Some(submit_fut) => {
+                                                handle.spawn(async move {
                                                     let result = submit_fut.await;
                                                     let _ = tx.send(result);
-                                                    return;
-                                                }
+                                                });
                                             }
-                                            let _ = tx.send(Ok(outcome));
-                                        });
+                                            None => {
+                                                let command_fut = command(input);
+                                                handle.spawn(async move {
+                                                    let outcome = command_fut.await;
+                                                    let _ = tx.send(Ok(outcome));
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }

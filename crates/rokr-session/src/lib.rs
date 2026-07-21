@@ -512,6 +512,29 @@ impl SessionStore {
         ))
     }
 
+    /// Reads and parses `session_id`'s raw `session.jsonl` log, returning
+    /// every [`SessionRecord`] in file order. Tolerant on both axes: a
+    /// missing/unreadable log file yields an empty `Vec` (mirrors
+    /// `list_sessions`'s own "not found" -> empty handling) rather than an
+    /// error, and an unparseable line is silently skipped rather than
+    /// aborting the whole read (same forward-compatibility policy as
+    /// `resume_session`, but without that method's `eprintln` warning --
+    /// callers here, like `/cost`, want the raw record stream rather than a
+    /// diagnostic).
+    pub fn read_records(&self, session_id: &str) -> Vec<SessionRecord> {
+        let session_jsonl_path = self
+            .data_dir
+            .join("sessions")
+            .join(session_id)
+            .join("session.jsonl");
+        let contents = std::fs::read_to_string(&session_jsonl_path).unwrap_or_default();
+        contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<SessionRecord>(line).ok())
+            .collect()
+    }
+
     /// RULING 3 (architect ruling, phase-5): the `replaced_through` of the
     /// LAST `Compaction` record in `session_id`'s log (in file order), or
     /// `None` if the session has never been compacted. `handle_rollback_command`

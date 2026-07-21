@@ -153,16 +153,26 @@ pub fn check_assertion(fixture_dir: &Path, assertion: &crate::case::Assertion) -
             args,
             expected_code,
         } => check_command_exit(fixture_dir, command, args, *expected_code),
-        // Ticket 59 (eval-llm-judge-scoring, thin glue outside this
-        // ticket's files-touched -- see ticket frontmatter amendment): a
-        // judge-rubric assertion is never dispatched here -- `lib.rs`'s
-        // per-case loop routes it to `judge::score_rubric` instead, before
-        // this function is ever called. Unreachable by construction, not by
-        // omission.
-        crate::case::Assertion::JudgeRubric { .. } => unreachable!(
-            "judge-rubric assertions are scored via judge::score_rubric, never dispatched \
-             through check_assertion"
-        ),
+        // F-010 (pre-ship review): `lib.rs`'s per-case loop routes a
+        // judge-rubric assertion to `judge::score_rubric` instead of here,
+        // but `check_assertion` is a `pub fn` -- nothing in the type system
+        // stops ANY caller (a future dispatcher, a direct unit test, a
+        // caller in another crate) from handing it a `JudgeRubric` variant
+        // anyway. This arm used to be `unreachable!()`, which would panic
+        // in production the moment that assumption broke. A judge rubric
+        // has no deterministic pass/fail contract of its own (see `judge`'s
+        // doc comment: it's a scored metric, never a gate), so the only
+        // honest answer `check_assertion` can give here is "failed by
+        // construction" with an explanation -- never a panic.
+        crate::case::Assertion::JudgeRubric { rubric } => AssertionOutcome {
+            description: format!("judge_rubric({rubric:?})"),
+            passed: false,
+            detail: "judge-rubric assertions are scored via judge::score_rubric and routed \
+                     there by lib.rs's per-case loop before this function is ever called; \
+                     check_assertion has no way to score a rubric itself, so this is reported \
+                     as failed-by-construction rather than panicking"
+                .to_string(),
+        },
     }
 }
 
@@ -269,6 +279,36 @@ mod tests {
         assert!(
             !failing.passed,
             "expected command_exit to fail when the command's exit code doesn't match, got: {failing:?}"
+        );
+    }
+
+    /// F-010: `check_assertion` must never panic when handed a
+    /// `JudgeRubric` assertion, even though `lib.rs`'s per-case loop never
+    /// actually dispatches one here in practice -- it must return a
+    /// non-panicking, explanatorily-detailed failed outcome instead.
+    #[test]
+    fn check_assertion_reports_failed_outcome_for_judge_rubric_instead_of_panicking() {
+        let dir = tempfile::tempdir().expect("failed to create temp fixture dir");
+        let assertion = crate::case::Assertion::JudgeRubric {
+            rubric: "did the agent do a good job?".to_string(),
+        };
+
+        let outcome = check_assertion(dir.path(), &assertion);
+
+        assert!(
+            !outcome.passed,
+            "expected a JudgeRubric assertion routed through check_assertion to report failed, \
+             got: {outcome:?}"
+        );
+        assert!(
+            !outcome.detail.is_empty(),
+            "expected an explanatory detail string, got an empty one"
+        );
+        assert!(
+            outcome.detail.contains("judge") || outcome.detail.contains("score_rubric"),
+            "expected the detail to explain that judge-rubric assertions are scored \
+             elsewhere, got: {:?}",
+            outcome.detail
         );
     }
 }

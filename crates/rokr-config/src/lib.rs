@@ -57,16 +57,20 @@ pub struct Config {
     /// map -- there IS a sane built-in default (a small table of known
     /// models' published per-token rates), so a config file missing this
     /// key still gets useful pricing out of the box. A user-supplied
-    /// `model_pricing` block in the file is honored verbatim in place of
-    /// (not merged into) these built-in defaults for any model key it
-    /// names; models the user's file doesn't mention keep no built-in
-    /// entry once the user has supplied the field at all -- same
-    /// last-value-wins semantics `serde`'s field-level default already
-    /// gives every other field here. `rokr-core`'s `calculate_cost` (which
-    /// this table feeds) is a separate, same-shaped `PricingEntry` type in
-    /// that crate -- `rokr-config` and `rokr-core` have no dependency edge
-    /// on each other, matching how `mcp`/`hooks` above already define their
-    /// own crate-local types rather than reusing another crate's.
+    /// `model_pricing` block in the file is MERGED, per-model, with these
+    /// built-in defaults (team-lead correction to ticket 56 -- see
+    /// `load_or_init`, which re-inserts every built-in default entry whose
+    /// key isn't already present after parsing): a named model key's
+    /// user-supplied rate wins over the built-in default for that key, but
+    /// any built-in default model the user's file doesn't mention still
+    /// resolves rather than disappearing. This is NOT the same
+    /// last-value-wins semantics `serde`'s field-level default gives every
+    /// other field here -- it's a deeper, key-level merge. `rokr-core`'s
+    /// `calculate_cost` (which this table feeds) is a separate, same-shaped
+    /// `PricingEntry` type in that crate -- `rokr-config` and `rokr-core`
+    /// have no dependency edge on each other, matching how `mcp`/`hooks`
+    /// above already define their own crate-local types rather than reusing
+    /// another crate's.
     #[serde(default = "default_model_pricing")]
     pub model_pricing: std::collections::HashMap<String, ModelPricing>,
 }
@@ -349,12 +353,23 @@ pub struct MemorySegment {
 ///   fallback for user scope.
 /// - Project scope: unchanged existing behavior, delegating to
 ///   [`load_project_context`] (AGENTS.md under `cwd`, falling back to
-///   CLAUDE.md) rather than duplicating its fallback logic.
+///   CLAUDE.md) rather than duplicating its fallback logic. Skipped
+///   entirely when `cwd` is `None` -- see below.
+///
+/// `cwd` is `Option` (F-011 pre-ship review fix) because project-scope
+/// memory is inherently cwd-dependent but user-scope memory is not: a
+/// caller whose `std::env::current_dir()` failed (deleted cwd, some
+/// sandboxed/CI environments) has no sensible directory to walk for
+/// project-scope memory, but that failure has nothing to do with
+/// user-scope memory and must not suppress it too. Callers should convert
+/// a `current_dir()` error to `None` and still call this function
+/// unconditionally, rather than skipping the call (and losing user-scope
+/// memory) when cwd resolution fails.
 ///
 /// Either, both, or neither may be present; the returned `Vec` contains
 /// only the segments that were actually found, still in user-then-project
 /// order.
-pub fn load_memory(config_dir: &Path, cwd: &Path) -> Vec<MemorySegment> {
+pub fn load_memory(config_dir: &Path, cwd: Option<&Path>) -> Vec<MemorySegment> {
     let mut segments = Vec::new();
 
     if let Ok(user_content) = std::fs::read_to_string(config_dir.join("AGENTS.md")) {
@@ -364,7 +379,7 @@ pub fn load_memory(config_dir: &Path, cwd: &Path) -> Vec<MemorySegment> {
         });
     }
 
-    if let Some(project_content) = load_project_context(cwd) {
+    if let Some(project_content) = cwd.and_then(load_project_context) {
         segments.push(MemorySegment {
             label: "Project memory",
             content: project_content,
@@ -961,7 +976,7 @@ mod tests {
         std::fs::write(temp_config.path().join("AGENTS.md"), user_content).unwrap();
         std::fs::write(temp_cwd.path().join("AGENTS.md"), project_content).unwrap();
 
-        let segments = load_memory(temp_config.path(), temp_cwd.path());
+        let segments = load_memory(temp_config.path(), Some(temp_cwd.path()));
 
         assert_eq!(segments.len(), 2, "expected two segments when both scopes present, got: {segments:?}");
         assert_eq!(segments[0].content, user_content, "user segment must come first");
@@ -979,7 +994,7 @@ mod tests {
     fn load_memory_returns_single_segment_when_only_one_scope_present_and_empty_when_neither() {
         let temp_cwd_neither = tempfile::tempdir().unwrap();
         let temp_config_neither = tempfile::tempdir().unwrap();
-        let segments = load_memory(temp_config_neither.path(), temp_cwd_neither.path());
+        let segments = load_memory(temp_config_neither.path(), Some(temp_cwd_neither.path()));
         assert!(
             segments.is_empty(),
             "expected empty segments when neither scope has a memory file, got: {segments:?}"
@@ -989,7 +1004,7 @@ mod tests {
         let temp_config_user_only = tempfile::tempdir().unwrap();
         let user_content = "# User AGENTS.md\nUser-only memory content.";
         std::fs::write(temp_config_user_only.path().join("AGENTS.md"), user_content).unwrap();
-        let segments = load_memory(temp_config_user_only.path(), temp_cwd_user_only.path());
+        let segments = load_memory(temp_config_user_only.path(), Some(temp_cwd_user_only.path()));
         assert_eq!(
             segments.len(), 1,
             "expected exactly one segment when only user scope present, got: {segments:?}"
@@ -1000,12 +1015,32 @@ mod tests {
         let temp_config_project_only = tempfile::tempdir().unwrap();
         let project_content = "# Project AGENTS.md\nProject-only memory content.";
         std::fs::write(temp_cwd_project_only.path().join("AGENTS.md"), project_content).unwrap();
-        let segments = load_memory(temp_config_project_only.path(), temp_cwd_project_only.path());
+        let segments = load_memory(temp_config_project_only.path(), Some(temp_cwd_project_only.path()));
         assert_eq!(
             segments.len(), 1,
             "expected exactly one segment when only project scope present, got: {segments:?}"
         );
         assert_eq!(segments[0].content, project_content);
+    }
+
+    /// F-011 (pre-ship review): user-scope memory has nothing to do with
+    /// cwd, so it must still load when `cwd` is `None` (the caller's
+    /// `std::env::current_dir()` failed) -- only the cwd-dependent
+    /// project-scope segment is skipped, gracefully, not as an error.
+    #[test]
+    fn load_memory_still_returns_user_segment_when_cwd_is_none() {
+        let temp_config = tempfile::tempdir().unwrap();
+        let user_content = "# User AGENTS.md\nUserMemorySurvivesMissingCwd.";
+        std::fs::write(temp_config.path().join("AGENTS.md"), user_content).unwrap();
+
+        let segments = load_memory(temp_config.path(), None);
+
+        assert_eq!(
+            segments.len(), 1,
+            "expected exactly the user-scope segment when cwd is None, got: {segments:?}"
+        );
+        assert_eq!(segments[0].label, "User memory");
+        assert_eq!(segments[0].content, user_content);
     }
 
     /// Ticket 51 (mcp-hooks-introspection), docs/adr/0012-hooks-execution-trust-model.md

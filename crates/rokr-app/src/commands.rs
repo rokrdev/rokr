@@ -18,12 +18,24 @@ use std::path::Path;
 
 /// A single discovered custom command: optional YAML-frontmatter metadata
 /// plus the markdown body, which is the prompt template.
+#[derive(Clone)]
 pub struct CustomCommand {
     pub template: String,
+    /// Frontmatter `description:` value, if present.
+    pub description: Option<String>,
+    /// Frontmatter `argument-hint:` value, if present.
+    pub argument_hint: Option<String>,
+    /// Frontmatter `agent:` value, if present. F-017 (pre-ship review):
+    /// parsed and stored for future use, but NOT YET honored anywhere --
+    /// there is no agent-dispatch logic for custom commands yet. This is
+    /// deliberately the cheapest compliant fix (parse + carry the field),
+    /// not an implementation of agent dispatch.
+    pub agent: Option<String>,
 }
 
 /// Discovers and holds user-scope custom commands (markdown files under
 /// `config_dir/commands/`), keyed by filename stem.
+#[derive(Clone)]
 pub struct CommandRegistry {
     commands: HashMap<String, CustomCommand>,
     /// Discovered skill markdown files, keyed by filename stem (skill name),
@@ -85,7 +97,20 @@ impl CommandRegistry {
         };
         let command = self.commands.get(name)?;
         let expanded = expand_template(&command.template, args);
-        Some(resolve_skill_mentions(&expanded, &self.skills))
+        Some(self.resolve_skills(&expanded))
+    }
+
+    /// F-007 (PRD story 10, pre-ship review): resolves `@skill:<name>`
+    /// mentions in ANY text, not just inside a command template's expanded
+    /// body -- [`Self::expand`] above already applies this to a template's
+    /// expansion, but that only runs for `/`-prefixed input naming a
+    /// discovered command. Exposed publicly so callers can apply the same
+    /// mention resolution to a plain prompt the user typed directly (no
+    /// leading `/`, never touches `expand` at all) -- see
+    /// [`resolve_skill_mentions`]'s doc comment for the mention
+    /// syntax/lookup contract this delegates to.
+    pub fn resolve_skills(&self, text: &str) -> String {
+        resolve_skill_mentions(text, &self.skills)
     }
 }
 
@@ -196,25 +221,56 @@ fn expand_template(template: &str, args: &str) -> String {
 /// by `---` lines) off of `contents`; everything after it (or all of
 /// `contents`, if there's no frontmatter) is the template body. Frontmatter
 /// keys are matched as plain `key: value` lines rather than through a real
-/// YAML parser -- deliberately, since the ticket only requires three known
-/// flat string keys and no YAML-parsing crate is already a dependency
+/// YAML parser -- deliberately, since the ticket only requires a handful of
+/// known flat string keys (`description`, `argument-hint`, `agent` -- F-017,
+/// pre-ship review) and no YAML-parsing crate is already a dependency
 /// anywhere in this workspace (checked before choosing this over adding
-/// one; see the ticket report's Assumptions/deviations section).
+/// one; see the ticket report's Assumptions/deviations section). Any other
+/// key is silently ignored; a key with no `:` is skipped rather than
+/// treated as an error, matching this parser's overall tolerant-absence
+/// contract (see `scan_commands_dir`'s doc comment).
 fn parse_command_file(contents: &str) -> CustomCommand {
     let Some(rest) = contents.strip_prefix("---\n") else {
         return CustomCommand {
             template: contents.to_string(),
+            description: None,
+            argument_hint: None,
+            agent: None,
         };
     };
     let Some(end) = rest.find("\n---") else {
         return CustomCommand {
             template: contents.to_string(),
+            description: None,
+            argument_hint: None,
+            agent: None,
         };
     };
+    let frontmatter = &rest[..end];
     let after = &rest[end + "\n---".len()..];
     let body = after.strip_prefix('\n').unwrap_or(after);
+
+    let mut description = None;
+    let mut argument_hint = None;
+    let mut agent = None;
+    for line in frontmatter.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "description" => description = Some(value),
+            "argument-hint" => argument_hint = Some(value),
+            "agent" => agent = Some(value),
+            _ => {}
+        }
+    }
+
     CustomCommand {
         template: body.to_string(),
+        description,
+        argument_hint,
+        agent,
     }
 }
 
@@ -239,6 +295,45 @@ mod tests {
         assert!(
             registry.get("my-command").is_some(),
             "expected registry to discover a command keyed by filename stem \"my-command\""
+        );
+    }
+
+    /// F-017 (pre-ship review): `description`, `argument-hint`, and `agent`
+    /// frontmatter fields must all be parsed and carried on the resulting
+    /// `CustomCommand`, not silently dropped. `agent` is parsed here but not
+    /// yet honored anywhere (no agent-dispatch logic exists for custom
+    /// commands yet -- see `CustomCommand::agent`'s doc comment); this test
+    /// only locks in that the value survives parsing.
+    #[test]
+    fn command_file_frontmatter_description_argument_hint_and_agent_are_parsed() {
+        let temp = tempfile::tempdir().unwrap();
+        let commands_dir = temp.path().join("commands");
+        fs::create_dir_all(&commands_dir).unwrap();
+        fs::write(
+            commands_dir.join("release.md"),
+            "---\ndescription: Cut a release\nargument-hint: <version>\nagent: release-bot\n---\nRelease $1",
+        )
+        .unwrap();
+
+        let registry = CommandRegistry::discover_user_scope(temp.path());
+        let command = registry
+            .get("release")
+            .expect("expected 'release' to be discovered from commands/");
+
+        assert_eq!(
+            command.description.as_deref(),
+            Some("Cut a release"),
+            "expected the 'description' frontmatter field to be parsed"
+        );
+        assert_eq!(
+            command.argument_hint.as_deref(),
+            Some("<version>"),
+            "expected the 'argument-hint' frontmatter field to be parsed"
+        );
+        assert_eq!(
+            command.agent.as_deref(),
+            Some("release-bot"),
+            "expected the 'agent' frontmatter field to be parsed (not yet honored elsewhere)"
         );
     }
 

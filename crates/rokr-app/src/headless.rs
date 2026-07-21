@@ -14,6 +14,13 @@
 //! of the above; this ticket wires every one of those in for real, mirroring
 //! the TUI startup path in `crates/rokr/src/main.rs`.
 
+/// F-005: the `rokr_core::run_tool_loop` `max_iterations` cap every headless
+/// (and, transitively, `rokr-eval`, which drives cases through
+/// [`run_result_object`]) submission runs with -- conservative enough that a
+/// well-behaved multi-step task never hits it, but low enough that a
+/// misbehaving/looping provider can't hang an unattended run indefinitely.
+pub const HEADLESS_MAX_ITERATIONS: u32 = 50;
+
 /// Whether this invocation should launch the TUI or run headless against a
 /// single prompt. See [`select_mode`].
 pub enum Mode {
@@ -170,6 +177,11 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
         cli.dangerously_skip_permissions,
         prompt,
         cwd,
+        // A normal headless `-p` invocation never overrides anything --
+        // ambient model/hooks/data-dir behavior stays byte-for-byte
+        // unchanged from before F-008. Only `rokr-eval` (see
+        // `HeadlessRunOverride`'s doc comment) ever passes `Some(..)`.
+        None,
     )
     .await
     {
@@ -234,6 +246,99 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
     result_object.exit_code()
 }
 
+/// F-008 (pre-ship review): the ambient state an eval-case run must NOT
+/// inherit -- (a) the provider model, which the PRD requires be pinned per
+/// case rather than read off whatever `ROKR_OPENAI_MODEL`/
+/// `ROKR_ANTHROPIC_MODEL` the operator's shell exports, (b) the operator's
+/// real configured hooks (e.g. `UserPromptSubmit`), which must never fire
+/// during an eval case, and (c) the real user data directory, which must
+/// never receive an eval case's session log. `rokr_eval::run_eval` builds
+/// one of these per case (pinned `model`/`provider` from the case file,
+/// an EMPTY `hooks_config`, and a fresh per-case temp `data_dir`) and
+/// passes it to [`run_result_object`]. A normal headless `-p` invocation
+/// (`run`, above) always passes `None`, so ambient behavior for that path
+/// is unchanged byte-for-byte from before this fix.
+pub struct HeadlessRunOverride {
+    /// Pinned model name, forwarded to whichever backend gets selected
+    /// (see `provider`) by temporarily overriding that backend's own
+    /// `ENV_MODEL` var for the duration of the (synchronous)
+    /// `build_provider` call below -- the underlying `OpenAiProvider`/
+    /// `AnthropicProvider` bake their model in at construction time from
+    /// that env var, so there is no other seam to pin it through without a
+    /// wider `rokr-provider` API change.
+    pub model: String,
+    /// `"openai"`/`"anthropic"` (case-insensitive, matching
+    /// `rokr_provider::AnyProvider::from_name`'s own spelling), or `None`
+    /// to let ambient `ROKR_PROVIDER` decide which backend gets selected
+    /// (with `model` still pinned on whichever backend that turns out to
+    /// be).
+    pub provider: Option<String>,
+    /// Replaces the real `config.hooks` entirely for this run -- an EMPTY
+    /// map suppresses every one of the operator's real configured hooks
+    /// (`UserPromptSubmit`, `PreToolUse`, etc.) from firing during an eval
+    /// case.
+    pub hooks_config: std::collections::HashMap<String, Vec<rokr_config::HookEntry>>,
+    /// Replaces `crate::runner::default_data_dir()` for this run -- a
+    /// fresh per-case temp dir so this run's session log never lands under
+    /// the real user data directory.
+    pub data_dir: std::path::PathBuf,
+}
+
+/// RAII guard: temporarily overrides BOTH `rokr_provider::openai::ENV_MODEL`
+/// and `rokr_provider::anthropic::ENV_MODEL` to `model` for as long as it's
+/// alive, restoring each var's PRIOR value (or removing it, if it was unset)
+/// on drop. Both vars are overridden (rather than just the selected
+/// backend's) because which backend `build_provider` actually selects can
+/// depend on `resolved_auth`/`ROKR_PROVIDER` in ways this call site doesn't
+/// want to duplicate -- overriding both guarantees the pinned model applies
+/// no matter which one wins.
+///
+/// Safety/scope note: this mutates process-wide env vars. It's only ever
+/// constructed around the single synchronous `build_provider(..)` call
+/// below (no `.await` point in between), so no concurrently-running task in
+/// this same process can observe the override mid-flight -- but two
+/// `HeadlessRunOverride` runs racing on separate OS threads within the SAME
+/// process could still interleave. `rokr_eval::run_eval` drives its cases
+/// sequentially (never concurrently) for exactly this reason; this is not a
+/// general-purpose thread-safe primitive.
+struct ModelEnvOverride {
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+impl ModelEnvOverride {
+    fn apply(model: &str) -> Self {
+        let vars: [&'static str; 2] =
+            [rokr_provider::openai::ENV_MODEL, rokr_provider::anthropic::ENV_MODEL];
+        let previous = vars
+            .into_iter()
+            .map(|var| {
+                let prior = std::env::var(var).ok();
+                // Safety: see this struct's doc comment -- scoped to the one
+                // synchronous `build_provider` call site, no `.await` in
+                // between, and `rokr-eval` (the only caller that ever
+                // constructs this) drives its cases sequentially.
+                unsafe { std::env::set_var(var, model) };
+                (var, prior)
+            })
+            .collect();
+        Self { previous }
+    }
+}
+
+impl Drop for ModelEnvOverride {
+    fn drop(&mut self) {
+        for (var, prior) in &self.previous {
+            // Safety: see `apply`'s doc comment.
+            unsafe {
+                match prior {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
+}
+
 /// Ticket 58: the bootstrap-and-run logic [`run`] used to have inlined,
 /// taking explicit params instead of `&crate::cli::Cli` +
 /// `std::env::current_dir()` so a caller (headless `main.rs`'s [`run`]
@@ -241,12 +346,19 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
 /// tier / permission mode / cwd this ONE turn runs with. Byte-for-byte the
 /// same bootstrap/run/result-object construction `run` used to do inline;
 /// only the parameter source changed (explicit args here, `&Cli` there).
+///
+/// F-008: `run_override`, when `Some`, is `rokr-eval`'s seam for pinning
+/// model/provider, suppressing real hooks, and redirecting the session's
+/// data dir -- see [`HeadlessRunOverride`]'s doc comment. `None` (every
+/// normal headless `-p` call site) keeps every one of those ambient-derived
+/// exactly as before this fix.
 pub async fn run_result_object(
     agent: crate::cli::AgentTier,
     permission_mode: crate::cli::PermissionMode,
     dangerously_skip_permissions: bool,
     prompt: String,
     cwd: Option<std::path::PathBuf>,
+    run_override: Option<HeadlessRunOverride>,
 ) -> Result<HeadlessRunOutcome, BootstrapError> {
     let started_at = std::time::Instant::now();
 
@@ -264,15 +376,39 @@ pub async fn run_result_object(
 
     let config_dir = rokr_config::default_config_dir();
 
+    // F-007 (PRD story 10, pre-ship review): `@skill:<name>` mentions must
+    // resolve in a plain, directly-typed prompt too, not just inside a
+    // command template's own expansion (`CommandRegistry::expand` already
+    // does this internally for a `/`-prefixed custom command) -- headless
+    // has no template-expansion step at all for a bare `-p "..."` prompt,
+    // so without this a mention would reach the provider completely
+    // unexpanded. Mirrors `crates/rokr/src/main.rs`'s TUI-side `submit`
+    // closure fix for the same finding. `config_dir`/`cwd` ambient
+    // discovery here matches this function's existing (pre-F-008)
+    // precedent of reading `config_dir`-rooted state (agent prompt,
+    // `AGENTS.md` memory, both above/below) unconditionally regardless of
+    // `run_override` -- only `model`/`provider`/`hooks_config`/`data_dir`
+    // are ever overridden for an eval run, see `HeadlessRunOverride`'s doc
+    // comment.
+    let mut command_registry = crate::CommandRegistry::discover_user_scope(&config_dir);
+    if let Some(cwd) = cwd.as_deref() {
+        command_registry.merge_overriding(crate::CommandRegistry::discover_project_scope(cwd));
+    }
+    let prompt = command_registry.resolve_skills(&prompt);
+
     let mut system_prompt = rokr_config::read_agent_prompt(&config_dir, agent.prompt_name())
         .map_err(|err| BootstrapError::Other(format!("failed to read agent prompt: {err}")))?;
 
-    if let Some(cwd) = cwd.as_deref() {
-        for segment in rokr_config::load_memory(&config_dir, cwd) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&format!("# {}\n", segment.label));
-            system_prompt.push_str(&segment.content);
-        }
+    // F-011 (pre-ship review): called unconditionally, not gated behind
+    // `cwd.is_some()` -- a `None` cwd (failed `current_dir()` in `run`,
+    // above) only means project-scope memory can't be found; user-scope
+    // memory (from `config_dir`) has nothing to do with cwd and must still
+    // load. `load_memory` itself skips the cwd-dependent project-scope
+    // segment when `cwd` is `None`.
+    for segment in rokr_config::load_memory(&config_dir, cwd.as_deref()) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&format!("# {}\n", segment.label));
+        system_prompt.push_str(&segment.content);
     }
 
     let repo_map: Option<String> = cwd.as_deref().map(rokr_tools::repo_map::generate);
@@ -283,25 +419,44 @@ pub async fn run_result_object(
         token_store.as_ref(),
         rokr_provider::anthropic::ENV_API_KEY,
     );
-    let built =
-        rokr_provider::build_provider(None, resolved_auth, rokr_provider::RetryPolicy::default());
+    let requested_provider_name = run_override.as_ref().and_then(|o| o.provider.as_deref());
+    // F-008: pin the model `build_provider` bakes into whichever backend it
+    // selects by temporarily overriding both backends' `ENV_MODEL` vars for
+    // the duration of this ONE synchronous call -- see
+    // `ModelEnvOverride`'s doc comment for the exact safety scope. Dropped
+    // (restoring ambient env vars) immediately after `built` is computed;
+    // `model_name` below is read straight off `run_override` rather than
+    // re-reading the env var, so it's correct even after the guard is gone.
+    let built = {
+        let _model_override_guard = run_override.as_ref().map(|o| ModelEnvOverride::apply(&o.model));
+        rokr_provider::build_provider(
+            requested_provider_name,
+            resolved_auth,
+            rokr_provider::RetryPolicy::default(),
+        )
+    };
     let (provider, provider_name, model_name): (
         Result<crate::runner::SharedProvider, String>,
         String,
         String,
     ) = match built {
         Ok(built) => {
-            let (provider_name, model_name) = match &built.selected {
-                rokr_provider::AnyProvider::OpenAi(_) => (
-                    "openai".to_string(),
-                    std::env::var(rokr_provider::openai::ENV_MODEL)
-                        .unwrap_or_else(|_| "unknown".to_string()),
-                ),
-                rokr_provider::AnyProvider::Anthropic(_) => (
-                    "anthropic".to_string(),
-                    std::env::var(rokr_provider::anthropic::ENV_MODEL)
-                        .unwrap_or_else(|_| "unknown".to_string()),
-                ),
+            let provider_name = match &built.selected {
+                rokr_provider::AnyProvider::OpenAi(_) => "openai".to_string(),
+                rokr_provider::AnyProvider::Anthropic(_) => "anthropic".to_string(),
+            };
+            let model_name = match &run_override {
+                Some(run_override) => run_override.model.clone(),
+                None => match &built.selected {
+                    rokr_provider::AnyProvider::OpenAi(_) => {
+                        std::env::var(rokr_provider::openai::ENV_MODEL)
+                            .unwrap_or_else(|_| "unknown".to_string())
+                    }
+                    rokr_provider::AnyProvider::Anthropic(_) => {
+                        std::env::var(rokr_provider::anthropic::ENV_MODEL)
+                            .unwrap_or_else(|_| "unknown".to_string())
+                    }
+                },
             };
             (
                 Ok(std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -319,7 +474,14 @@ pub async fn run_result_object(
     // resumes, it's always a single fresh submission. A store/creation
     // failure degrades gracefully (no persistence, empty session_id) rather
     // than aborting the run, matching the TUI path's own handling.
-    let data_dir = crate::runner::default_data_dir();
+    //
+    // F-008: `run_override.data_dir`, when present, redirects this run's
+    // session log to a per-case temp dir instead of the real user data
+    // directory -- see `HeadlessRunOverride`'s doc comment.
+    let data_dir = run_override
+        .as_ref()
+        .map(|o| o.data_dir.clone())
+        .unwrap_or_else(crate::runner::default_data_dir);
     let store = rokr_session::SessionStore::open(&data_dir);
     let session_handle = match store.create_session() {
         Ok(handle) => {
@@ -362,6 +524,7 @@ pub async fn run_result_object(
         system_prompt,
         repo_map: std::sync::Arc::new(std::sync::Mutex::new(repo_map)),
         last_known_usage: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        last_turn_usage: std::sync::Arc::new(std::sync::Mutex::new(None)),
         config_dir,
         session_handle: std::sync::Arc::new(tokio::sync::RwLock::new(session_handle)),
         turn_index: std::sync::Arc::new(std::sync::Mutex::new(0)),
@@ -372,16 +535,41 @@ pub async fn run_result_object(
         mcp_http_origins: std::sync::Arc::new(std::collections::HashMap::new()),
         // Real hooks config now (ticket 54 hardcoded an empty map) --
         // `PreToolUse` hooks run exactly as in the TUI, per the ticket's
-        // `## Context`.
-        hooks_config: std::sync::Arc::new(config.hooks.clone()),
+        // `## Context`. F-008: `run_override.hooks_config`, when present,
+        // REPLACES this entirely (an eval case must never fire the
+        // operator's real configured hooks) -- see
+        // `HeadlessRunOverride`'s doc comment.
+        hooks_config: std::sync::Arc::new(
+            run_override
+                .as_ref()
+                .map(|o| o.hooks_config.clone())
+                .unwrap_or_else(|| config.hooks.clone()),
+        ),
         agent,
         context_window_size: config.context_window_size,
         auto_compact_threshold: config.auto_compact_threshold,
+        // F-005: headless/eval are unattended, so a misbehaving/looping
+        // provider must not be able to hang the run forever the way an
+        // interactive TUI session (which a human can just interrupt) can
+        // tolerate. `run_result_object` is ALSO `rokr-eval`'s per-case
+        // driver (see its own doc comment), so this cap applies to eval
+        // runs too without `rokr-eval` needing its own copy.
+        max_iterations: Some(HEADLESS_MAX_ITERATIONS),
     };
 
     let run_result = runner.run_submission(prompt, permission.clone()).await;
     let duration_ms = started_at.elapsed().as_millis() as u64;
-    let usage = runner.last_known_usage.lock().unwrap().unwrap_or_default();
+    // F-001: the FULL turn's cumulative usage (every `Provider::send` round
+    // trip this one submission made), not `last_known_usage`'s final-call-only
+    // figure -- see `SessionRunner::last_turn_usage`'s doc comment. Headless
+    // drives exactly one submission per process, so this is unambiguously
+    // "this run's usage".
+    let usage = runner
+        .last_turn_usage
+        .lock()
+        .unwrap()
+        .map(|turn_usage| turn_usage.cumulative)
+        .unwrap_or_default();
 
     // `run_tool_loop` does not abort on a denied gated tool call -- it
     // records an error `ToolResult` and loops again, so `run_submission`
@@ -393,11 +581,17 @@ pub async fn run_result_object(
         Ok(reply) if permission.denied() => (crate::result_schema::Subtype::ErrorPermission, reply),
         Ok(reply) => (crate::result_schema::Subtype::Success, reply),
         Err(err) if permission.denied() => (crate::result_schema::Subtype::ErrorPermission, err),
-        // No real max-turns cap exists in `rokr_core::run_tool_loop` today
-        // (out of this ticket's scope to add one) -- `ErrorMaxTurns` is the
-        // closest fit among the three subtypes the ticket's `## Context`
-        // documents for any OTHER `run_submission` failure (e.g. a
-        // provider error), see `Subtype`'s own doc comment.
+        // F-005: `run_tool_loop` now genuinely enforces `max_iterations`
+        // (`HEADLESS_MAX_ITERATIONS` above), returning
+        // `RunToolLoopError::MaxIterationsExceeded` (stringified by
+        // `run_submission`'s `.map_err(|err| err.to_string())`) once it's
+        // exhausted -- this is the case that error text now actually
+        // represents. `ErrorMaxTurns` remains the closest fit among
+        // `Subtype`'s three documented values for any OTHER
+        // `run_submission` failure too (e.g. a genuine provider error),
+        // since the schema (`docs/adr/0013-headless-output-schema.md`) has
+        // no fourth "generic error" subtype -- see `Subtype`'s own doc
+        // comment.
         Err(err) => (crate::result_schema::Subtype::ErrorMaxTurns, err),
     };
     let is_error = subtype != crate::result_schema::Subtype::Success;
@@ -463,10 +657,10 @@ pub fn build_permission_requester(
 /// `PricingEntry` (what `calculate_cost` actually takes) -- the two crates
 /// have no dependency edge on each other (see `ModelPricing`'s own doc
 /// comment in `crates/rokr-config/src/lib.rs`), so there's no `From`/`Into`
-/// between them to reuse. Same four fields, same names, same types;
-/// duplicated in `crates/rokr/src/main.rs` for the same reason (that file
-/// already depends on both crates too).
-fn model_pricing_to_pricing_entry(
+/// between them to reuse. Same four fields, same names, same types. Public
+/// so `crates/rokr/src/main.rs` (which already depends on both crates too)
+/// can reuse this instead of keeping its own duplicate.
+pub fn model_pricing_to_pricing_entry(
     pricing: &rokr_config::ModelPricing,
 ) -> rokr_core::pricing::PricingEntry {
     rokr_core::pricing::PricingEntry {
