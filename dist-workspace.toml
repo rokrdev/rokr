@@ -1,0 +1,26 @@
+[workspace]
+members = ["cargo:crates/rokr"]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# Ticket 66 (cargo-dist-release-spine): GitHub Actions workflow generation
+# is explicitly out of scope for this ticket. `ci = "github"` is still
+# needed (not scope creep) because the shell/homebrew installers compute
+# their download URLs from the configured hosting backend -- but we don't
+# want `cargo dist plan`/`init` to require (or write) an actual
+# `.github/workflows/release.yml`. `allow-dirty = ["ci"]` suppresses that
+# generated-file up-to-date check so `cargo dist plan` succeeds without
+# ever generating CI, leaving workflow generation to a later ops ticket.
+allow-dirty = ["ci"]
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
