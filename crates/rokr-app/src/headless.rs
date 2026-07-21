@@ -306,13 +306,26 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
         .filter(|message| message.role == rokr_core::Role::Assistant)
         .count() as u32;
 
+    // Ticket 57 (cost-command-and-headless-reporting): resolves this run's
+    // own model into a dollar rate (falling back to `calculate_cost`'s own
+    // `None` -> `$0.00` handling for an unpriced/unknown model) and applies
+    // it to the SAME `usage` value already used for `UsageObject` above --
+    // `rokr_core::Usage` is `Copy`, so no re-fetch off `runner.last_known_usage`
+    // is needed. Replaces this ticket's predecessor's `cost_usd: 0.0`
+    // placeholder.
+    let pricing_entry = config
+        .model_pricing
+        .get(&model_name)
+        .map(model_pricing_to_pricing_entry);
+    let cost_usd = rokr_core::pricing::calculate_cost(usage, pricing_entry.as_ref());
+
     let result_object = crate::result_schema::ResultObject {
         subtype,
         session_id,
         result: result_text,
         is_error,
         usage: crate::result_schema::UsageObject::from(usage),
-        cost_usd: 0.0,
+        cost_usd,
         num_turns,
         duration_ms,
     };
@@ -381,6 +394,25 @@ pub fn build_permission_requester(
         mode,
         denied: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
+}
+
+/// Ticket 57: field-copy bridge from `rokr-config`'s `ModelPricing` (the
+/// on-disk-configurable pricing table entry) to `rokr-core::pricing`'s
+/// `PricingEntry` (what `calculate_cost` actually takes) -- the two crates
+/// have no dependency edge on each other (see `ModelPricing`'s own doc
+/// comment in `crates/rokr-config/src/lib.rs`), so there's no `From`/`Into`
+/// between them to reuse. Same four fields, same names, same types;
+/// duplicated in `crates/rokr/src/main.rs` for the same reason (that file
+/// already depends on both crates too).
+fn model_pricing_to_pricing_entry(
+    pricing: &rokr_config::ModelPricing,
+) -> rokr_core::pricing::PricingEntry {
+    rokr_core::pricing::PricingEntry {
+        input_price_per_token: pricing.input_price_per_token,
+        output_price_per_token: pricing.output_price_per_token,
+        cache_read_price_per_token: pricing.cache_read_price_per_token,
+        cache_write_price_per_token: pricing.cache_write_price_per_token,
+    }
 }
 
 #[cfg(test)]

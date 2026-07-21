@@ -127,6 +127,14 @@ async fn main() -> ExitCode {
             // `/hooks` can list every configured hook without disturbing
             // either of the two clones above.
             let command_hooks_config = hooks_config.clone();
+            // Ticket 57 (cost-command-and-headless-reporting): `config.model_pricing`
+            // wasn't threaded into `command`'s closure before this ticket --
+            // `/cost`/`/cost --all` need it to resolve a session's model
+            // string into a dollar rate, mirroring `hooks_config`'s own
+            // load-once-and-`Arc`-clone pattern immediately above.
+            let model_pricing: Arc<std::collections::HashMap<String, rokr_config::ModelPricing>> =
+                Arc::new(config.model_pricing.clone());
+            let command_model_pricing = model_pricing.clone();
 
             // `SessionStart` (PRD "Hooks"; architect decision: "SessionStart
             // at startup"): fires once, here, before the TUI ever renders.
@@ -654,6 +662,7 @@ async fn main() -> ExitCode {
                 let mcp_server_handles = command_mcp_server_handles.clone();
                 let mcp_configs = command_mcp_configs.clone();
                 let hooks_config = command_hooks_config.clone();
+                let model_pricing = command_model_pricing.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
@@ -835,6 +844,40 @@ async fn main() -> ExitCode {
                         }
                         "/mcp" => format_mcp_listing(&mcp_configs, &mcp_server_handles),
                         "/hooks" => format_hooks_listing(&hooks_config),
+                        // Ticket 57: `/cost` folds the CURRENT session's own
+                        // `UsageRecord`s (a fresh raw read off disk, not the
+                        // in-memory `last_known_usage`, which only carries
+                        // the LAST turn's figure -- see
+                        // `fold_session_usage_and_model`'s doc comment) into
+                        // a token-by-type breakdown, cache-hit rate, and
+                        // dollar estimate against its own model's pricing.
+                        "/cost" => {
+                            match session_handle.read().await.as_ref().map(|handle| {
+                                handle.session_id().to_string()
+                            }) {
+                                Some(session_id) => {
+                                    let records = read_session_records(&data_dir, &session_id);
+                                    let (usage, model) = fold_session_usage_and_model(&records);
+                                    let pricing_entry = model_pricing
+                                        .get(&model)
+                                        .map(model_pricing_to_pricing_entry);
+                                    let cost_usd = rokr_core::pricing::calculate_cost(
+                                        usage,
+                                        pricing_entry.as_ref(),
+                                    );
+                                    format_cost_breakdown(usage, cost_usd)
+                                }
+                                None => "No active session.".to_string(),
+                            }
+                        }
+                        // Ticket 57: `/cost --all` extends the same fold
+                        // across every session `SessionStore::list_sessions`
+                        // knows about, pricing each session against its OWN
+                        // model before summing dollar totals (see
+                        // `format_cost_all_summary`'s doc comment for why).
+                        "/cost --all" => {
+                            format_cost_all_summary(&data_dir, &store, &model_pricing).await
+                        }
                         _ => format!("unknown command: {input}"),
                     }
                 }
@@ -1436,6 +1479,148 @@ async fn set_active_provider(
     Ok(())
 }
 
+/// Ticket 57 (cost-command-and-headless-reporting): sums every `Turn`
+/// record's `UsageRecord` across `records` into one `rokr_core::Usage`,
+/// plus the model string off the `Header` record (empty if none is
+/// present). Deliberately NOT `rokr_session::fold` -- that function only
+/// keeps the LAST known usage per session (overwriting on every `Turn`, see
+/// its own doc comment), which is exactly wrong for `/cost`'s
+/// token-by-type breakdown, which needs the SUM across the whole session's
+/// history. A session's model can't change mid-session in today's schema
+/// (no per-`Turn` model field, same limitation `SessionIndexEntry::last_model`
+/// already documents), so a single `Header`-derived string is enough.
+fn fold_session_usage_and_model(records: &[rokr_session::SessionRecord]) -> (rokr_core::Usage, String) {
+    let mut usage = rokr_core::Usage::default();
+    let mut model = String::new();
+    for record in records {
+        match record {
+            rokr_session::SessionRecord::Header {
+                model: header_model, ..
+            } => {
+                model = header_model.clone();
+            }
+            rokr_session::SessionRecord::Turn {
+                usage: turn_usage, ..
+            } => {
+                let turn_usage: rokr_core::Usage = (*turn_usage).into();
+                usage.input_tokens += turn_usage.input_tokens;
+                usage.output_tokens += turn_usage.output_tokens;
+                usage.cache_read_tokens += turn_usage.cache_read_tokens;
+                usage.cache_write_tokens += turn_usage.cache_write_tokens;
+            }
+            rokr_session::SessionRecord::Compaction { .. }
+            | rokr_session::SessionRecord::Rollback { .. }
+            | rokr_session::SessionRecord::Checkpoint { .. } => {}
+        }
+    }
+    (usage, model)
+}
+
+/// Reads and parses one session's raw `session.jsonl` log directly off disk
+/// (`<data_dir>/sessions/<session_id>/session.jsonl`), the same
+/// read-every-line-skip-unparseable pattern `rokr_session::SessionStore`'s
+/// own `resume_session`/`search` use internally -- replicated here rather
+/// than reused because neither of those methods returns the raw
+/// `Vec<SessionRecord>` `/cost` needs (they return already-folded output),
+/// and adding a new public method to `rokr-session` is out of this ticket's
+/// files-touched scope. A missing/unreadable file yields an empty `Vec`
+/// (mirrors `SessionStore::list_sessions`'s own "not found" -> empty
+/// handling) rather than surfacing an error `/cost` would have nowhere
+/// good to show.
+fn read_session_records(
+    data_dir: &std::path::Path,
+    session_id: &str,
+) -> Vec<rokr_session::SessionRecord> {
+    let session_jsonl_path = data_dir.join("sessions").join(session_id).join("session.jsonl");
+    let contents = std::fs::read_to_string(&session_jsonl_path).unwrap_or_default();
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+        .collect()
+}
+
+/// Ticket 57: field-copy bridge from `rokr-config`'s `ModelPricing` (the
+/// on-disk-configurable pricing table entry) to `rokr-core::pricing`'s
+/// `PricingEntry` (what `calculate_cost` actually takes) -- the two crates
+/// have no dependency edge on each other (see `ModelPricing`'s own doc
+/// comment), so there's no `From`/`Into` between them to reuse. Same four
+/// fields, same names, same types; duplicated in `crates/rokr-app/src/headless.rs`
+/// for the same reason (that file already depends on both crates too).
+fn model_pricing_to_pricing_entry(
+    pricing: &rokr_config::ModelPricing,
+) -> rokr_core::pricing::PricingEntry {
+    rokr_core::pricing::PricingEntry {
+        input_price_per_token: pricing.input_price_per_token,
+        output_price_per_token: pricing.output_price_per_token,
+        cache_read_price_per_token: pricing.cache_read_price_per_token,
+        cache_write_price_per_token: pricing.cache_write_price_per_token,
+    }
+}
+
+/// Formats `/cost`'s token-by-type breakdown, cache-hit rate, and estimated
+/// dollar cost for one already-folded `usage` total. Cache-hit-rate formula
+/// mirrors `rokr-provider/src/anthropic.rs`'s own per-call calculation
+/// exactly (fraction of total prompt tokens -- input + cache-read +
+/// cache-write -- served from cache).
+fn format_cost_breakdown(usage: rokr_core::Usage, cost_usd: f64) -> String {
+    let total_prompt_tokens =
+        usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+    let cache_hit_rate = if total_prompt_tokens > 0 {
+        usage.cache_read_tokens as f64 / total_prompt_tokens as f64
+    } else {
+        0.0
+    };
+    format!(
+        "Input tokens: {}\nOutput tokens: {}\nCache-read tokens: {}\nCache-write tokens: {}\nCache hit rate: {:.1}%\nEstimated cost: ${:.4}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+        cache_hit_rate * 100.0,
+        cost_usd
+    )
+}
+
+/// `/cost --all`: extends the same fold across EVERY session on disk
+/// (`store.list_sessions()`, PRD decision 2's index rather than a directory
+/// scan). Token counts are summed freely across sessions, but each
+/// session's dollar cost is computed against ITS OWN model's pricing before
+/// summing the dollar totals -- sessions can have different models/prices,
+/// so applying one session's rate to another's tokens would misprice it.
+async fn format_cost_all_summary(
+    data_dir: &std::path::Path,
+    store: &rokr_session::SessionStore,
+    model_pricing: &std::collections::HashMap<String, rokr_config::ModelPricing>,
+) -> String {
+    let entries = match store.list_sessions() {
+        Ok(entries) => entries,
+        Err(err) => return format!("failed to list sessions: {err}"),
+    };
+    if entries.is_empty() {
+        return "No sessions found.".to_string();
+    }
+
+    let mut total_usage = rokr_core::Usage::default();
+    let mut total_cost_usd = 0.0;
+    for entry in &entries {
+        let records = read_session_records(data_dir, &entry.session_id);
+        let (usage, model) = fold_session_usage_and_model(&records);
+        let pricing_entry = model_pricing.get(&model).map(model_pricing_to_pricing_entry);
+        total_cost_usd += rokr_core::pricing::calculate_cost(usage, pricing_entry.as_ref());
+        total_usage.input_tokens += usage.input_tokens;
+        total_usage.output_tokens += usage.output_tokens;
+        total_usage.cache_read_tokens += usage.cache_read_tokens;
+        total_usage.cache_write_tokens += usage.cache_write_tokens;
+    }
+
+    format!(
+        "Sessions: {}\n{}",
+        entries.len(),
+        format_cost_breakdown(total_usage, total_cost_usd)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1464,6 +1649,72 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Ticket 57 (cost-command-and-headless-reporting): `/cost`'s token
+    /// totals must be a SUM across every `Turn` record's `UsageRecord`, not
+    /// the last-known figure `rokr_session::fold` keeps (that function
+    /// overwrites `last_known_usage` on every `Turn`, see its own doc
+    /// comment) -- this proves the new, standalone summing fold actually
+    /// adds three turns' worth of each of the four token fields together,
+    /// and separately resolves the model string off the `Header` record.
+    #[test]
+    fn cost_command_folds_current_session_usage_records_into_token_and_dollar_summary() {
+        let records = vec![
+            rokr_session::SessionRecord::Header {
+                schema_version: 2,
+                session_id: "sess-1".to_string(),
+                created_at: "0".to_string(),
+                project_path: "/tmp/project".to_string(),
+                agent_tier: "plan".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+            },
+            rokr_session::SessionRecord::Turn {
+                messages: vec![],
+                usage: UsageRecord {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_tokens: 10,
+                    cache_write_tokens: 5,
+                },
+                timestamp: "1".to_string(),
+            },
+            rokr_session::SessionRecord::Turn {
+                messages: vec![],
+                usage: UsageRecord {
+                    input_tokens: 200,
+                    output_tokens: 75,
+                    cache_read_tokens: 20,
+                    cache_write_tokens: 0,
+                },
+                timestamp: "2".to_string(),
+            },
+            rokr_session::SessionRecord::Turn {
+                messages: vec![],
+                usage: UsageRecord {
+                    input_tokens: 300,
+                    output_tokens: 125,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 15,
+                },
+                timestamp: "3".to_string(),
+            },
+        ];
+
+        let (usage, model) = fold_session_usage_and_model(&records);
+
+        assert_eq!(usage.input_tokens, 600, "input tokens must be summed across all turns");
+        assert_eq!(usage.output_tokens, 250, "output tokens must be summed across all turns");
+        assert_eq!(
+            usage.cache_read_tokens, 30,
+            "cache-read tokens must be summed across all turns"
+        );
+        assert_eq!(
+            usage.cache_write_tokens, 20,
+            "cache-write tokens must be summed across all turns"
+        );
+        assert_eq!(model, "gpt-4o-mini", "model must be resolved off the Header record");
     }
 
     #[test]

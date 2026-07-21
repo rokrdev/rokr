@@ -198,6 +198,97 @@ async fn json_output_format_produces_one_parseable_result_object_with_required_f
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
 
+/// Ticket 57 (cost-command-and-headless-reporting): the JSON result
+/// object's `cost_usd` must be computed via `rokr_core::pricing::calculate_cost`
+/// against the run's own reported usage -- NOT the `0.0` placeholder ticket
+/// 55 hardcoded. The test above
+/// (`json_output_format_produces_one_parseable_result_object_with_required_fields`)
+/// also asserts `cost_usd == 0.0`, but that's a fake-green for THIS
+/// ticket's wiring: its mocked response carries no `usage` object at all,
+/// so `cost_usd` would be `0.0` regardless of whether real pricing math is
+/// wired in (zero tokens * any rate is still zero). This test uses
+/// `gpt-4o-mini` -- one of the two models with non-zero entries in
+/// `rokr_config::default_model_pricing` (the other, `claude-3-5-sonnet-20241022`,
+/// is the Anthropic backend, not exercised by this OpenAI-mock harness) --
+/// AND mocks a real, non-zero `usage` object, so a genuinely non-zero
+/// `cost_usd` can only appear if the pricing math actually ran.
+#[tokio::test]
+async fn headless_json_result_cost_usd_matches_pricing_math_for_run_usage() {
+    const MARKER: &str = "HeadlessCostUsdReplyMarker3321";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": MARKER}}],
+            "usage": {
+                "prompt_tokens": 800000,
+                "completion_tokens": 500000,
+                "prompt_tokens_details": { "cached_tokens": 200000 }
+            }
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("cost-usd-home");
+    let xdg_config_home = unique_temp_dir("cost-usd-xdg-config-home");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("-p")
+        .arg("say hi")
+        .arg("--output-format")
+        .arg("json")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value =
+        serde_json::from_str(stdout.trim_end()).expect("stdout must be one parseable JSON object");
+
+    // The same `gpt-4o-mini` pricing entry `rokr_config::default_model_pricing`
+    // hardcodes (that function is private to `rokr-config`, so this
+    // duplicates its literal per-token rates rather than calling it) and
+    // the exact usage the mocked response above reports, run through the
+    // SAME `calculate_cost` function `crates/rokr-app/src/headless.rs`
+    // must now call.
+    let usage = rokr_core::Usage {
+        input_tokens: 800_000,
+        output_tokens: 500_000,
+        cache_read_tokens: 200_000,
+        cache_write_tokens: 0,
+    };
+    let pricing = rokr_core::pricing::PricingEntry {
+        input_price_per_token: 0.000_000_15,
+        output_price_per_token: 0.000_000_6,
+        cache_read_price_per_token: 0.000_000_075,
+        cache_write_price_per_token: 0.000_000_15,
+    };
+    let expected_cost_usd = rokr_core::pricing::calculate_cost(usage, Some(&pricing));
+    assert!(
+        expected_cost_usd > 0.0,
+        "test setup bug: expected a non-zero priced cost, got {expected_cost_usd}"
+    );
+
+    let actual_cost_usd = result["cost_usd"]
+        .as_f64()
+        .expect("cost_usd must be a JSON number");
+    assert!(
+        (actual_cost_usd - expected_cost_usd).abs() < 1e-9,
+        "expected cost_usd ({actual_cost_usd}) to match calculate_cost's own result \
+         ({expected_cost_usd}) for this run's usage, got full result: {result}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
 /// Ticket 55: `--output-format stream-json` against the same kind of
 /// scripted provider must print JSONL -- every line but the last a
 /// parseable JSON "event" object -- with the LAST line being a full,

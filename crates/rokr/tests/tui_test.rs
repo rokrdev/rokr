@@ -11729,3 +11729,431 @@ async fn mcp_tool_on_auto_approve_list_executes_without_permission_prompt() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// Ticket 57 (cost-command-and-headless-reporting) acceptance test: `/cost`
+/// must print a token-by-type breakdown, cache-hit rate, and estimated
+/// dollar cost folded from the current session's `UsageRecord`s. Mocks a
+/// single turn against `gpt-4o-mini` (a model with non-zero default pricing
+/// -- see `rokr_config::default_model_pricing`) reporting an EXACT,
+/// hand-picked usage (input=800_000, cache-read=200_000, output=500_000,
+/// cache-write=0) chosen so the cache-hit rate (200_000 / (800_000 +
+/// 200_000) = 20.0%) and dollar cost (800_000*$0.00000015 +
+/// 500_000*$0.0000006 + 200_000*$0.000000075 = $0.4350) both land on clean,
+/// unambiguous decimal values -- no floating-point rounding-boundary risk
+/// in the assertions below.
+#[tokio::test]
+async fn cost_command_prints_token_breakdown_cache_hit_rate_and_dollar_estimate() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let reply_text = "CostCommandReplyMarker8834";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-cost",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": reply_text },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 800000,
+                "completion_tokens": 500000,
+                "prompt_tokens_details": { "cached_tokens": 200000 }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-cost-command");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-cost-command");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"trigger the turn\r")
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(reply_text),
+        "expected pty output to contain the mocked assistant reply, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/cost\r")
+        .expect("failed to write /cost to pty");
+
+    let cost_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < cost_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Cache hit rate") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("800000"),
+        "expected /cost output to contain the input token count, got: {output:?}"
+    );
+    assert!(
+        output.contains("500000"),
+        "expected /cost output to contain the output token count, got: {output:?}"
+    );
+    assert!(
+        output.contains("200000"),
+        "expected /cost output to contain the cache-read token count, got: {output:?}"
+    );
+    assert!(
+        output.contains("20.0%"),
+        "expected /cost output to contain the cache-hit-rate figure, got: {output:?}"
+    );
+    assert!(
+        output.contains("0.4350"),
+        "expected /cost output to contain the estimated dollar cost, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 57 (cost-command-and-headless-reporting) acceptance test: `/cost
+/// --all` must fold usage across EVERY session on disk, not just the
+/// currently active one. Pre-seeds two fixture sessions (A and B) directly
+/// under `<data_dir>/sessions/`, each with its own `session.jsonl` AND a
+/// combined `sessions/index.jsonl` entry (mirrors
+/// `resume_without_confirm_warns_and_confirm_swaps_transcript_and_writer`'s
+/// own fixture-seeding pattern -- `SessionStore::list_sessions`, which
+/// `/cost --all` uses to enumerate every session, reads only the index, not
+/// a directory scan). Both fixtures use `gpt-4o-mini` (non-zero default
+/// pricing). Neither fixture's individual totals could satisfy the
+/// assertions below alone -- only their SUM (input=4000, output=600,
+/// cache-read=400, cache_hit_rate=400/4400=9.1%, cost=$0.0010) proves both
+/// contributed. No prompt is submitted in this test (the freshly-created
+/// active session therefore contributes zero usage of its own, and a mock
+/// server is wired up only so provider startup has a syntactically valid
+/// base URL to point at -- it never receives a request).
+#[tokio::test]
+async fn cost_all_flag_folds_every_session_on_disk() {
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+
+    let home = unique_temp_dir("home-cost-all");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-cost-all");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-cost-all");
+
+    let session_a_id = "01FIXTURECOSTALLSESSIONAAA";
+    let session_b_id = "01FIXTURECOSTALLSESSIONBBB";
+    let sessions_root = xdg_data_home.join("rokr").join("sessions");
+    std::fs::create_dir_all(&sessions_root).expect("failed to create fixture sessions root");
+
+    let session_a_header = rokr_session::SessionRecord::Header {
+        schema_version: 2,
+        session_id: session_a_id.to_string(),
+        created_at: "2026-07-21T01:00:00Z".to_string(),
+        project_path: "/tmp/fixture-project-a".to_string(),
+        agent_tier: "plan".to_string(),
+        provider: "openai".to_string(),
+        model: "gpt-4o-mini".to_string(),
+    };
+    let session_a_turn = rokr_session::SessionRecord::Turn {
+        messages: vec![rokr_core::Message::user_text("sessionaprompt")],
+        usage: rokr_session::UsageRecord {
+            input_tokens: 1000,
+            output_tokens: 200,
+            cache_read_tokens: 100,
+            cache_write_tokens: 0,
+        },
+        timestamp: "2026-07-21T01:00:01Z".to_string(),
+    };
+    let session_a_dir = sessions_root.join(session_a_id);
+    std::fs::create_dir_all(&session_a_dir).expect("failed to create session A fixture dir");
+    std::fs::write(
+        session_a_dir.join("session.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&session_a_header).unwrap(),
+            serde_json::to_string(&session_a_turn).unwrap(),
+        ),
+    )
+    .expect("failed to write session A fixture session.jsonl");
+
+    let session_b_header = rokr_session::SessionRecord::Header {
+        schema_version: 2,
+        session_id: session_b_id.to_string(),
+        created_at: "2026-07-21T02:00:00Z".to_string(),
+        project_path: "/tmp/fixture-project-b".to_string(),
+        agent_tier: "plan".to_string(),
+        provider: "openai".to_string(),
+        model: "gpt-4o-mini".to_string(),
+    };
+    let session_b_turn = rokr_session::SessionRecord::Turn {
+        messages: vec![rokr_core::Message::user_text("sessionbprompt")],
+        usage: rokr_session::UsageRecord {
+            input_tokens: 3000,
+            output_tokens: 400,
+            cache_read_tokens: 300,
+            cache_write_tokens: 0,
+        },
+        timestamp: "2026-07-21T02:00:01Z".to_string(),
+    };
+    let session_b_dir = sessions_root.join(session_b_id);
+    std::fs::create_dir_all(&session_b_dir).expect("failed to create session B fixture dir");
+    std::fs::write(
+        session_b_dir.join("session.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&session_b_header).unwrap(),
+            serde_json::to_string(&session_b_turn).unwrap(),
+        ),
+    )
+    .expect("failed to write session B fixture session.jsonl");
+
+    let session_a_index_entry = rokr_session::SessionIndexEntry {
+        session_id: session_a_id.to_string(),
+        project_path: "/tmp/fixture-project-a".to_string(),
+        created_at: "2026-07-21T01:00:00Z".to_string(),
+        updated_at: "2026-07-21T01:00:01Z".to_string(),
+        title: "sessionaprompt".to_string(),
+        turn_count: 1,
+        last_model: "gpt-4o-mini".to_string(),
+    };
+    let session_b_index_entry = rokr_session::SessionIndexEntry {
+        session_id: session_b_id.to_string(),
+        project_path: "/tmp/fixture-project-b".to_string(),
+        created_at: "2026-07-21T02:00:00Z".to_string(),
+        updated_at: "2026-07-21T02:00:01Z".to_string(),
+        title: "sessionbprompt".to_string(),
+        turn_count: 1,
+        last_model: "gpt-4o-mini".to_string(),
+    };
+    std::fs::write(
+        sessions_root.join("index.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&session_a_index_entry).unwrap(),
+            serde_json::to_string(&session_b_index_entry).unwrap(),
+        ),
+    )
+    .expect("failed to write fixture index.jsonl");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/cost --all\r")
+        .expect("failed to write /cost --all to pty");
+
+    let cost_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < cost_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Cache hit rate") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("4000"),
+        "expected /cost --all output to contain the combined input token count (1000 + 3000 \
+         from both fixture sessions), got: {output:?}"
+    );
+    assert!(
+        output.contains("600"),
+        "expected /cost --all output to contain the combined output token count (200 + 400 \
+         from both fixture sessions), got: {output:?}"
+    );
+    assert!(
+        output.contains("400"),
+        "expected /cost --all output to contain the combined cache-read token count (100 + 300 \
+         from both fixture sessions), got: {output:?}"
+    );
+    assert!(
+        output.contains("9.1%"),
+        "expected /cost --all output to contain the combined cache-hit-rate figure \
+         (400 / (4000 + 400) = 9.1%), got: {output:?}"
+    );
+    assert!(
+        output.contains("0.0010"),
+        "expected /cost --all output to contain the combined estimated dollar cost, got: \
+         {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+}
