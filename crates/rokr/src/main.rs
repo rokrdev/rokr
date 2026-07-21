@@ -1,3 +1,5 @@
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -513,6 +515,15 @@ async fn main() -> ExitCode {
             // takes ownership of the original binding, same reasoning as
             // `command_provider` above.
             let command_config_dir = config_dir.clone();
+            // Ticket 62 (memory-slash-command-opens-editor): `/memory`'s
+            // path-resolver closure (built below, after `submit`/`command`)
+            // needs its own clones of `cwd` and `config_dir` -- cloned here,
+            // before `submit`'s `move` closure and the `runner` struct
+            // literal below take ownership of the originals (`config_dir`
+            // in particular is moved wholesale into `SessionRunner`), same
+            // reasoning as `command_config_dir`/`command_provider` above.
+            let memory_command_cwd = cwd.clone();
+            let memory_command_config_dir = config_dir.clone();
             // Ticket 40 (prompt-history): `on_history_append`'s closure
             // (built below, after `submit`/`command`) needs its own clone
             // of `data_dir`, cloned here before `submit`'s `move` closure
@@ -960,12 +971,30 @@ async fn main() -> ExitCode {
                 }
             };
 
+            // Ticket 62 (memory-slash-command-opens-editor): path
+            // resolution/creation is main.rs's job (`resolve_memory_path`
+            // above) so rokr-tui's `event_loop` stays decoupled from
+            // cwd/AGENTS.md specifics -- it just calls this synchronous
+            // closure right before suspending the terminal. Assumption: if
+            // `cwd` couldn't be resolved at startup (see its own doc
+            // comment), falls back to a user-scope `config_dir/AGENTS.md`
+            // rather than failing `/memory` outright -- a reasonable
+            // default for that rare case, not a scope rokr-config's
+            // existing read-only memory loading otherwise defines.
+            let resolve_memory_path_for_tui = move || -> io::Result<PathBuf> {
+                let dir = memory_command_cwd
+                    .as_deref()
+                    .unwrap_or(&memory_command_config_dir);
+                resolve_memory_path(dir)
+            };
+
             let run_result = rokr_tui::run(
                 submit,
                 command,
                 prompt_history,
                 on_history_append,
                 status_rx,
+                resolve_memory_path_for_tui,
             )
             .await;
 
@@ -1002,6 +1031,23 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Ticket 62 (memory-slash-command-opens-editor): resolves `/memory`'s edit
+/// target -- project-scope only (`cwd.join("AGENTS.md")`), deliberately with
+/// no fallback to `CLAUDE.md`. That fallback (see
+/// `rokr_config::load_project_context`) is a *read* convenience for
+/// assembling the system prompt when no `AGENTS.md` exists yet; `/memory`
+/// should never silently start editing a differently-named file the user
+/// didn't ask for. Creates an empty file if none exists yet (the ticket's
+/// "creating it if absent" requirement) but never truncates/overwrites an
+/// already-existing file.
+fn resolve_memory_path(cwd: &Path) -> io::Result<PathBuf> {
+    let path = cwd.join("AGENTS.md");
+    if !path.exists() {
+        std::fs::write(&path, "")?;
+    }
+    Ok(path)
 }
 
 /// F-002: gates `/mcp reconnect <server>` to `Degraded` servers only --
@@ -2970,6 +3016,44 @@ mod tests {
             "expected the pending unflushed turn appended to session A before the first jump \
              to have been flushed to session A's session.jsonl by handle_resume_command's \
              F-007 origin-flush, and therefore visible after re-jumping back to A"
+        );
+    }
+
+    /// Ticket 62 (memory-slash-command-opens-editor): `resolve_memory_path`
+    /// is project-scope only (`cwd.join("AGENTS.md")`, no CLAUDE.md
+    /// fallback -- that fallback belongs to `load_project_context`'s
+    /// system-prompt *read* convenience, not to `/memory`'s edit target).
+    /// Covers both halves of "creating it if absent": when no file exists
+    /// yet, the path is resolved AND an empty file is created there; when a
+    /// file already exists with content, the same path is resolved but the
+    /// existing content is left untouched (not clobbered/truncated) --
+    /// without this second assertion, an implementation that unconditionally
+    /// `fs::write`s an empty string would pass just as easily as the correct
+    /// create-if-absent one.
+    #[test]
+    fn memory_command_resolves_project_scope_file_path_creating_it_if_absent() {
+        let cwd = unique_temp_dir("memory-command-resolve");
+
+        let resolved = resolve_memory_path(&cwd).expect("should resolve/create the memory path");
+        let expected = cwd.join("AGENTS.md");
+        assert_eq!(resolved, expected, "should resolve to <cwd>/AGENTS.md");
+        assert!(expected.exists(), "AGENTS.md should have been created");
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "",
+            "a freshly created AGENTS.md should be empty"
+        );
+
+        let existing_content = "pre-existing project memory content, must not be clobbered";
+        std::fs::write(&expected, existing_content).unwrap();
+
+        let resolved_again =
+            resolve_memory_path(&cwd).expect("should resolve the already-existing memory path");
+        assert_eq!(resolved_again, expected, "should still resolve to <cwd>/AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            existing_content,
+            "resolving an already-existing AGENTS.md must not truncate/clobber its contents"
         );
     }
 }

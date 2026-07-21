@@ -12369,3 +12369,197 @@ async fn cost_all_flag_folds_every_session_on_disk() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&xdg_data_home);
 }
+
+/// Ticket 62 (memory-slash-command-opens-editor) acceptance test: typing
+/// `/memory` and pressing Enter suspends the TUI (mirroring ticket 42's
+/// Ctrl+E editor keybinding), spawns the scripted `$EDITOR` stand-in
+/// directly against the project-scope memory file (`<cwd>/AGENTS.md`,
+/// creating it first since `project_dir` deliberately has no pre-existing
+/// AGENTS.md), and on the script's exit restores the terminal -- verified
+/// both by the scripted editor's marker line landing in the real on-disk
+/// file (not routed back through the prompt buffer/rendered output, unlike
+/// Ctrl+E's scratch-buffer round trip) and by the session still quitting
+/// cleanly on a subsequent `q`, proving the terminal was left in a normal,
+/// responsive state.
+#[tokio::test]
+async fn memory_command_suspends_tui_and_opens_project_memory_file_in_scripted_editor() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-memory",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "unused-memory-command-never-hits-the-provider"
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-memory-cmd");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-memory-cmd");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-memory-cmd");
+    let project_dir = unique_temp_dir("memory-cmd-project");
+
+    let memory_path = project_dir.join("AGENTS.md");
+    assert!(
+        !memory_path.exists(),
+        "test setup should start with no pre-existing AGENTS.md, to also exercise \
+         create-if-absent"
+    );
+
+    // Scripted `$EDITOR` stand-in: appends a known, unique marker line to
+    // whatever file path it's given (`$1`) and exits 0 immediately, standing
+    // in for a real interactive editor without requiring one in CI.
+    let edited_marker = "MemoryCommandScriptedEditorMarkerUniqueToken";
+    let editor_script_dir = unique_temp_dir("editor-script-memory-cmd");
+    let editor_script_path = editor_script_dir.join("fake_editor.sh");
+    std::fs::write(
+        &editor_script_path,
+        format!("#!/bin/sh\nprintf '\\n{edited_marker}\\n' >> \"$1\"\n"),
+    )
+    .expect("failed to write fake editor script");
+    let mut perms = std::fs::metadata(&editor_script_path)
+        .expect("failed to stat fake editor script")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&editor_script_path, perms)
+        .expect("failed to make fake editor script executable");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.env("EDITOR", editor_script_path.to_str().expect("script path should be valid utf-8"));
+    cmd.cwd(&project_dir);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/memory\r")
+        .expect("failed to write /memory + Enter to pty");
+
+    // The scripted editor writes straight to the real on-disk memory file,
+    // not back through the prompt buffer/rendered output (unlike Ctrl+E's
+    // scratch-buffer round trip) -- so this polls the file directly rather
+    // than watching the pty output stream.
+    let edit_deadline = Instant::now() + Duration::from_secs(10);
+    let mut memory_contents = String::new();
+    while Instant::now() < edit_deadline {
+        if let Ok(contents) = std::fs::read_to_string(&memory_path) {
+            if contents.contains(edited_marker) {
+                memory_contents = contents;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        memory_contents.contains(edited_marker),
+        "expected the scripted editor's marker line to have been written to the project-scope \
+         AGENTS.md file at {memory_path:?} after /memory + Enter; contents were: \
+         {memory_contents:?}"
+    );
+
+    // Confirm the terminal was restored to a normal, responsive state: `q`
+    // (with an empty prompt, matching `should_quit`'s contract) should still
+    // cleanly quit the session, the same way ticket 42's Ctrl+E test proves
+    // terminal restoration by continuing to interact normally afterward.
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!(
+                "rokr did not exit within timeout after pressing q following /memory; output so \
+                 far: {output:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q following /memory, proving the terminal was \
+         restored; got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let _ = std::fs::remove_dir_all(&editor_script_dir);
+}
