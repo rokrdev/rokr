@@ -5,7 +5,7 @@
 //! `--resume <id>`, `--continue`, and the `auth login` subcommand -- but now
 //! through a single declarative struct that also drives `--help`.
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 /// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
 /// when no flag is given (the caller applies that default;
@@ -66,9 +66,11 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// Top-level subcommands. Today the only one is `auth`, whose sole action is
+/// Top-level subcommands. Today there are two: `auth`, whose sole action is
 /// `login` -- i.e. `rokr auth login`, the OAuth PKCE flow that runs and
-/// exits rather than entering the TUI.
+/// exits rather than entering the TUI -- and `completions` (ticket 53:
+/// shell-completions-subcommand), which prints a shell completion script to
+/// stdout and exits rather than entering the TUI.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Authentication commands (`auth login`).
@@ -76,6 +78,27 @@ pub enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Print a shell completion script to stdout (`completions <shell>`).
+    Completions {
+        /// Which shell's completion script to generate.
+        shell: clap_complete::Shell,
+    },
+}
+
+/// Ticket 53 (shell-completions-subcommand): renders the full [`Cli`]
+/// command surface (`clap_complete::generate` walks it via
+/// [`clap::CommandFactory`], so this stays in sync with `Cli`/`Command`
+/// automatically -- no separate list of subcommands to hand-maintain) into a
+/// completion script for the given `shell`. Used by both the
+/// `completions_subcommand_generates_script_for_each_supported_shell` unit
+/// test below and `main.rs`'s `Some(Command::Completions { shell })` dispatch
+/// arm.
+pub fn completions_script(shell: clap_complete::Shell) -> String {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut cmd, name, &mut buf);
+    String::from_utf8(buf).expect("clap_complete output should always be valid UTF-8")
 }
 
 /// Actions under the `auth` subcommand.
@@ -173,5 +196,36 @@ mod tests {
             Cli::try_parse_from(["rokr", "--agent", "bogus"]).is_err(),
             "an unknown --agent value must be a parse error"
         );
+    }
+
+    /// Ticket 53 (shell-completions-subcommand) RED: `completions_script`
+    /// (backed by `clap_complete::generate`) must produce a non-empty
+    /// completion script for each shell clap_complete supports selecting via
+    /// `rokr completions <shell>`, and that script must mention every real
+    /// top-level subcommand this codebase actually has today -- `auth` and
+    /// `completions` itself (NOT `eval`/`upgrade`, which don't exist yet).
+    /// Fails to compile today since neither `Command::Completions` nor
+    /// `completions_script` exist yet.
+    #[test]
+    fn completions_subcommand_generates_script_for_each_supported_shell() {
+        for shell in [
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Fish,
+        ] {
+            let script = completions_script(shell);
+            assert!(
+                !script.is_empty(),
+                "expected a non-empty completion script for {shell:?}"
+            );
+            assert!(
+                script.contains("auth"),
+                "expected {shell:?} completion script to mention the `auth` subcommand, got: {script}"
+            );
+            assert!(
+                script.contains("completions"),
+                "expected {shell:?} completion script to mention the `completions` subcommand, got: {script}"
+            );
+        }
     }
 }

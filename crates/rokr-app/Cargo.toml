@@ -14,6 +14,7 @@ rokr-session = { path = "../rokr-session" }
 rokr-mcp = { path = "../rokr-mcp" }
 rokr-hooks = { path = "../rokr-hooks" }
 clap = { workspace = true }
+clap_complete = "4"
 tokio = { workspace = true }
 serde_json = { workspace = true }
 

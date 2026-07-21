@@ -457,3 +457,28 @@ fn rokr_help_lists_agent_resume_continue_and_auth_login_flags() {
         );
     }
 }
+
+/// Ticket 53 (shell-completions-subcommand) acceptance test: `rokr
+/// completions zsh` must print a valid zsh completion script to stdout and
+/// exit 0. RED before this ticket: `completions` isn't a recognized
+/// subcommand yet, so clap rejects it as unknown and exits nonzero.
+#[test]
+fn rokr_completions_zsh_prints_valid_completion_script_to_stdout() {
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd.arg("completions").arg("zsh").assert().success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#compdef"),
+        "expected `rokr completions zsh` stdout to look like a zsh completion script \
+         (contain '#compdef'), got: {stdout}"
+    );
+    for needle in ["auth", "completions"] {
+        assert!(
+            stdout.contains(needle),
+            "expected `rokr completions zsh` stdout to mention the {needle:?} subcommand, \
+             got: {stdout}"
+        );
+    }
+}

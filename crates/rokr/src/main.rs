@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rokr_core::ExecutableTool;
-use rokr_app::cli::{AuthAction, Cli, Command};
+use rokr_app::cli::{completions_script, AuthAction, Cli, Command};
 use rokr_app::{
     append_compaction_record, log_observational_hook_outcome, matching_hook_entries,
     now_timestamp, run_hook_entry, AgentTier, ResumeMode, SessionRunner, SharedProvider,
@@ -34,6 +34,14 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        // Ticket 53 (shell-completions-subcommand): prints the requested
+        // shell's completion script to stdout and exits, rather than
+        // entering the TUI -- the same "run and exit" shape as `auth login`
+        // above.
+        Some(Command::Completions { shell }) => {
+            println!("{}", completions_script(shell));
+            ExitCode::SUCCESS
         }
         // No subcommand: launch the TUI. `--agent` defaults to `Plan` when
         // absent (the old `parse_agent_tier([])` behavior);
