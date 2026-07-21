@@ -30,8 +30,18 @@ use std::io::{BufRead, Write};
 /// wiremock-scripted assistant reply by accident.
 pub const FIXED_RESPONSE_TEXT: &str = "fake-mcp-server-echo-response-9f3c2a";
 
-/// The one tool this fixture exposes, matched by name in `tools/call`.
+/// The one tool this fixture exposes by default, matched by name in
+/// `tools/call`. Overridable via `FAKE_MCP_SERVER_TOOL_NAME` (ticket 46,
+/// mcp-namespace-multi-server-freeze) so a test can stand up two servers
+/// that both expose a tool with the SAME raw name, proving namespacing
+/// keeps them distinguishable -- see this fixture's `tool_name()` below.
 const TOOL_NAME: &str = "echo";
+
+/// Ticket 46: the effective tool name for this run, read once so every
+/// `tools/list`/`tools/call` branch below agrees on it.
+fn tool_name() -> String {
+    std::env::var("FAKE_MCP_SERVER_TOOL_NAME").unwrap_or_else(|_| TOOL_NAME.to_string())
+}
 
 fn main() {
     // Ticket 45 (mcp-config-and-lifecycle) acceptance test support: when
@@ -48,6 +58,22 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Ticket 46 (mcp-namespace-multi-server-freeze) acceptance test
+    // support: when set, blocks BEFORE reading (or responding to) any
+    // stdin line -- including `initialize` -- until the given path exists
+    // on disk. This lets a test hold a server in `Starting` (never
+    // `Ready`) for as long as it wants, then deterministically release it
+    // by creating the file, to prove a session's already-frozen MCP tool
+    // snapshot is untouched by a server that only becomes `Ready` after
+    // that snapshot was taken. A poll loop (not a filesystem watch) to
+    // keep this fixture dependency-free.
+    if let Ok(gate_path) = std::env::var("FAKE_MCP_SERVER_READY_GATE_FILE") {
+        while !std::path::Path::new(&gate_path).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    let tool_name = tool_name();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -83,7 +109,7 @@ fn main() {
             "tools/list" => serde_json::json!({
                 "tools": [
                     {
-                        "name": TOOL_NAME,
+                        "name": tool_name,
                         "description": "Echoes back a fixed marker string.",
                         "inputSchema": {
                             "type": "object",
@@ -100,7 +126,7 @@ fn main() {
                     .and_then(|p| p.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or("");
-                if requested_tool == TOOL_NAME {
+                if requested_tool == tool_name {
                     serde_json::json!({
                         "content": [
                             { "type": "text", "text": FIXED_RESPONSE_TEXT }

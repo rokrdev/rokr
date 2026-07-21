@@ -8244,30 +8244,46 @@ fn fake_mcp_server_path() -> PathBuf {
 /// spawned, so `load_or_init` takes its "existing file" branch and parses
 /// this real `mcp` block -- ticket 45 (mcp-config-and-lifecycle) replaces
 /// ticket 44's `ROKR_MCP_SERVER` env-var wiring with exactly this
-/// config-driven path.
+/// config-driven path. Thin wrapper over `write_mcp_config_servers` below
+/// (ticket 46, mcp-namespace-multi-server-freeze) for the common
+/// one-server case every earlier test uses.
 fn write_mcp_config(
     xdg_config_home: &std::path::Path,
     server_name: &str,
     command: &std::path::Path,
     env: serde_json::Value,
 ) {
+    write_mcp_config_servers(xdg_config_home, &[(server_name, command, env)]);
+}
+
+/// Ticket 46 (mcp-namespace-multi-server-freeze): same as `write_mcp_config`
+/// above, but declares MULTIPLE enabled stdio MCP servers in one
+/// `rokr.json` -- needed for the two-server namespacing/collision
+/// acceptance test, which must configure two independent fake servers in a
+/// single session.
+fn write_mcp_config_servers(
+    xdg_config_home: &std::path::Path,
+    servers: &[(&str, &std::path::Path, serde_json::Value)],
+) {
     let config_dir = xdg_config_home.join("rokr");
     std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
 
     let mut mcp = serde_json::Map::new();
-    mcp.insert(
-        server_name.to_string(),
-        serde_json::json!({
-            "transport": {
-                "stdio": {
-                    "command": command.to_string_lossy(),
-                    "args": [],
-                    "env": env
-                }
-            },
-            "enabled": true
-        }),
-    );
+    for (server_name, command, env) in servers {
+        mcp.insert(
+            server_name.to_string(),
+            serde_json::json!({
+                "transport": {
+                    "stdio": {
+                        "command": command.to_string_lossy(),
+                        "args": [],
+                        "env": env
+                    }
+                },
+                "enabled": true
+            }),
+        );
+    }
     let config = serde_json::json!({ "version": 1, "mcp": mcp });
 
     std::fs::write(
@@ -8891,4 +8907,488 @@ async fn failed_mcp_server_shows_status_notice_and_session_continues_without_its
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+
+/// Ticket 46 (mcp-namespace-multi-server-freeze) acceptance test: two
+/// configured stdio servers ("server_a", "server_b") each expose a tool
+/// with the identical RAW name "search" (`FAKE_MCP_SERVER_TOOL_NAME`, a
+/// ticket-46 fixture addition -- see `fake_mcp_server.rs`). The model
+/// issues both tool calls in ONE assistant turn; both must be reachable
+/// and individually executable via their namespaced names
+/// (`mcp__server_a__search` / `mcp__server_b__search`) without either
+/// colliding with or shadowing the other -- the whole point of
+/// `qualified_name`'s per-server namespacing (PRD "Namespacing").
+#[tokio::test]
+async fn two_mcp_servers_with_colliding_tool_name_both_reachable_by_namespaced_name() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterBothMcpServersForTesting";
+    let qualified_a = rokr_mcp::qualified_name("server_a", "search");
+    let qualified_b = rokr_mcp::qualified_name("server_b", "search");
+
+    // The model calls BOTH servers' "search" tool in the same assistant
+    // turn -- `run_tool_loop` executes tool calls in order, so this drives
+    // two sequential permission prompts within one submit.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-two-servers",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_a",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_a,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            },
+                            {
+                                "id": "call_b",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_b,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Only matches once BOTH tool results have round-tripped back into the
+    // request body -- proving both namespaced calls actually ran against
+    // their own (real, separately-spawned) fixture server, not a stub.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-two-servers-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-two-servers");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-two-servers");
+    let fixture = fake_mcp_server_path();
+    write_mcp_config_servers(
+        &xdg_config_home,
+        &[
+            (
+                "server_a",
+                fixture.as_path(),
+                serde_json::json!({ "FAKE_MCP_SERVER_TOOL_NAME": "search" }),
+            ),
+            (
+                "server_b",
+                fixture.as_path(),
+                serde_json::json!({ "FAKE_MCP_SERVER_TOOL_NAME": "search" }),
+            ),
+        ],
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call both mcp servers\r")
+        .expect("failed to write prompt to pty");
+
+    // First permission prompt: server_a's namespaced tool name.
+    let prompt_a_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_a_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_a) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(&qualified_a),
+        "expected pty output to contain '{qualified_a}' in the first permission prompt, got: \
+         {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for server_a to pty");
+
+    // Second permission prompt: server_b's namespaced tool name -- must be
+    // distinguishable from server_a's despite both wrapping the identical
+    // raw tool name "search".
+    let prompt_b_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_b_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_b) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(&qualified_b),
+        "expected pty output to contain '{qualified_b}' in the second permission prompt, got: \
+         {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for server_b to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting both \
+         namespaced MCP tool calls, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 46 (mcp-namespace-multi-server-freeze) acceptance test: PRD "MCP
+/// caching and session semantics" -- "the MCP tool set is frozen for the
+/// lifetime of a session ... never mutated turn-to-turn". A server held in
+/// `Starting` (via the `FAKE_MCP_SERVER_READY_GATE_FILE` ticket-46 fixture
+/// knob) contributes zero tools to the FIRST submit's frozen snapshot;
+/// releasing the gate and letting the server reach `Ready` afterwards must
+/// NOT retroactively add its tool to a LATER submit in the same session --
+/// proving the snapshot really is taken once (at first use) and reused,
+/// not recomputed fresh every turn (ticket 45's original, now-superseded
+/// behavior).
+#[tokio::test]
+async fn mid_session_server_tool_list_change_does_not_alter_already_frozen_snapshot() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let first_reply_text = "OrdinaryFirstReplyBeforeSlowServerReadyForTesting";
+    let second_reply_text = "OrdinarySecondReplyAfterSlowServerReadyForTesting";
+    let slow_server_qualified_name = rokr_mcp::qualified_name("slow", "echo");
+
+    // Turn 1: ordinary reply, no tool call -- this is the submit whose
+    // (empty, "slow" isn't Ready yet) MCP snapshot gets frozen.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-freeze-turn1",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": first_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Turn 2: also an ordinary reply -- the interesting assertion is on the
+    // outgoing REQUEST body (captured via `received_requests()` below),
+    // not this response.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-freeze-turn2",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": second_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-freeze");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-freeze");
+    let ready_gate_dir = unique_temp_dir("mcp-freeze-ready-gate");
+    let ready_gate_file = ready_gate_dir.join("ready");
+    write_mcp_config(
+        &xdg_config_home,
+        "slow",
+        &fake_mcp_server_path(),
+        serde_json::json!({
+            "FAKE_MCP_SERVER_READY_GATE_FILE": ready_gate_file.to_string_lossy()
+        }),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    // First paint must not be delayed by the still-gated "slow" server.
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Turn 1, submitted while "slow" is still gated (never responded to
+    // `initialize`, so it's stuck in `Starting`) -- this is when the
+    // session's MCP tool snapshot is taken and frozen, empty.
+    writer
+        .write_all(b"say something ordinary\r")
+        .expect("failed to write turn1 prompt to pty");
+
+    let turn1_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain turn 1's reply, got: {output:?}"
+    );
+
+    // Release the gate: "slow" can now complete `initialize` + `tools/list`
+    // and reach `Ready` with its "echo" tool -- a genuine mid-session
+    // tool-availability change happening strictly AFTER turn 1's snapshot
+    // was already taken.
+    std::fs::write(&ready_gate_file, b"go").expect("failed to write mcp ready-gate file");
+    // Give the background lifecycle task real wall-clock time to finish
+    // the handshake and flip status to `Ready` before turn 2 submits --
+    // generous relative to the fixture's own 25ms poll interval.
+    thread::sleep(Duration::from_millis(500));
+
+    // Turn 2: if the tool snapshot were (incorrectly) recomputed fresh per
+    // submit, "slow"'s now-Ready "echo" tool would appear in this turn's
+    // outgoing tool-spec list.
+    writer
+        .write_all(b"say something else ordinary\r")
+        .expect("failed to write turn2 prompt to pty");
+
+    let turn2_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn2_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain turn 2's reply, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        received_requests.len() >= 2,
+        "expected at least two outgoing requests (one per turn), got: {}",
+        received_requests.len()
+    );
+    let second_request_body =
+        String::from_utf8_lossy(&received_requests[1].body).into_owned();
+    assert!(
+        !second_request_body.contains(&slow_server_qualified_name),
+        "expected turn 2's outgoing request to NOT contain '{slow_server_qualified_name}' -- \
+         the session's MCP tool snapshot was taken (frozen empty) on turn 1, before 'slow' \
+         became Ready, and must not have picked up its tool on turn 2 just because the server \
+         became ready in between; got body: {second_request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&ready_gate_dir);
 }

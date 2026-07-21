@@ -485,13 +485,16 @@ async fn main() -> ExitCode {
             // (`rokr_mcp::spawn_stdio_server`), strictly off the render
             // path -- first paint never waits on any MCP server (PRD "MCP
             // lifecycle"). A server's tools become available once it
-            // reports ready (`McpServerHandle::tools`, read fresh at each
-            // `submit` below); a server whose init fails contributes zero
-            // tools and surfaces a one-line status notice instead of
-            // crashing or blocking the rest of rokr. Replaces ticket 44's
-            // `ROKR_MCP_SERVER` env-var interim wiring wholesale (see
-            // docs/adr/0011-rokr-mcp-crate-boundary.md's Consequences
-            // section).
+            // reports ready (`McpServerHandle::tools`); a server whose init
+            // fails contributes zero tools and surfaces a one-line status
+            // notice instead of crashing or blocking the rest of rokr.
+            // Replaces ticket 44's `ROKR_MCP_SERVER` env-var interim wiring
+            // wholesale (see docs/adr/0011-rokr-mcp-crate-boundary.md's
+            // Consequences section). Ticket 46
+            // (mcp-namespace-multi-server-freeze): the tool-set snapshot
+            // built from these handles is frozen for the session's lifetime
+            // (`mcp_tools_frozen` below), NOT re-read fresh on every
+            // `submit` as ticket 45 originally left it.
             let (mcp_notice_tx, mcp_notice_rx) = std::sync::mpsc::channel::<String>();
             // Bridges rokr-mcp's plain `String` notices (rokr-mcp depends
             // on rokr-core only -- ADR 0011 -- so it can't know about
@@ -545,6 +548,20 @@ async fn main() -> ExitCode {
                     .collect(),
             );
 
+            // Ticket 46 (mcp-namespace-multi-server-freeze), PRD "MCP
+            // caching and session semantics": "the MCP tool set is frozen
+            // for the lifetime of a session ... snapshotted once servers
+            // report ready (or at submit time) ... never mutated
+            // turn-to-turn". `OnceLock` gives exactly that: the FIRST
+            // `submit` call that actually needs MCP tools (Build tier)
+            // computes `rokr_mcp::snapshot_tools` once and every later
+            // `submit` in this session -- even one issued after more
+            // servers/tools have since become `Ready` -- reuses that exact
+            // `Vec` instead of recomputing it. A session that never enters
+            // Build tier simply never initializes this cell.
+            let mcp_tools_frozen: Arc<std::sync::OnceLock<Vec<Arc<rokr_mcp::McpTool>>>> =
+                Arc::new(std::sync::OnceLock::new());
+
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
@@ -557,6 +574,7 @@ async fn main() -> ExitCode {
                 let data_dir = data_dir.clone();
                 let status_tx = status_tx.clone();
                 let mcp_server_handles = mcp_server_handles.clone();
+                let mcp_tools_frozen = mcp_tools_frozen.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -744,23 +762,29 @@ async fn main() -> ExitCode {
                         subagent_request_permission,
                     );
 
-                    // Ticket 45 (mcp-config-and-lifecycle): a fresh snapshot
-                    // of every ready server's tools, taken at submit time --
-                    // "the tool snapshot used for a given submission is
-                    // taken at submit time, so a server that finishes
-                    // initializing mid-session is picked up on the next
-                    // submission" (PRD "MCP lifecycle"). Declared here, as
-                    // owned `Arc<McpTool>`s, BEFORE `tools` below so the
-                    // `&dyn ExecutableTool` references pushed into `tools`
-                    // borrow from something that outlives the
-                    // `run_tool_loop` call. Deliberately NOT
-                    // frozen/sorted/deduplicated across the session yet --
-                    // that determinism guarantee is ticket 46
-                    // (mcp-namespace-multi-server-freeze)'s job, not this
-                    // one's.
+                    // Ticket 46 (mcp-namespace-multi-server-freeze), PRD
+                    // "MCP caching and session semantics": the session's MCP
+                    // tool-set snapshot -- sorted deterministically by
+                    // (server, tool) via `rokr_mcp::snapshot_tools` -- is
+                    // computed AT MOST ONCE per session, the first time a
+                    // Build-tier `submit` needs it, and reused verbatim by
+                    // every later `submit`, even one issued after more
+                    // servers/tools have since become `Ready` ("a server
+                    // reconnecting mid-session with a changed tool list is
+                    // treated as a one-time accepted cache invalidation for
+                    // that session, not a per-turn concern"). Supersedes
+                    // ticket 45's original "fresh snapshot every submit"
+                    // behavior, which would otherwise let the tool-spec list
+                    // -- and therefore the cached prompt prefix -- shuffle
+                    // turn-to-turn. Declared here, as owned `Arc<McpTool>`s,
+                    // BEFORE `tools` below so the `&dyn ExecutableTool`
+                    // references pushed into `tools` borrow from something
+                    // that outlives the `run_tool_loop` call.
                     let mcp_tools_snapshot: Vec<Arc<rokr_mcp::McpTool>> =
                         if matches!(agent, AgentTier::Build) {
-                            mcp_server_handles.iter().flat_map(|h| h.tools()).collect()
+                            mcp_tools_frozen
+                                .get_or_init(|| rokr_mcp::snapshot_tools(&mcp_server_handles))
+                                .clone()
                         } else {
                             Vec::new()
                         };

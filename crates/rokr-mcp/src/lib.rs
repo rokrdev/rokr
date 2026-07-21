@@ -151,6 +151,26 @@ impl McpServerHandle {
     }
 }
 
+
+/// PRD "MCP caching and session semantics": builds one session's MCP
+/// tool-set snapshot from every configured server's CURRENT tools (empty
+/// for a server still `Starting` or permanently `Degraded`), sorted
+/// deterministically by `(server, tool)` -- not handle/server registration
+/// order, which is neither meaningful nor stable -- so the resulting
+/// tool-spec order (and therefore the cached prompt prefix) never shuffles
+/// between two snapshots taken over the same ready set. Pure and
+/// side-effect-free: calling this again reflects whatever the handles look
+/// like AT THAT MOMENT. Freezing the result for the lifetime of a session
+/// (calling this exactly once and reusing the owned `Vec` afterwards,
+/// never re-snapshotting turn-to-turn) is the CALLER's job -- `main.rs`
+/// (ticket 46, mcp-namespace-multi-server-freeze) does that with a
+/// `OnceLock`.
+pub fn snapshot_tools(handles: &[McpServerHandle]) -> Vec<Arc<McpTool>> {
+    let mut tools: Vec<Arc<McpTool>> = handles.iter().flat_map(|handle| handle.tools()).collect();
+    tools.sort_by(|a, b| (&a.server, &a.tool_name).cmp(&(&b.server, &b.tool_name)));
+    tools
+}
+
 /// Bounded retry count for a server's connect+list_tools attempt (PRD "MCP
 /// lifecycle": "bounded retry with backoff... then the server is marked
 /// degraded", "no unbounded retry loop"). Ticket 51 adds a manual `/mcp
@@ -539,6 +559,124 @@ mod tests {
             }
             Ok(text) => panic!("expected an error result (isError: true), got Ok({text})"),
         }
+    }
+
+
+    /// Ticket 46 (mcp-namespace-multi-server-freeze), PRD "Namespacing":
+    /// non-alphanumeric characters in EITHER half of `mcp__<server>__<tool>`
+    /// are sanitized (not just rejected/left raw), and two servers exposing
+    /// the SAME raw tool name still produce two DISTINCT qualified names --
+    /// the whole reason namespacing exists. Exercises the real `McpTool`
+    /// adapter (not just the free `qualified_name` fn) so this proves what
+    /// the model actually sees via `ExecutableTool::name`/`to_tool_spec`.
+    #[test]
+    fn tool_names_sanitized_and_namespaced_as_mcp_server_tool() {
+        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
+            content: Vec::new(),
+            is_error: false,
+        });
+        let tool = McpTool::new(
+            client,
+            "my server",
+            McpToolDef {
+                name: "search:tool".to_string(),
+                description: "d".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        );
+
+        assert_eq!(tool.name(), "mcp__my_server__search_tool");
+        assert_eq!(tool.to_tool_spec().name, "mcp__my_server__search_tool");
+
+        // Two servers exposing a tool with the identical raw name must not
+        // collide once namespaced.
+        assert_ne!(
+            qualified_name("server_a", "search"),
+            qualified_name("server_b", "search"),
+        );
+    }
+
+    /// Ticket 46 (mcp-namespace-multi-server-freeze), PRD "MCP caching and
+    /// session semantics": a tool-set snapshot assembled from multiple
+    /// servers is sorted deterministically by (server, tool) -- not server
+    /// registration/iteration order -- and calling the snapshot fn again
+    /// against UNCHANGED handles returns a byte-for-byte identical result.
+    #[test]
+    fn snapshot_sorted_by_server_then_tool_and_stable_across_repeated_calls() {
+        fn make_handle(name: &str, tool_names: &[&str]) -> McpServerHandle {
+            let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
+                content: Vec::new(),
+                is_error: false,
+            });
+            let tools = tool_names
+                .iter()
+                .map(|tool_name| {
+                    Arc::new(McpTool::new(
+                        client.clone(),
+                        name.to_string(),
+                        McpToolDef {
+                            name: tool_name.to_string(),
+                            description: String::new(),
+                            input_schema: serde_json::json!({}),
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            McpServerHandle {
+                name: name.to_string(),
+                status: Arc::new(std::sync::Mutex::new(McpServerStatus::Ready)),
+                tools: Arc::new(std::sync::Mutex::new(tools)),
+            }
+        }
+
+        // Deliberately out of (server, tool) order, and with "server_a"
+        // registered AFTER "server_b", to prove the snapshot re-sorts
+        // rather than trusting handle/tool iteration order.
+        let handles = vec![
+            make_handle("server_b", &["search", "alpha"]),
+            make_handle("server_a", &["zzz", "search"]),
+        ];
+
+        let snapshot_1 = snapshot_tools(&handles);
+        let names_1: Vec<&str> = snapshot_1.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names_1,
+            vec![
+                qualified_name("server_a", "search"),
+                qualified_name("server_a", "zzz"),
+                qualified_name("server_b", "alpha"),
+                qualified_name("server_b", "search"),
+            ]
+        );
+
+        let snapshot_2 = snapshot_tools(&handles);
+        let names_2: Vec<&str> = snapshot_2.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names_1, names_2,
+            "repeated snapshots over unchanged handles must be byte-for-byte identical"
+        );
+
+        // A handle's live tool list changing AFTER a snapshot was taken
+        // (e.g. a future reconnect) must never reach back into that
+        // already-taken snapshot -- `snapshot_1` returns owned `Arc<McpTool>`
+        // clones, not a view into the handle's mutex.
+        *handles[0].tools.lock().unwrap() = vec![Arc::new(McpTool::new(
+            Arc::new(FakeClient {
+                content: Vec::new(),
+                is_error: false,
+            }),
+            "server_b".to_string(),
+            McpToolDef {
+                name: "changed".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            },
+        ))];
+        let names_1_after_mutation: Vec<&str> = snapshot_1.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names_1_after_mutation, names_1,
+            "an already-taken snapshot must be unaffected by a later handle mutation"
+        );
     }
 }
 
