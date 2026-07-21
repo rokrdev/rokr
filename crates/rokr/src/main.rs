@@ -543,6 +543,7 @@ async fn main() -> ExitCode {
                             stdio.args.clone(),
                             stdio.env.clone(),
                             mcp_notice_tx.clone(),
+                            server.auto_approve.clone(),
                         ),
                     })
                     .collect(),
@@ -684,6 +685,20 @@ async fn main() -> ExitCode {
                                     },
                                     Some((path, old)),
                                 ),
+                                rokr_core::PermissionPayload::ToolCall {
+                                    server,
+                                    tool,
+                                    input_pretty,
+                                } => (
+                                    rokr_tui::PermissionDetail::Text(
+                                        format_tool_call_permission_text(
+                                            &server,
+                                            &tool,
+                                            &input_pretty,
+                                        ),
+                                    ),
+                                    None,
+                                ),
                             };
                             let granted = permission
                                 .request(rokr_tui::PermissionRequest {
@@ -733,6 +748,20 @@ async fn main() -> ExitCode {
                                             new,
                                         },
                                         Some((path, old)),
+                                    ),
+                                    rokr_core::PermissionPayload::ToolCall {
+                                        server,
+                                        tool,
+                                        input_pretty,
+                                    } => (
+                                        rokr_tui::PermissionDetail::Text(
+                                            format_tool_call_permission_text(
+                                                &server,
+                                                &tool,
+                                                &input_pretty,
+                                            ),
+                                        ),
+                                        None,
                                     ),
                                 };
                                 let granted = permission
@@ -1195,6 +1224,19 @@ async fn main() -> ExitCode {
 /// running history.
 fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
     transcript.push(rokr_core::Message::user_text(input));
+}
+
+/// Ticket 47 (mcp-permission-polish): formats a `PermissionPayload::ToolCall`
+/// into the `rokr_tui::PermissionDetail::Text` shown in the permission
+/// prompt -- one `label: value` line per field, server then tool then the
+/// pretty-printed input. Kept as discrete lines (rather than one
+/// interpolated blob) so ticket 48 (Streamable HTTP) can prepend/append an
+/// `origin: ...` line for a remote server's permission prompt without
+/// reshaping this format. Shared by both `request_permission` and
+/// `subagent_request_permission` below, which build identical prompt text
+/// for a `ToolCall` payload.
+fn format_tool_call_permission_text(server: &str, tool: &str, input_pretty: &str) -> String {
+    format!("server: {server}\ntool: {tool}\ninput: {input_pretty}")
 }
 
 /// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management

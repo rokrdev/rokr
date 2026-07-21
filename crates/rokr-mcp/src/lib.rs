@@ -197,6 +197,7 @@ pub fn spawn_server_with_connector<F, Fut>(
     name: String,
     connect: F,
     notice_tx: std::sync::mpsc::Sender<String>,
+    auto_approve: Arc<Vec<String>>,
 ) -> McpServerHandle
 where
     F: Fn() -> Fut + Send + Sync + 'static,
@@ -210,7 +211,14 @@ where
         tools: Arc::clone(&tools),
     };
 
-    tokio::spawn(run_lifecycle(name, connect, status, tools, notice_tx));
+    tokio::spawn(run_lifecycle(
+        name,
+        connect,
+        status,
+        tools,
+        notice_tx,
+        auto_approve,
+    ));
 
     handle
 }
@@ -228,6 +236,7 @@ async fn run_lifecycle<F, Fut>(
     status: Arc<std::sync::Mutex<McpServerStatus>>,
     tools_out: Arc<std::sync::Mutex<Vec<Arc<McpTool>>>>,
     notice_tx: std::sync::mpsc::Sender<String>,
+    auto_approve: Arc<Vec<String>>,
 ) where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<Arc<dyn McpClientPort>, McpClientError>>,
@@ -240,7 +249,14 @@ async fn run_lifecycle<F, Fut>(
                 Ok(defs) => {
                     let built: Vec<Arc<McpTool>> = defs
                         .into_iter()
-                        .map(|def| Arc::new(McpTool::new(client.clone(), name.clone(), def)))
+                        .map(|def| {
+                            Arc::new(McpTool::new(
+                                client.clone(),
+                                name.clone(),
+                                def,
+                                auto_approve.clone(),
+                            ))
+                        })
                         .collect();
                     *tools_out.lock().unwrap() = built;
                     *status.lock().unwrap() = McpServerStatus::Ready;
@@ -274,6 +290,7 @@ pub fn spawn_stdio_server(
     args: Vec<String>,
     env: std::collections::HashMap<String, String>,
     notice_tx: std::sync::mpsc::Sender<String>,
+    auto_approve: Vec<String>,
 ) -> McpServerHandle {
     let connect = move || {
         let command = command.clone();
@@ -284,7 +301,7 @@ pub fn spawn_stdio_server(
             Ok(Arc::new(client) as Arc<dyn McpClientPort>)
         }
     };
-    spawn_server_with_connector(name, connect, notice_tx)
+    spawn_server_with_connector(name, connect, notice_tx, Arc::new(auto_approve))
 }
 
 impl McpClientPort for RmcpStdioClient {
@@ -368,10 +385,22 @@ pub struct McpTool {
     qualified_name: String,
     description: String,
     input_schema: serde_json::Value,
+    /// This server's `auto_approve` allowlist (ticket 47,
+    /// mcp-permission-polish), of UNQUALIFIED tool names -- see
+    /// `rokr_config::McpServerConfig::auto_approve`'s doc comment for why
+    /// unqualified. Shared (`Arc`) across every `McpTool` for the same
+    /// server rather than cloned per tool, since it's set once at server
+    /// configuration time and never mutated.
+    auto_approve: Arc<Vec<String>>,
 }
 
 impl McpTool {
-    pub fn new(client: Arc<dyn McpClientPort>, server: impl Into<String>, def: McpToolDef) -> Self {
+    pub fn new(
+        client: Arc<dyn McpClientPort>,
+        server: impl Into<String>,
+        def: McpToolDef,
+        auto_approve: Arc<Vec<String>>,
+    ) -> Self {
         let server = server.into();
         let qualified_name = qualified_name(&server, &def.name);
         Self {
@@ -381,6 +410,7 @@ impl McpTool {
             qualified_name,
             description: def.description,
             input_schema: def.input_schema,
+            auto_approve,
         }
     }
 }
@@ -449,10 +479,25 @@ impl ExecutableTool for McpTool {
         &self,
         input: serde_json::Value,
     ) -> Option<Result<PermissionPayload, rokr_core::ToolError>> {
-        Some(Ok(PermissionPayload::Command(format!(
-            "MCP tool call: {}::{} {}",
-            self.server, self.tool_name, input
-        ))))
+        // Ticket 47 (mcp-permission-polish), PRD "MCP permissions": a tool
+        // on its server's `auto_approve` list is checked by UNQUALIFIED
+        // name (`self.tool_name`, not `self.qualified_name`) -- see
+        // `rokr_config::McpServerConfig::auto_approve`'s doc comment.
+        // Returning `None` here (rather than `Some(Ok(_))`) is what makes
+        // it ungated: `run_tool_loop`'s existing `preview() -> None` =>
+        // execute-directly-no-permission-check semantics already does the
+        // rest, so this needs no change to the loop itself.
+        if self.auto_approve.iter().any(|name| name == &self.tool_name) {
+            return None;
+        }
+
+        let input_pretty =
+            serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string());
+        Some(Ok(PermissionPayload::ToolCall {
+            server: self.server.clone(),
+            tool: self.tool_name.clone(),
+            input_pretty,
+        }))
     }
 }
 
@@ -511,7 +556,12 @@ mod tests {
 
         let (notice_tx, _notice_rx) = std::sync::mpsc::channel::<String>();
         let before = Instant::now();
-        let handle = spawn_server_with_connector("srv".to_string(), connect, notice_tx);
+        let handle = spawn_server_with_connector(
+            "srv".to_string(),
+            connect,
+            notice_tx,
+            Arc::new(Vec::new()),
+        );
 
         assert!(
             before.elapsed() < Duration::from_millis(50),
@@ -543,6 +593,7 @@ mod tests {
                 description: "d".to_string(),
                 input_schema: serde_json::json!({}),
             },
+            Arc::new(Vec::new()),
         );
 
         let result = tool.execute_boxed(serde_json::json!({})).await;
@@ -583,6 +634,7 @@ mod tests {
                 description: "d".to_string(),
                 input_schema: serde_json::json!({}),
             },
+            Arc::new(Vec::new()),
         );
 
         assert_eq!(tool.name(), "mcp__my_server__search_tool");
@@ -619,6 +671,7 @@ mod tests {
                             description: String::new(),
                             input_schema: serde_json::json!({}),
                         },
+                        Arc::new(Vec::new()),
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -671,6 +724,7 @@ mod tests {
                 description: String::new(),
                 input_schema: serde_json::json!({}),
             },
+            Arc::new(Vec::new()),
         ))];
         let names_1_after_mutation: Vec<&str> = snapshot_1.iter().map(|t| t.name()).collect();
         assert_eq!(

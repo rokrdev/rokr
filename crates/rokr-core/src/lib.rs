@@ -53,6 +53,21 @@ pub enum PermissionPayload {
     /// path in `crates/rokr/src/main.rs`, which only sees this payload, not
     /// the raw tool-call JSON.
     Diff { path: String, old: String, new: String },
+    /// An MCP tool call (ticket 47, mcp-permission-polish), replacing
+    /// ticket 44's interim `Command(String)` encoding for MCP calls: the
+    /// server name, tool name, and pretty-printed input JSON are carried
+    /// as separate fields rather than pre-flattened into one opaque
+    /// string, so `crates/rokr/src/main.rs`'s permission bridge can format
+    /// them explicitly (and, per the PRD's "MCP permissions" section, a
+    /// later ticket can add an `origin` line for a remote HTTP server
+    /// without re-encoding this payload). Deliberately not
+    /// `#[non_exhaustive]` -- this codebase's house style is
+    /// compile-enforced match updates when a new variant lands.
+    ToolCall {
+        server: String,
+        tool: String,
+        input_pretty: String,
+    },
 }
 
 /// A gated tool call awaiting user permission: the tool's name plus a
@@ -1249,5 +1264,36 @@ mod tests {
         };
 
         assert_eq!(tool.name(), "dynamic-1");
+    }
+
+    /// Ticket 47 (mcp-permission-polish): `PermissionPayload` gains a new
+    /// `ToolCall` variant alongside `Command`/`Diff` so an MCP tool call's
+    /// permission prompt can carry the server name, tool name, and
+    /// pretty-printed input separately (rather than flattening them into
+    /// one opaque `Command(String)`, ticket 44's interim decision) -- the
+    /// bridge in `crates/rokr/src/main.rs` matches on these fields directly
+    /// to build the rendered prompt text. This is a compile-time check as
+    /// much as a runtime one: before this variant exists, constructing it
+    /// is a compile error (E0599/E0433), which IS this test's RED.
+    #[test]
+    fn permission_payload_tool_call_variant_carries_server_tool_and_pretty_input() {
+        let payload = PermissionPayload::ToolCall {
+            server: "interim".to_string(),
+            tool: "echo".to_string(),
+            input_pretty: "{\n  \"message\": \"hi\"\n}".to_string(),
+        };
+
+        match payload {
+            PermissionPayload::ToolCall {
+                server,
+                tool,
+                input_pretty,
+            } => {
+                assert_eq!(server, "interim");
+                assert_eq!(tool, "echo");
+                assert_eq!(input_pretty, "{\n  \"message\": \"hi\"\n}");
+            }
+            other => panic!("expected PermissionPayload::ToolCall, got {other:?}"),
+        }
     }
 }

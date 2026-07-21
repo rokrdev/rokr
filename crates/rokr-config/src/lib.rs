@@ -38,12 +38,19 @@ fn default_auto_compact_threshold() -> f64 {
 }
 
 /// One configured MCP server (PRD "Config schema"). `auto_approve` (ticket
-/// 47) is deliberately not a field yet.
+/// 47, mcp-permission-polish) is a per-server allowlist of UNQUALIFIED
+/// tool names (the server-local name as reported by `tools/list`, e.g.
+/// `"echo"` -- not the `mcp__<server>__<tool>` model-facing form), since
+/// the list is already scoped to one server by virtue of living on its
+/// `McpServerConfig`. A tool whose name appears here skips the interactive
+/// permission prompt and executes directly.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct McpServerConfig {
     pub transport: McpTransport,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
 }
 
 /// A server's transport configuration. Only `Stdio` is implemented in
@@ -391,6 +398,46 @@ mod tests {
         assert_eq!(stdio.command, "/path/to/server");
         assert_eq!(stdio.args, vec!["--flag".to_string()]);
         assert_eq!(stdio.env.get("KEY"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn mcp_server_auto_approve_list_deserializes_and_defaults_to_empty() {
+        let json_without_auto_approve = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": { "command": "/path/to/server" }
+                    },
+                    "enabled": true
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json_without_auto_approve).unwrap();
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert!(
+            server.auto_approve.is_empty(),
+            "expected empty auto_approve when field absent, got: {:?}",
+            server.auto_approve
+        );
+
+        let json_with_auto_approve = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": { "command": "/path/to/server" }
+                    },
+                    "enabled": true,
+                    "auto_approve": ["tool_a"]
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json_with_auto_approve).unwrap();
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert_eq!(server.auto_approve, vec!["tool_a".to_string()]);
     }
 
     #[test]
