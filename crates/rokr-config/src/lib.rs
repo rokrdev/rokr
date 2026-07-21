@@ -24,7 +24,13 @@ pub struct Config {
     /// at runtime; the field is never written back. See
     /// docs/adr/0011-rokr-mcp-crate-boundary.md and ticket 45
     /// (mcp-config-and-lifecycle), which replaces ticket 44's
-    /// `ROKR_MCP_SERVER` env-var interim wiring with this real schema.
+    /// `ROKR_MCP_SERVER` env-var interim wiring with this real schema. Per
+    /// docs/adr/0012-hooks-execution-trust-model.md decision 2 and the
+    /// PRD's "Config schema" section, `mcp` (like `hooks` below) is loaded
+    /// from user-scope config ONLY -- `load_or_init` reads exactly the one
+    /// `config_dir` path it is given and nothing else; see ticket 51's
+    /// `project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader`
+    /// test for the enforcement guard.
     #[serde(default)]
     pub mcp: std::collections::HashMap<String, McpServerConfig>,
     /// Configured hooks, keyed by event name (`"PreToolUse"`,
@@ -40,9 +46,9 @@ pub struct Config {
     /// them. Per docs/adr/0012-hooks-execution-trust-model.md and the PRD's
     /// "Config schema" section, `hooks` (like `mcp`) is loaded from
     /// user-scope config ONLY -- there is no project-scope config loader
-    /// yet for either field to be read from by mistake (ticket 51 adds the
-    /// loader-level enforcement test once project-scope config exists as a
-    /// concept).
+    /// at all yet for either field to be read from by mistake; ticket 51's
+    /// `project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader`
+    /// test is the forward regression guard for once one exists (Phase 7).
     #[serde(default)]
     pub hooks: std::collections::HashMap<String, Vec<HookEntry>>,
 }
@@ -254,6 +260,13 @@ pub fn load_project_context(cwd: &Path) -> Option<String> {
 ///
 /// Also scaffolds `agents/plan.md` and `agents/build.md` under `config_dir`
 /// with default prompt content, if they do not already exist.
+///
+/// `config_dir` is the ONLY location ever read -- there is no fallback to
+/// (nor merge with) any project-local config file, regardless of the
+/// process's current directory or any other "nearby" location. This is the
+/// user-scope trust boundary `Config::mcp`/`Config::hooks` document (ADR
+/// 0012 decision 2); see ticket 51's
+/// `project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader` test.
 pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
     std::fs::create_dir_all(config_dir)?;
     let file_path = config_dir.join("rokr.json");
@@ -778,6 +791,79 @@ mod tests {
         assert_eq!(
             context, None,
             "a non-NotFound read error on AGENTS.md must yield no project context"
+        );
+    }
+
+    /// Ticket 51 (mcp-hooks-introspection), docs/adr/0012-hooks-execution-trust-model.md
+    /// decision 2 ("User-scope-only trust boundary"), PRD "Config schema":
+    /// `mcp`/`hooks` must be loaded from user-scope config ONLY -- a
+    /// project-local config file (however project-scope config is
+    /// eventually discovered, once that concept exists -- deferred to
+    /// Phase 7) must have zero effect. There is no project-scope reader
+    /// anywhere in this codebase today, so this is a forward regression
+    /// guard: `load_or_init` must keep reading ONLY the one explicit
+    /// `config_dir` path it's given, never anything "nearby" like the
+    /// process's current directory -- proven here by making a poisoned
+    /// project-local `rokr.json` sit at the process's cwd (the most
+    /// plausible way a future, careless project-scope implementation might
+    /// "discover" it) while loading from a genuinely separate, real
+    /// user-scope directory.
+    #[test]
+    fn project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader() {
+        static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = CWD_GUARD.lock().unwrap();
+
+        let user_scope_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // A project-local rokr.json with `mcp`/`hooks` blocks populated with
+        // distinctive marker values -- if the loader ever read this file
+        // (directly, or by falling back to the current directory), those
+        // markers would leak into the loaded config below.
+        let poisoned = serde_json::json!({
+            "version": 1,
+            "mcp": {
+                "project-injected-server": {
+                    "transport": {
+                        "stdio": { "command": "evil", "args": [], "env": {} }
+                    },
+                    "enabled": true,
+                    "auto_approve": []
+                }
+            },
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "command": "project-injected-hook.sh" }
+                ]
+            }
+        });
+        std::fs::write(
+            project_dir.path().join("rokr.json"),
+            serde_json::to_string_pretty(&poisoned).unwrap(),
+        )
+        .unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_dir.path()).unwrap();
+
+        let result = load_or_init(user_scope_dir.path());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+
+        let config = result.expect("expected load_or_init to succeed against the user-scope dir");
+        assert!(
+            config.mcp.is_empty(),
+            "loader must never read `mcp` from a project-local config file; got: {:?}",
+            config.mcp
+        );
+        assert!(
+            config.hooks.is_empty(),
+            "loader must never read `hooks` from a project-local config file; got: {:?}",
+            config.hooks
+        );
+        assert!(
+            !config.mcp.contains_key("project-injected-server"),
+            "project-local mcp block leaked into the loaded config"
         );
     }
 }

@@ -73,6 +73,25 @@ fn main() {
         }
     }
 
+    // Ticket 51 (mcp-hooks-introspection) acceptance test support: a
+    // "degraded, then recoverable" knob for `/mcp reconnect`.
+    // `FAKE_MCP_SERVER_FAIL_INIT` above fails for the entire life of the
+    // env var, which is useless for testing reconnect -- every retry
+    // attempt (and every reconnect) spawns a brand-new subprocess with the
+    // SAME env, so a permanently-set flag can never let a later attempt
+    // succeed. This checks a marker FILE instead of the env var's mere
+    // presence: exits immediately (same abrupt-failure shape as
+    // `FAKE_MCP_SERVER_FAIL_INIT`) as long as the given path does not
+    // exist, but proceeds normally once it does -- a test drives a server
+    // to `Degraded` first (path absent), then creates the path and issues
+    // `/mcp reconnect`, and the NEXT spawned subprocess (same command/env,
+    // different point in time) finds the path present and succeeds.
+    if let Ok(marker_path) = std::env::var("FAKE_MCP_SERVER_FAIL_UNTIL_FILE") {
+        if !std::path::Path::new(&marker_path).exists() {
+            std::process::exit(1);
+        }
+    }
+
     let tool_name = tool_name();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

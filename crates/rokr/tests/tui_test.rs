@@ -10132,6 +10132,499 @@ async fn failed_mcp_server_shows_status_notice_and_session_continues_without_its
 }
 
 
+/// Ticket 51 (mcp-hooks-introspection) acceptance test: `/mcp` lists every
+/// configured server's connection state and (for a connected server) its
+/// current tool list -- one server reaches `Ready` normally, the other is
+/// configured with `FAKE_MCP_SERVER_FAIL_INIT` (same knob
+/// `failed_mcp_server_shows_status_notice_and_session_continues_without_its_tools`
+/// above uses) so it exhausts its bounded retry and lands on `Degraded`.
+/// No live model turn is needed here -- MCP servers spawn unconditionally
+/// at startup regardless of agent tier (`main.rs`), so this is a plain PTY
+/// command-dispatch check, mirroring `/sessions`'s/`/search`'s own tests
+/// rather than the wiremock-backed MCP tool-call tests elsewhere in this
+/// file.
+#[test]
+fn mcp_command_lists_servers_connection_state_and_tools() {
+    let home = unique_temp_dir("home-mcp-list");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-list");
+
+    write_mcp_config_servers(
+        &xdg_config_home,
+        &[
+            ("healthy", &fake_mcp_server_path(), serde_json::json!({})),
+            (
+                "flaky",
+                &fake_mcp_server_path(),
+                serde_json::json!({ "FAKE_MCP_SERVER_FAIL_INIT": "1" }),
+            ),
+        ],
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Give the flaky server's bounded retry+backoff time to exhaust into
+    // Degraded before asking for the listing -- otherwise /mcp could race
+    // it and observe a transient Starting state instead.
+    let degrade_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < degrade_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("flaky") && output.contains("failed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+
+    let listing_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < listing_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("state=connected") && output.contains("state=degraded") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("healthy"),
+        "expected /mcp output to mention 'healthy', got: {output:?}"
+    );
+    assert!(
+        output.contains("flaky"),
+        "expected /mcp output to mention 'flaky', got: {output:?}"
+    );
+    assert!(
+        output.contains("state=connected"),
+        "expected /mcp output to show the healthy server as state=connected, got: {output:?}"
+    );
+    assert!(
+        output.contains("state=degraded"),
+        "expected /mcp output to show the flaky server as state=degraded, got: {output:?}"
+    );
+    assert!(
+        output.contains("echo"),
+        "expected /mcp output to list the connected server's 'echo' tool, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 51 (mcp-hooks-introspection) acceptance test: `/hooks` lists
+/// every configured hook per event plus whether that event is actually
+/// wired anywhere in `main.rs` (`state=active`) or not (`state=inactive`
+/// -- e.g. a hook configured under `PreCompact`, one of the PRD's events
+/// explicitly deferred to Phase 7, which `matching_hook_entries`'s call
+/// sites never look up). `write_hooks_config` only writes one event/command
+/// pair, so this writes `rokr.json` directly, mirroring
+/// `write_mcp_config_servers`'s inline JSON-building style.
+#[test]
+fn hooks_command_lists_configured_hooks_per_event_and_active_state() {
+    let home = unique_temp_dir("home-hooks-list");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-hooks-list");
+
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+    let config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "bash", "command": "activehooktoken.sh" }
+            ],
+            "PreCompact": [
+                { "command": "inactivehooktoken.sh" }
+            ]
+        }
+    });
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/hooks\r")
+        .expect("failed to write /hooks to pty");
+
+    let listing_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < listing_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("activehooktoken.sh") && output.contains("inactivehooktoken.sh") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("PreToolUse"),
+        "expected /hooks output to mention event 'PreToolUse', got: {output:?}"
+    );
+    assert!(
+        output.contains("activehooktoken.sh"),
+        "expected /hooks output to mention the PreToolUse hook's command, got: {output:?}"
+    );
+    assert!(
+        output.contains("PreCompact"),
+        "expected /hooks output to mention event 'PreCompact', got: {output:?}"
+    );
+    assert!(
+        output.contains("inactivehooktoken.sh"),
+        "expected /hooks output to mention the PreCompact hook's command, got: {output:?}"
+    );
+    assert!(
+        output.contains("state=active"),
+        "expected /hooks output to mark the wired PreToolUse hook state=active, got: {output:?}"
+    );
+    assert!(
+        output.contains("state=inactive"),
+        "expected /hooks output to mark the unwired PreCompact hook state=inactive, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 51 (mcp-hooks-introspection) acceptance test: `/mcp reconnect
+/// <server>` restarts a `Degraded` server's connect+`list_tools` retry
+/// loop, and a SUBSEQUENT `/mcp` shows it `state=connected` again with its
+/// tool list restored -- proving the reconnect actually re-spawned and
+/// succeeded, not merely accepted the command text. Uses the
+/// `FAKE_MCP_SERVER_FAIL_UNTIL_FILE` fixture flag (ticket 51 addition,
+/// `fake_mcp_server.rs`): the server fails every attempt while the marker
+/// file is absent (driving it to `Degraded`, same shape as
+/// `FAKE_MCP_SERVER_FAIL_INIT` elsewhere in this file), then succeeds once
+/// the test creates the marker file and issues `/mcp reconnect` --
+/// `FAKE_MCP_SERVER_FAIL_INIT` alone can't express this since it fails for
+/// the entire life of the env var, with no way to later flip a live
+/// subprocess's env out from under it.
+#[test]
+fn mcp_reconnect_command_restarts_a_degraded_server() {
+    let home = unique_temp_dir("home-mcp-reconnect");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-reconnect");
+    let marker_dir = unique_temp_dir("marker-mcp-reconnect");
+    let marker_path = marker_dir.join("recover.marker");
+
+    write_mcp_config_servers(
+        &xdg_config_home,
+        &[(
+            "flaky",
+            &fake_mcp_server_path(),
+            serde_json::json!({ "FAKE_MCP_SERVER_FAIL_UNTIL_FILE": marker_path.to_string_lossy() }),
+        )],
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Let the bounded retry+backoff exhaust into Degraded first.
+    let degrade_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < degrade_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("flaky") && output.contains("failed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("flaky") && output.contains("failed"),
+        "expected a one-line status notice mentioning the failed server 'flaky', got: {output:?}"
+    );
+
+    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+    let degraded_listing_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < degraded_listing_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("state=degraded") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("state=degraded"),
+        "expected /mcp to show 'flaky' as state=degraded before reconnect, got: {output:?}"
+    );
+
+    // Now let the fixture succeed on its next spawn, and trigger it.
+    std::fs::create_dir_all(&marker_dir).expect("failed to create marker dir");
+    std::fs::write(&marker_path, "").expect("failed to write recovery marker file");
+
+    writer
+        .write_all(b"/mcp reconnect flaky\r")
+        .expect("failed to write /mcp reconnect to pty");
+
+    // The freshly spawned subprocess (marker file now present) succeeds on
+    // its very first attempt -- no backoff delay -- but still needs a beat
+    // for the real connect+list_tools round-trip to complete before a
+    // fresh `/mcp` reflects it.
+    thread::sleep(Duration::from_millis(500));
+    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+
+    let reconnect_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < reconnect_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("state=connected") && output.contains("echo") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("state=connected"),
+        "expected 'flaky' to show state=connected after /mcp reconnect, got: {output:?}"
+    );
+    assert!(
+        output.contains("echo"),
+        "expected 'flaky's tool list to be restored (containing 'echo') after reconnect, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&marker_dir);
+}
+
+
 /// Ticket 46 (mcp-namespace-multi-server-freeze) acceptance test: two
 /// configured stdio servers ("server_a", "server_b") each expose a tool
 /// with the identical RAW name "search" (`FAKE_MCP_SERVER_TOOL_NAME`, a

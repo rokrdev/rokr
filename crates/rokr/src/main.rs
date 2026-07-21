@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use rokr_core::Provider;
+use rokr_core::{ExecutableTool, Provider};
 
 mod subagent;
 
@@ -145,6 +145,21 @@ fn matching_hook_entries<'a>(
 /// silent default (nothing to report); `Blocked` (exit 2) is logged as an
 /// IGNORED veto attempt, since these events have no veto to honor;
 /// `NonBlockingFailure` is logged as-is.
+///
+/// Known wart (ticket 51, mcp-hooks-introspection, flagged for Phase 7):
+/// `eprintln!` here (and at the two `PreToolUse` outcome sites in `submit`
+/// just above `run_tool_loop`'s call) writes to stderr while the TUI may
+/// still hold the alt-screen -- fine for the `SessionStart`/`SessionEnd`
+/// call sites (both fire outside `rokr_tui::run`'s active window), but the
+/// `PostToolUse`/`Stop` call sites inside `submit`'s closure fire WHILE the
+/// TUI is rendering. Routing these through the existing `SessionStatus`
+/// notice channel (`status_tx`, already captured in `submit`'s closure)
+/// would need: a `context_percent` value to pair with the notice (no
+/// "current" figure exists mid-turn without adding new state -- unlike the
+/// MCP notice-forwarder task above, which has `last_known_usage` handy),
+/// and splitting this function's signature (or adding a sibling wrapper)
+/// since `SessionStart`/`SessionEnd` must stay `eprintln!`-based. Judged
+/// out of scope for this ticket.
 fn log_observational_hook_outcome(event: &str, result: &rokr_hooks::HookResult) {
     match result {
         rokr_hooks::HookResult::Success { .. } => {}
@@ -260,6 +275,12 @@ async fn main() -> ExitCode {
             // this scope for the `SessionEnd` firing point after
             // `rokr_tui::run` returns, near the bottom of this function.
             let hooks_config_for_submit = hooks_config.clone();
+            // Ticket 51 (mcp-hooks-introspection): a third clone, for
+            // `command`'s own `move` closure below (built alongside the
+            // other `command_*` clones near `command_provider`), so
+            // `/hooks` can list every configured hook without disturbing
+            // either of the two clones above.
+            let command_hooks_config = hooks_config.clone();
 
             // `SessionStart` (PRD "Hooks"; architect decision: "SessionStart
             // at startup"): fires once, here, before the TUI ever renders.
@@ -664,6 +685,19 @@ async fn main() -> ExitCode {
                     })
                     .collect(),
             );
+
+            // Ticket 51 (mcp-hooks-introspection): clones for `command`'s
+            // own `move` closure below (built alongside the other
+            // `command_*` clones near `command_provider`), so `/mcp` and
+            // `/mcp reconnect` can list/reconnect servers. `command_mcp_configs`
+            // is the raw, unfiltered `config.mcp` (not just the handles
+            // above) because a server with `enabled: false` never gets a
+            // handle at all -- this is `/mcp`'s only way to report it as
+            // "disabled" rather than silently omitting it.
+            let command_mcp_server_handles = mcp_server_handles.clone();
+            let command_mcp_configs: Arc<
+                std::collections::HashMap<String, rokr_config::McpServerConfig>,
+            > = Arc::new(config.mcp.clone());
 
             // Ticket 48 (mcp-http-transport), PRD "MCP permissions": an
             // HTTP server's origin is a data-exfiltration signal, so it's
@@ -1354,6 +1388,9 @@ async fn main() -> ExitCode {
                 let last_known_usage = command_last_known_usage.clone();
                 let turn_index = command_turn_index.clone();
                 let data_dir = command_data_dir.clone();
+                let mcp_server_handles = command_mcp_server_handles.clone();
+                let mcp_configs = command_mcp_configs.clone();
+                let hooks_config = command_hooks_config.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
@@ -1428,6 +1465,26 @@ async fn main() -> ExitCode {
                         };
                     }
 
+                    // Ticket 51 (mcp-hooks-introspection): `/mcp reconnect
+                    // <server>` is the only MUTATING introspection command
+                    // (resets ONE named server's retry state -- never
+                    // touches config on disk). Checked before the bare
+                    // `/mcp` match arm below, same `strip_prefix` shape as
+                    // `/search ` above.
+                    if let Some(server_name) = input.strip_prefix("/mcp reconnect ") {
+                        let server_name = server_name.trim();
+                        return match mcp_server_handles
+                            .iter()
+                            .find(|handle| handle.name == server_name)
+                        {
+                            Some(handle) => {
+                                handle.reconnect();
+                                format!("Reconnecting MCP server '{server_name}'.")
+                            }
+                            None => format!("no such MCP server: '{server_name}'"),
+                        };
+                    }
+
                     match input.as_str() {
                         "/sessions" => match store.list_sessions() {
                             Ok(entries) if entries.is_empty() => {
@@ -1498,6 +1555,8 @@ async fn main() -> ExitCode {
                                 }
                             }
                         }
+                        "/mcp" => format_mcp_listing(&mcp_configs, &mcp_server_handles),
+                        "/hooks" => format_hooks_listing(&hooks_config),
                         _ => format!("unknown command: {input}"),
                     }
                 }
@@ -1584,6 +1643,130 @@ fn format_tool_call_permission_text(
         text.push_str(&format!("\norigin: {origin}"));
     }
     text
+}
+
+/// Ticket 51 (mcp-hooks-introspection), `/mcp`: renders one line per
+/// configured MCP server (PRD "connection state (connected/degraded/
+/// disabled)"), sorted by name for deterministic output. `configs` is the
+/// raw, unfiltered `config.mcp` -- a server with `enabled: false` never
+/// gets a `McpServerHandle` at all (see `mcp_server_handles`'s
+/// construction in `main`), so `configs` is what lets this report
+/// "disabled" for it instead of silently omitting it; `handles` supplies
+/// live status/tools for every server that DID get spawned. State/field
+/// values are printed as single `key=value` tokens with no internal
+/// spaces (`state=connected`, not `state: connected`) so they survive
+/// ratatui's cell-diff rendering (unchanged cells, including blank spaces,
+/// aren't redrawn) as one contiguous run of bytes in a raw terminal
+/// capture.
+fn format_mcp_listing(
+    configs: &std::collections::HashMap<String, rokr_config::McpServerConfig>,
+    handles: &[rokr_mcp::McpServerHandle],
+) -> String {
+    if configs.is_empty() {
+        return "No MCP servers configured.".to_string();
+    }
+
+    let mut names: Vec<&String> = configs.keys().collect();
+    names.sort();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let server_config = &configs[name];
+            let transport = match server_config.transport {
+                rokr_config::McpTransport::Stdio(_) => "stdio",
+                rokr_config::McpTransport::Http(_) => "http",
+            };
+
+            if !server_config.enabled {
+                return format!("{name} | transport={transport} | state=disabled | tools=[]");
+            }
+
+            let handle = handles.iter().find(|handle| &handle.name == name);
+            let (state, tools) = match handle.map(|handle| handle.status()) {
+                Some(rokr_mcp::McpServerStatus::Starting) => {
+                    ("state=starting".to_string(), Vec::new())
+                }
+                Some(rokr_mcp::McpServerStatus::Ready) => {
+                    let tool_names = handle
+                        .expect("handle present for a Ready status")
+                        .tools()
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect::<Vec<_>>();
+                    ("state=connected".to_string(), tool_names)
+                }
+                Some(rokr_mcp::McpServerStatus::Degraded { reason }) => {
+                    (format!("state=degraded (reason: {reason})"), Vec::new())
+                }
+                None => ("state=unknown".to_string(), Vec::new()),
+            };
+
+            format!(
+                "{name} | transport={transport} | {state} | tools=[{}]",
+                tools.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Ticket 51 (mcp-hooks-introspection): the six hook event names actually
+/// wired to a hook call site somewhere in this file (`main`'s
+/// `SessionStart` firing point; `submit`'s `UserPromptSubmit`,
+/// `PreToolUse`, `PostToolUse`, `Stop`; and the `SessionEnd` firing point
+/// after `rokr_tui::run` returns) -- matches every literal event string
+/// passed to `matching_hook_entries` elsewhere in this file exactly. Used
+/// by `format_hooks_listing` below to flag a hook entry configured under
+/// any OTHER key (a typo, or one of the events the PRD defers to Phase 7
+/// -- `SubagentStop`, `PreCompact`, `Notification`) as `state=inactive`:
+/// real config `/hooks` should still list, just flagged since nothing will
+/// ever run it.
+const SUPPORTED_HOOK_EVENTS: [&str; 6] = [
+    "PreToolUse",
+    "PostToolUse",
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "SessionEnd",
+];
+
+/// Ticket 51 (mcp-hooks-introspection), `/hooks`: renders one line per
+/// configured hook entry, sorted by event name for deterministic output.
+/// See `SUPPORTED_HOOK_EVENTS`'s doc comment for what `state=active` /
+/// `state=inactive` means; see `format_mcp_listing`'s doc comment for why
+/// fields are printed as single `key=value` tokens.
+fn format_hooks_listing(
+    hooks_config: &std::collections::HashMap<String, Vec<rokr_config::HookEntry>>,
+) -> String {
+    if hooks_config.is_empty() {
+        return "No hooks configured.".to_string();
+    }
+
+    let mut events: Vec<&String> = hooks_config.keys().collect();
+    events.sort();
+
+    let mut lines = Vec::new();
+    for event in events {
+        let active = SUPPORTED_HOOK_EVENTS.contains(&event.as_str());
+        let state = if active { "state=active" } else { "state=inactive" };
+        for entry in &hooks_config[event] {
+            let matcher = entry.matcher.as_deref().unwrap_or("*");
+            let timeout_ms = entry
+                .timeout_ms
+                .unwrap_or(rokr_hooks::DEFAULT_TIMEOUT.as_millis() as u64);
+            let blocking = entry
+                .blocking
+                .map(|blocking| blocking.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            lines.push(format!(
+                "{event} | matcher={matcher} | command={} | timeout_ms={timeout_ms} | \
+                 blocking={blocking} | {state}",
+                entry.command
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management

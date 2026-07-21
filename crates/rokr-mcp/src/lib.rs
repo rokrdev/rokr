@@ -174,12 +174,21 @@ pub enum McpServerStatus {
 /// Shared, introspectable state for one configured MCP server: current
 /// status plus the tools it contributes once ready. The background
 /// lifecycle task (spawned by `spawn_server_with_connector`) is the sole
-/// writer; every reader (tool-set assembly in `main.rs`, eventually ticket
-/// 51's `/mcp` command) only ever reads through the accessor methods below.
+/// writer of `status`/`tools`; every reader (tool-set assembly in
+/// `main.rs`, ticket 51's `/mcp` command) only ever reads through the
+/// accessor methods below.
 pub struct McpServerHandle {
     pub name: String,
     status: Arc<std::sync::Mutex<McpServerStatus>>,
     tools: Arc<std::sync::Mutex<Vec<Arc<McpTool>>>>,
+    /// Ticket 51 (mcp-hooks-introspection), `/mcp reconnect`: re-invokes
+    /// this server's connect+`list_tools` retry loop from a fresh
+    /// `Starting` state. Boxed/type-erased (rather than a second generic
+    /// parameter on this struct) so `McpServerHandle` stays a plain,
+    /// non-generic type usable in `Vec<McpServerHandle>` regardless of
+    /// which connector produced it -- `reconnect` below is the only
+    /// caller.
+    restart: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl McpServerHandle {
@@ -193,6 +202,35 @@ impl McpServerHandle {
     /// snapshot without holding this handle's lock.
     pub fn tools(&self) -> Vec<Arc<McpTool>> {
         self.tools.lock().unwrap().clone()
+    }
+
+    /// Ticket 51 (mcp-hooks-introspection), `/mcp reconnect`: resets this
+    /// server back to `Starting` and re-spawns its connect+`list_tools`
+    /// retry loop from attempt 1. The exhausted bounded retry's backoff
+    /// state lived entirely on the stack of the now-finished
+    /// `run_lifecycle` task -- spawning a fresh one from attempt 1 IS
+    /// clearing it; there is no separate counter to reset. Also clears any
+    /// stale tool snapshot, though a `Degraded` server already has none
+    /// (PRD "MCP lifecycle": "contributes zero tools until a future manual
+    /// reconnect").
+    ///
+    /// Deliberately does NOT touch any session's already-frozen MCP
+    /// tool-set snapshot (`mcp_tools_frozen`/`OnceLock` in `main.rs`,
+    /// ticket 46) -- that snapshot is a separate owned `Vec` cloned out via
+    /// `snapshot_tools` at the moment a session first needs it, so a
+    /// reconnect mid-session can only ever affect the NEXT session's
+    /// snapshot, never retroactively change tools already in flight for
+    /// calls already dispatched.
+    ///
+    /// Callable regardless of current status (not just `Degraded`) -- a
+    /// caller may restrict which states it allows reconnecting from
+    /// (`main.rs`'s `/mcp reconnect` does not bother; restarting an
+    /// already-`Ready` server from scratch is harmless), this method
+    /// itself has no opinion.
+    pub fn reconnect(&self) {
+        *self.status.lock().unwrap() = McpServerStatus::Starting;
+        self.tools.lock().unwrap().clear();
+        (*self.restart)();
     }
 }
 
@@ -238,6 +276,20 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// so this lifecycle/retry/status logic is unit-testable without a real
 /// subprocess -- `spawn_stdio_server` below is the production entry point
 /// that supplies a real connector.
+///
+/// Ticket 51 (mcp-hooks-introspection), `/mcp reconnect`: `F: Clone` (new
+/// bound) lets this build a `spawn_lifecycle` closure that re-invokes
+/// `run_lifecycle` on demand, stored on the returned handle as
+/// `McpServerHandle::reconnect`'s restart hook. Free for every real
+/// connector today (`spawn_stdio_server`/`spawn_http_server` below capture
+/// only `String`/`Vec<String>`/`HashMap<String, String>`, all `Clone`, so
+/// the closures rustc derives for them are automatically `Clone` too).
+/// `notice_tx` is wrapped in `Arc<Mutex<_>>` internally (rather than
+/// changing this function's own parameter type) because
+/// `std::sync::mpsc::Sender` is `Send` but not `Sync`, and it needs to be
+/// re-cloned on every reconnect from inside a closure that itself must be
+/// `Sync` (`McpServerHandle` flows through `Arc<Vec<McpServerHandle>>` in
+/// `main.rs`, which requires every field to stay `Send + Sync`).
 pub fn spawn_server_with_connector<F, Fut>(
     name: String,
     connect: F,
@@ -245,27 +297,41 @@ pub fn spawn_server_with_connector<F, Fut>(
     auto_approve: Arc<Vec<String>>,
 ) -> McpServerHandle
 where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<Arc<dyn McpClientPort>, McpClientError>> + Send + 'static,
 {
     let status = Arc::new(std::sync::Mutex::new(McpServerStatus::Starting));
     let tools = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let handle = McpServerHandle {
-        name: name.clone(),
-        status: Arc::clone(&status),
-        tools: Arc::clone(&tools),
+    let notice_tx = Arc::new(std::sync::Mutex::new(notice_tx));
+
+    let spawn_lifecycle: Arc<dyn Fn() + Send + Sync> = {
+        let name = name.clone();
+        let connect = connect.clone();
+        let status = Arc::clone(&status);
+        let tools = Arc::clone(&tools);
+        let notice_tx = Arc::clone(&notice_tx);
+        let auto_approve = Arc::clone(&auto_approve);
+        Arc::new(move || {
+            let sender = notice_tx.lock().unwrap().clone();
+            tokio::spawn(run_lifecycle(
+                name.clone(),
+                connect.clone(),
+                Arc::clone(&status),
+                Arc::clone(&tools),
+                sender,
+                Arc::clone(&auto_approve),
+            ));
+        })
     };
 
-    tokio::spawn(run_lifecycle(
+    (*spawn_lifecycle)();
+
+    McpServerHandle {
         name,
-        connect,
         status,
         tools,
-        notice_tx,
-        auto_approve,
-    ));
-
-    handle
+        restart: spawn_lifecycle,
+    }
 }
 
 /// The background task body `spawn_server_with_connector` spawns: a bounded
@@ -671,6 +737,96 @@ mod tests {
         assert_eq!(handle.status(), McpServerStatus::Ready);
     }
 
+    /// Ticket 51 (mcp-hooks-introspection), `/mcp reconnect`: a server that
+    /// has exhausted its bounded retry (`MAX_CONNECT_ATTEMPTS` failures,
+    /// now `Degraded`) can be reconnected -- `McpServerHandle::reconnect`
+    /// must reset status to `Starting` SYNCHRONOUSLY (before any `.await`,
+    /// proving the degraded/backoff state is cleared immediately rather
+    /// than lingering until some later attempt happens to succeed), then
+    /// re-run the connect+`list_tools` retry loop from attempt 1 -- proven
+    /// here by a connector that succeeds on the very first call after
+    /// `reconnect()`, reaching `Ready` promptly (well under the wall-clock
+    /// backoff the exhausted first loop already paid), with the total
+    /// attempt count landing at exactly `MAX_CONNECT_ATTEMPTS + 1` (3
+    /// exhausted attempts, then 1 fresh successful one) -- not some higher
+    /// number that would mean the old loop's attempt counter carried over.
+    #[tokio::test]
+    async fn reconnect_resets_degraded_server_to_retrying_and_clears_backoff_state() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let should_succeed = Arc::new(AtomicBool::new(false));
+        let connect = {
+            let attempts = Arc::clone(&attempts);
+            let should_succeed = Arc::clone(&should_succeed);
+            move || {
+                let attempts = Arc::clone(&attempts);
+                let should_succeed = Arc::clone(&should_succeed);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if should_succeed.load(Ordering::SeqCst) {
+                        let client: Arc<dyn McpClientPort> = Arc::new(FakeClient {
+                            content: Vec::new(),
+                            is_error: false,
+                        });
+                        Ok(client)
+                    } else {
+                        Err(McpClientError::Spawn("boom".to_string()))
+                    }
+                }
+            }
+        };
+
+        let (notice_tx, _notice_rx) = std::sync::mpsc::channel::<String>();
+        let handle = spawn_server_with_connector(
+            "srv".to_string(),
+            connect,
+            notice_tx,
+            Arc::new(Vec::new()),
+        );
+
+        // Let the bounded retry (3 attempts, with backoff between them)
+        // exhaust and land on Degraded.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            matches!(handle.status(), McpServerStatus::Degraded { .. }),
+            "expected Degraded after the bounded retry exhausted, got {:?}",
+            handle.status()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_CONNECT_ATTEMPTS as usize);
+
+        should_succeed.store(true, Ordering::SeqCst);
+        handle.reconnect();
+
+        assert_eq!(
+            handle.status(),
+            McpServerStatus::Starting,
+            "reconnect must reset status to Starting synchronously"
+        );
+
+        let before = Instant::now();
+        loop {
+            if handle.status() == McpServerStatus::Ready {
+                break;
+            }
+            assert!(
+                before.elapsed() < Duration::from_millis(500),
+                "reconnect did not reach Ready promptly -- stale backoff state from the \
+                 exhausted retry loop appears to have carried over, got {:?}",
+                handle.status()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            MAX_CONNECT_ATTEMPTS as usize + 1,
+            "expected the reconnect's retry loop to start counting from attempt 1, not \
+             continue from the exhausted loop's leftover count"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_tool_flattens_text_content_and_maps_is_error() {
         let client = Arc::new(FakeClient {
@@ -862,6 +1018,7 @@ mod tests {
                 name: name.to_string(),
                 status: Arc::new(std::sync::Mutex::new(McpServerStatus::Ready)),
                 tools: Arc::new(std::sync::Mutex::new(tools)),
+                restart: Arc::new(|| {}),
             }
         }
 
