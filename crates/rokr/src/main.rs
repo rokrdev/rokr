@@ -1,200 +1,30 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use rokr_core::{ExecutableTool, Provider};
-
-mod subagent;
-
-const USAGE: &str =
-    "Usage: rokr [--version] [--agent <plan|build>] [--resume <id>] [--continue] [auth login]";
-
-/// Ticket 35 (resume-session): which prior session (if any) this run should
-/// resume into, extracted from the raw CLI args before the existing
-/// `--version`/`auth login`/`parse_agent_tier` matching runs.
-enum ResumeMode {
-    None,
-    Id(String),
-    Continue,
-}
-
-/// Pulls `--resume <id>` / `--continue` (in any position) out of `args`,
-/// returning the resolved `ResumeMode` plus the remaining args untouched --
-/// so the existing `--version` / `auth login` / `parse_agent_tier` matching
-/// keeps working exactly as today, just against the filtered remainder.
-fn extract_resume_mode(args: &[String]) -> (ResumeMode, Vec<String>) {
-    let mut mode = ResumeMode::None;
-    let mut remaining = Vec::new();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--resume" => {
-                if let Some(id) = iter.next() {
-                    mode = ResumeMode::Id(id.clone());
-                }
-            }
-            "--continue" => mode = ResumeMode::Continue,
-            other => remaining.push(other.to_string()),
-        }
-    }
-    (mode, remaining)
-}
-
-/// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
-/// when no flag is given. `Plan` is read-only: read/glob/grep/ls only, so
-/// the agent can explore and reason about a codebase without being able to
-/// change anything. `Build` adds bash/write/edit on top, unlocking actual
-/// mutation. Each tier's tools are all wired through the same
-/// `rokr_core::run_tool_loop`; the tier only changes which tools are handed
-/// in and which system prompt (`{config_dir}/agents/{tier}.md`) is seeded.
-#[derive(Clone, Copy)]
-enum AgentTier {
-    Plan,
-    Build,
-}
-
-impl AgentTier {
-    fn prompt_name(self) -> &'static str {
-        match self {
-            AgentTier::Plan => "plan",
-            AgentTier::Build => "build",
-        }
-    }
-}
-
-/// F-003: the real send path (`run_tool_loop`, `compact_transcript`) AND
-/// `subagent::SubagentTool` (ticket 30, F-004) share this SINGLE
-/// resilience-wrapped provider — previously this was two separate locks (a
-/// resilience-wrapped one for the send path, a bare unwrapped one for
-/// subagents), written and read non-atomically, so a `/model` switch racing
-/// `submit`'s two reads could split the parent and a subagent onto
-/// different backends. `ResilientProvider<AnyProvider>` is `Clone` (see
-/// `resilience.rs`), so a single `Arc<RwLock<..>>` is enough: ticket 29's
-/// read-clone-drop-guard pattern (clone the current provider out from
-/// behind a read lock and drop the guard immediately, so `/model` never
-/// blocks on an in-flight request's `.await`, which can legitimately run as
-/// long as the retry policy's `max_elapsed`) clones the whole
-/// `ResilientProvider<AnyProvider>` value directly rather than an inner
-/// `Arc`.
-type SharedProvider = Arc<tokio::sync::RwLock<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>>;
-
-/// Parses the raw CLI args (already stripped of argv[0]) into an
-/// `AgentTier`. No args at all defaults to `Plan`; `--agent plan` and
-/// `--agent build` select explicitly; anything else is a usage error.
-fn parse_agent_tier(args: &[String]) -> Result<AgentTier, ()> {
-    match args {
-        [] => Ok(AgentTier::Plan),
-        [flag, value] if flag == "--agent" => match value.as_str() {
-            "plan" => Ok(AgentTier::Plan),
-            "build" => Ok(AgentTier::Build),
-            _ => Err(()),
-        },
-        _ => Err(()),
-    }
-}
-
-/// Runs `entry`'s command against `payload`, honoring its `timeout_ms`
-/// override (falling back to `rokr_hooks::DEFAULT_TIMEOUT` when absent).
-/// Ticket 50 (hooks-remaining-events-and-config): shared by every hook call
-/// site below (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`,
-/// `SessionStart`, `Stop`, `SessionEnd`) so the timeout-override lookup
-/// lives in exactly one place.
-async fn run_hook_entry(
-    entry: &rokr_config::HookEntry,
-    payload: &rokr_hooks::HookPayload,
-) -> rokr_hooks::HookResult {
-    let timeout = entry
-        .timeout_ms
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(rokr_hooks::DEFAULT_TIMEOUT);
-    rokr_hooks::execute_hook(&entry.command, payload, timeout).await
-}
-
-/// Every hook entry configured for `event`, matcher-filtered against
-/// `tool_name` when `Some` (`PreToolUse`/`PostToolUse`) or left unfiltered
-/// when `None` -- every lifecycle event (`SessionStart`, `UserPromptSubmit`,
-/// `Stop`, `SessionEnd`) ignores `matcher` entirely, per the PRD's "Matcher
-/// shape" note, simply by always being called with `tool_name: None` at its
-/// call sites below. An entry with no `matcher` set behaves like `"*"`
-/// (matches every tool), same as a missing `matcher` string would via
-/// `rokr_hooks::matches_tool_name`.
-fn matching_hook_entries<'a>(
-    hooks_config: &'a std::collections::HashMap<String, Vec<rokr_config::HookEntry>>,
-    event: &str,
-    tool_name: Option<&str>,
-) -> Vec<&'a rokr_config::HookEntry> {
-    hooks_config
-        .get(event)
-        .into_iter()
-        .flatten()
-        .filter(|entry| match tool_name {
-            Some(tool_name) => entry
-                .matcher
-                .as_deref()
-                .is_none_or(|matcher| rokr_hooks::matches_tool_name(matcher, tool_name)),
-            None => true,
-        })
-        .collect()
-}
-
-/// Logs a one-line notice for a fire-and-observe hook's outcome
-/// (`PostToolUse`, `Stop`, `SessionEnd` -- none of which can veto anything,
-/// architect decision: "Stop/SessionEnd: fire-and-observe, exit codes
-/// logged, non-blocking"), extended here to `PostToolUse` for the identical
-/// reason (it always runs after the tool it's attached to has already
-/// executed, so there's nothing left to veto). A `Success` outcome is the
-/// silent default (nothing to report); `Blocked` (exit 2) is logged as an
-/// IGNORED veto attempt, since these events have no veto to honor;
-/// `NonBlockingFailure` is logged as-is.
-///
-/// Known wart (ticket 51, mcp-hooks-introspection, flagged for Phase 7):
-/// `eprintln!` here (and at the two `PreToolUse` outcome sites in `submit`
-/// just above `run_tool_loop`'s call) writes to stderr while the TUI may
-/// still hold the alt-screen -- fine for the `SessionStart`/`SessionEnd`
-/// call sites (both fire outside `rokr_tui::run`'s active window), but the
-/// `PostToolUse`/`Stop` call sites inside `submit`'s closure fire WHILE the
-/// TUI is rendering. Routing these through the existing `SessionStatus`
-/// notice channel (`status_tx`, already captured in `submit`'s closure)
-/// would need: a `context_percent` value to pair with the notice (no
-/// "current" figure exists mid-turn without adding new state -- unlike the
-/// MCP notice-forwarder task above, which has `last_known_usage` handy),
-/// and splitting this function's signature (or adding a sibling wrapper)
-/// since `SessionStart`/`SessionEnd` must stay `eprintln!`-based. Judged
-/// out of scope for this ticket.
-fn log_observational_hook_outcome(event: &str, result: &rokr_hooks::HookResult) {
-    match result {
-        rokr_hooks::HookResult::Success { .. } => {}
-        rokr_hooks::HookResult::Blocked { stderr } => {
-            eprintln!(
-                "{event} hook exited 2 (a blocking exit code), but {event} is fire-and-observe \
-                 only and cannot veto anything -- ignoring: {stderr}"
-            );
-        }
-        rokr_hooks::HookResult::NonBlockingFailure { message } => {
-            eprintln!("{event} hook failed non-blocking: {message}");
-        }
-    }
-}
+use clap::Parser;
+use rokr_core::ExecutableTool;
+use rokr_app::cli::{AuthAction, Cli, Command};
+use rokr_app::{
+    append_compaction_record, log_observational_hook_outcome, matching_hook_entries,
+    now_timestamp, run_hook_entry, AgentTier, ResumeMode, SessionRunner, SharedProvider,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // Ticket 35 (resume-session): pulled out BEFORE the existing match so
-    // `--resume <id>` / `--continue` can appear anywhere on the command
-    // line without disturbing the `--version` / `auth login` /
-    // `parse_agent_tier` matching below, which now runs against
-    // `remaining_args` instead of the raw `args`.
-    let (resume_mode, remaining_args) = extract_resume_mode(&args);
+    // Ticket 52 (clap-and-sessionrunner-extraction): argument parsing is now
+    // owned by `clap` (see `rokr_app::cli`). `Cli::parse()` handles
+    // `--version` / `--help` and usage errors itself (printing and exiting),
+    // replacing the hand-rolled `--version` / `auth login` / `parse_agent_tier`
+    // match this function used to open with.
+    let cli = Cli::parse();
 
-    match remaining_args.as_slice() {
-        [flag] if flag == "--version" => {
-            println!("rokr {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
+    match cli.command {
         // Ticket 31 (oauth-pkce-login): runs the PKCE login flow and exits
-        // rather than entering the TUI. Parallel to the `--version` arm
-        // above -- there's no clap/subcommand framework in this binary yet,
-        // so this is a second explicit match arm, same as that one.
-        [a, b] if a == "auth" && b == "login" => {
+        // rather than entering the TUI. Now the `auth login` clap subcommand
+        // rather than a hand-matched `[a, b]` argv pair.
+        Some(Command::Auth {
+            action: AuthAction::Login,
+        }) => {
             let config_dir = rokr_config::default_config_dir();
             let token_store = rokr_provider::auth::default_token_store(&config_dir);
             match rokr_provider::auth::login(token_store.as_ref()).await {
@@ -205,14 +35,12 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        _ => {
-            let agent = match parse_agent_tier(&remaining_args) {
-                Ok(agent) => agent,
-                Err(()) => {
-                    eprintln!("{USAGE}");
-                    return ExitCode::FAILURE;
-                }
-            };
+        // No subcommand: launch the TUI. `--agent` defaults to `Plan` when
+        // absent (the old `parse_agent_tier([])` behavior);
+        // `--resume` / `--continue` resolve via `Cli::resume_mode`.
+        None => {
+            let agent = cli.agent.unwrap_or(AgentTier::Plan);
+            let resume_mode = cli.resume_mode();
 
             let config = match rokr_config::load_or_init_default() {
                 Ok(config) => config,
@@ -739,624 +567,34 @@ async fn main() -> ExitCode {
             // that turn, in deterministic sorted order.
             let submit_mcp_notice_tx = mcp_notice_tx.clone();
 
+            let runner = SessionRunner {
+                provider,
+                transcript,
+                system_prompt,
+                repo_map,
+                last_known_usage,
+                config_dir,
+                session_handle,
+                turn_index,
+                data_dir,
+                status_tx,
+                mcp_server_handles,
+                mcp_notice_tx: submit_mcp_notice_tx,
+                mcp_http_origins,
+                hooks_config: hooks_config_for_submit,
+                agent,
+                context_window_size,
+                auto_compact_threshold,
+            };
+
+            // Ticket 52 (clap-and-sessionrunner-extraction): the submit-and-run
+            // orchestration that used to be inlined in this closure now lives in
+            // `rokr_app::SessionRunner::run_submission`. This closure is a thin
+            // adapter -- `rokr_tui::run` hands it each Enter-press's prompt text
+            // and a fresh `PermissionHandle`, which it forwards straight into the
+            // runner (identical behavior; a pure move).
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
-                let provider = provider.clone();
-                let transcript = transcript.clone();
-                let system_prompt = system_prompt.clone();
-                let repo_map = repo_map.clone();
-                let last_known_usage = last_known_usage.clone();
-                let config_dir = config_dir.clone();
-                let session_handle = session_handle.clone();
-                let turn_index = turn_index.clone();
-                let data_dir = data_dir.clone();
-                let status_tx = status_tx.clone();
-                let mcp_server_handles = mcp_server_handles.clone();
-                let mcp_notice_tx = submit_mcp_notice_tx.clone();
-                let mcp_http_origins = mcp_http_origins.clone();
-                let hooks_config = hooks_config_for_submit.clone();
-                async move {
-                    let provider = provider?;
-                    // F-003: ONE read lock, ONE clone of the current
-                    // resilience-wrapped provider snapshot, shared by both
-                    // the send path below and `SubagentTool` (F-004) --
-                    // guard dropped immediately, never held across an
-                    // `.await`, so `/model` never blocks on an in-flight
-                    // request's `.await` (which can legitimately run as
-                    // long as the retry policy's `max_elapsed`).
-                    let provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider> =
-                        provider.read().await.clone();
-
-                    // All eight tools are constructed unconditionally
-                    // (they're cheap zero-sized unit structs); which ones
-                    // actually land in `tools` depends on the agent tier.
-                    // read/glob/grep/ls auto-approve (ADR 0005: none are
-                    // `PreviewableTool`s); bash, write, edit, and webfetch
-                    // are gated and round-trip through the permission
-                    // callback below, and only exist in the tool set for
-                    // the `Build` tier.
-                    let read = rokr_tools::read::ReadTool;
-                    let glob = rokr_tools::glob::GlobTool;
-                    let grep = rokr_tools::grep::GrepTool;
-                    let ls = rokr_tools::ls::LsTool;
-                    let bash = rokr_tools::bash::BashTool;
-                    let write = rokr_tools::write::WriteTool;
-                    let edit = rokr_tools::edit::EditTool;
-                    let webfetch = rokr_tools::webfetch::WebfetchTool;
-
-                    // Ticket 28 (websearch-tool): `websearch` needs an
-                    // actual `rokr_tools::websearch::NativeSearchCapability`
-                    // object to delegate to — `provider.native_search_capable()`
-                    // alone is just a thin bool signal (see that method's
-                    // doc comment on why `rokr-core` can't hand back more
-                    // than that). No adapter in this codebase constructs a
-                    // real capability object yet (`rokr-provider` doesn't
-                    // depend on `rokr-tools`, and bridging a real
-                    // Anthropic-backed capability through here is out of
-                    // scope for this ticket), so `native_search_capability`
-                    // is provably `None` today. The `native_search_capable()`
-                    // query below is still real, not hardcoded, so a
-                    // follow-up ticket that supplies a genuine capability
-                    // object lights `websearch` up without touching this
-                    // gating logic again.
-                    let native_search_capability: Option<
-                        Arc<dyn rokr_tools::websearch::NativeSearchCapability>,
-                    > = None;
-                    let websearch = if provider.native_search_capable() {
-                        rokr_tools::websearch::for_capability(native_search_capability)
-                    } else {
-                        None
-                    };
-
-                    // Ticket 30 (subagent-tool): cloned before
-                    // `request_permission` below moves `permission` into
-                    // its own closure -- the subagent tool's callback needs
-                    // its own clone of the SAME handle so a subagent's
-                    // gated tool calls round-trip through the identical
-                    // channel the parent's own gated tool calls do.
-                    let subagent_permission = permission.clone();
-
-                    // Ticket 38 (checkpoint-pre-images): both
-                    // `request_permission` below and the mirrored
-                    // `subagent_request_permission` need their OWN owned
-                    // clones of `session_handle`/`turn_index`/`data_dir` to
-                    // `move` into themselves, since `session_handle` and
-                    // `turn_index` are still read again later in this same
-                    // `submit` body (append_turn / the increment above's
-                    // sibling call site) -- cloning here, not moving the
-                    // originals, mirrors `subagent_permission`'s existing
-                    // pattern immediately above.
-                    let request_permission_session_handle = session_handle.clone();
-                    let request_permission_turn_index = turn_index.clone();
-                    let request_permission_data_dir = data_dir.clone();
-                    let request_permission_mcp_http_origins = mcp_http_origins.clone();
-                    let subagent_request_permission_session_handle = session_handle.clone();
-                    let subagent_request_permission_turn_index = turn_index.clone();
-                    let subagent_request_permission_data_dir = data_dir.clone();
-                    let subagent_request_permission_mcp_http_origins = mcp_http_origins.clone();
-
-                    // Bridges rokr-core's `PermissionRequest` (tool name +
-                    // `PermissionPayload`) to rokr-tui's primitive
-                    // `PermissionRequest` (tool name + a display string),
-                    // round-tripping through the TUI's render loop via
-                    // `permission`. This is the seam rokr-tui's `run` doc
-                    // comment calls out: rokr-tui stays decoupled from
-                    // rokr-core's specific types, so main.rs bridges them.
-                    // Ticket 38 (checkpoint-pre-images): on GRANT, also
-                    // captures a pre-image snapshot for a `Diff` payload
-                    // (write/edit) and appends a correlating `Checkpoint`
-                    // record -- see `capture_checkpoint_if_granted_diff`'s
-                    // doc comment. `PermissionPayload::Command` (bash)
-                    // snapshots nothing, falling out structurally from the
-                    // match below rather than a runtime special-case.
-                    let request_permission = move |request: rokr_core::PermissionRequest| {
-                        let permission = permission.clone();
-                        let session_handle = request_permission_session_handle.clone();
-                        let turn_index = request_permission_turn_index.clone();
-                        let data_dir = request_permission_data_dir.clone();
-                        let mcp_http_origins = request_permission_mcp_http_origins.clone();
-                        async move {
-                            let (detail, diff_path_and_old) = match request.payload {
-                                rokr_core::PermissionPayload::Command(command) => {
-                                    (rokr_tui::PermissionDetail::Text(command), None)
-                                }
-                                rokr_core::PermissionPayload::Diff { path, old, new } => (
-                                    rokr_tui::PermissionDetail::Diff {
-                                        old: old.clone(),
-                                        new,
-                                    },
-                                    Some((path, old)),
-                                ),
-                                rokr_core::PermissionPayload::ToolCall {
-                                    server,
-                                    tool,
-                                    input_pretty,
-                                } => {
-                                    let origin = mcp_http_origins.get(&server).map(String::as_str);
-                                    (
-                                        rokr_tui::PermissionDetail::Text(
-                                            format_tool_call_permission_text(
-                                                &server,
-                                                &tool,
-                                                &input_pretty,
-                                                origin,
-                                            ),
-                                        ),
-                                        None,
-                                    )
-                                }
-                            };
-                            let granted = permission
-                                .request(rokr_tui::PermissionRequest {
-                                    tool_name: request.tool_name,
-                                    detail,
-                                })
-                                .await;
-                            if granted {
-                                capture_checkpoint_if_granted_diff(
-                                    diff_path_and_old,
-                                    &data_dir,
-                                    &session_handle,
-                                    &turn_index,
-                                )
-                                .await;
-                            }
-                            granted
-                        }
-                    };
-
-                    // Ticket 30 (subagent-tool): bridges rokr-core's
-                    // PermissionRequest to the SAME rokr_tui::PermissionHandle
-                    // the parent's own request_permission above uses (PRD
-                    // Phase 4 "Subagents": "Permission inheritance").
-                    // Tagging with the subagent's name happens inside
-                    // `subagent::run_subagent`, not here -- this closure
-                    // only forwards the (already-tagged) request. Ticket 38
-                    // (checkpoint-pre-images): wired the SAME way as
-                    // `request_permission` above -- a subagent's gated tool
-                    // calls happen within the same parent turn, so they
-                    // share the SAME `turn_index` (not a subagent-local
-                    // counter).
-                    let subagent_request_permission: subagent::PermissionCallback =
-                        Box::new(move |request: rokr_core::PermissionRequest| {
-                            let permission = subagent_permission.clone();
-                            let session_handle = subagent_request_permission_session_handle.clone();
-                            let turn_index = subagent_request_permission_turn_index.clone();
-                            let data_dir = subagent_request_permission_data_dir.clone();
-                            let mcp_http_origins =
-                                subagent_request_permission_mcp_http_origins.clone();
-                            Box::pin(async move {
-                                let (detail, diff_path_and_old) = match request.payload {
-                                    rokr_core::PermissionPayload::Command(command) => {
-                                        (rokr_tui::PermissionDetail::Text(command), None)
-                                    }
-                                    rokr_core::PermissionPayload::Diff { path, old, new } => (
-                                        rokr_tui::PermissionDetail::Diff {
-                                            old: old.clone(),
-                                            new,
-                                        },
-                                        Some((path, old)),
-                                    ),
-                                    rokr_core::PermissionPayload::ToolCall {
-                                        server,
-                                        tool,
-                                        input_pretty,
-                                    } => {
-                                        let origin =
-                                            mcp_http_origins.get(&server).map(String::as_str);
-                                        (
-                                            rokr_tui::PermissionDetail::Text(
-                                                format_tool_call_permission_text(
-                                                    &server,
-                                                    &tool,
-                                                    &input_pretty,
-                                                    origin,
-                                                ),
-                                            ),
-                                            None,
-                                        )
-                                    }
-                                };
-                                let granted = permission
-                                    .request(rokr_tui::PermissionRequest {
-                                        tool_name: request.tool_name,
-                                        detail,
-                                    })
-                                    .await;
-                                if granted {
-                                    capture_checkpoint_if_granted_diff(
-                                        diff_path_and_old,
-                                        &data_dir,
-                                        &session_handle,
-                                        &turn_index,
-                                    )
-                                    .await;
-                                }
-                                granted
-                            })
-                        });
-                    // F-003/F-004: the SAME single provider snapshot the
-                    // send path below uses, resilience-wrapped -- no longer
-                    // a separately-tracked bare `AnyProvider`.
-                    let subagent_tool = subagent::SubagentTool::new(
-                        provider.clone(),
-                        config_dir.clone(),
-                        subagent_request_permission,
-                    );
-
-                    // PC-1 ruling (supersedes ticket 46's whole-session
-                    // `OnceLock` freeze): the session's MCP tool-set
-                    // snapshot -- sorted deterministically by (server,
-                    // tool) via `rokr_mcp::snapshot_tools` -- is now
-                    // recomputed fresh every Build-tier `submit`, but each
-                    // individual server's contribution within it is
-                    // ALREADY frozen (`McpServerHandle::joined`, written at
-                    // most once per server: that server's own first
-                    // `Ready`, or again on a later explicit `/mcp
-                    // reconnect` success -- never on an automatic
-                    // Ready-after-Fail flap). So a server that's still
-                    // `Starting` on turn 1 and reaches `Ready` before turn
-                    // 2 DOES appear starting turn 2 (this is the intended,
-                    // one-time auto-join, not "mutation"); a server that
-                    // was already joined on turn 1 contributes the EXACT
-                    // SAME tools on turn 2 even if its live tool list
-                    // somehow changed, since this reads each server's
-                    // frozen `joined` snapshot, never its live one.
-                    // Declared here, as owned `Arc<McpTool>`s, BEFORE
-                    // `tools` below so the `&dyn ExecutableTool` references
-                    // pushed into `tools` borrow from something that
-                    // outlives the `run_tool_loop` call.
-                    let mcp_tools_snapshot: Vec<Arc<rokr_mcp::McpTool>> =
-                        if matches!(agent, AgentTier::Build) {
-                            rokr_mcp::snapshot_tools(&mcp_server_handles, &mcp_notice_tx)
-                        } else {
-                            Vec::new()
-                        };
-
-                    let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
-                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
-                        AgentTier::Build => {
-                            vec![
-                                &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
-                                &subagent_tool,
-                            ]
-                        }
-                    };
-                    if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
-                        tools.push(websearch);
-                    }
-                    // MCP tools are gated (`McpTool::preview` always returns
-                    // `Some(...)`), so -- like bash/write/edit/webfetch
-                    // above -- they only join the tool set for the `Build`
-                    // tier, never `Plan` (ticket 44's original gating
-                    // behavior, preserved here).
-                    for tool in &mcp_tools_snapshot {
-                        tools.push(tool.as_ref() as &dyn rokr_core::ExecutableTool);
-                    }
-
-                    // Expand any `@path` mentions in the raw input BEFORE it
-                    // joins the transcript, so resolved file contents (or a
-                    // not-found note) land in the same user-role message
-                    // rather than as a separate synthetic message — at
-                    // least one supported provider rejects an orphan
-                    // tool-role message on the wire, so this deliberately
-                    // reuses the plain user-text path rather than a
-                    // ToolResult block. The resolver is real filesystem IO
-                    // (the only IO `rokr-core`'s pure `mentions` module
-                    // doesn't perform itself), matching `rokr-tools`'
-                    // `read` tool's own io-error-to-failure behavior: any
-                    // read error (missing file, permissions, non-UTF-8,
-                    // ...) is treated as `NotFound`.
-                    let mut expanded_input =
-                        rokr_core::mentions::expand_mentions(&input, |path| {
-                            match std::fs::read_to_string(path) {
-                                Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
-                                Err(_) => rokr_core::mentions::MentionResolution::NotFound,
-                            }
-                        });
-
-                    // `UserPromptSubmit` (PRD "Hooks"; architect decision:
-                    // "UserPromptSubmit before each prompt is sent"): runs
-                    // BEFORE this turn's user message joins the transcript
-                    // at all, so a blocking deny (exit 2, unless the entry
-                    // opts out via `blocking: false`) can short-circuit the
-                    // whole submission with an early `Err` -- same "denied
-                    // before anything is recorded" shape `PreToolUse`'s
-                    // ordering rule gives tool calls, just one level up.
-                    // Every matching hook's exit-0 stdout is concatenated
-                    // and appended to `expanded_input`, injecting fresh
-                    // context into THIS turn's own user message (reusing
-                    // the plain user-text path, same reasoning as the
-                    // `@path`-mention expansion above: at least one
-                    // supported provider rejects an orphan tool-role
-                    // message on the wire).
-                    let mut injected_user_prompt_context = String::new();
-                    for entry in matching_hook_entries(&hooks_config, "UserPromptSubmit", None) {
-                        let payload = rokr_hooks::HookPayload::UserPromptSubmit {
-                            prompt: expanded_input.clone(),
-                        };
-                        match run_hook_entry(entry, &payload).await {
-                            rokr_hooks::HookResult::Success { stdout } => {
-                                if !stdout.trim().is_empty() {
-                                    if !injected_user_prompt_context.is_empty() {
-                                        injected_user_prompt_context.push_str("\n\n");
-                                    }
-                                    injected_user_prompt_context.push_str(stdout.trim());
-                                }
-                            }
-                            rokr_hooks::HookResult::Blocked { stderr } => {
-                                if entry.blocking.unwrap_or(true) {
-                                    return Err(stderr);
-                                }
-                                eprintln!(
-                                    "UserPromptSubmit hook exited 2 but its config entry sets \
-                                     blocking: false, allowing the prompt through: {stderr}"
-                                );
-                            }
-                            rokr_hooks::HookResult::NonBlockingFailure { message } => {
-                                eprintln!(
-                                    "UserPromptSubmit hook failed non-blocking, continuing \
-                                     without its injected context: {message}"
-                                );
-                            }
-                        }
-                    }
-                    if !injected_user_prompt_context.is_empty() {
-                        expanded_input =
-                            format!("{expanded_input}\n\n{injected_user_prompt_context}");
-                    }
-
-                    let mut transcript = transcript.lock().await;
-                    // Schema v2 (architect ruling, phase-5): capture the
-                    // transcript length BEFORE this turn's user message and
-                    // its whole exchange are appended, so the `Turn` record
-                    // below can persist EXACTLY the slice this submit
-                    // produced -- the user prompt plus every
-                    // assistant/tool-use/tool-result/final message
-                    // `run_tool_loop` appends in place.
-                    let start = transcript.len();
-                    accumulate_user_turn(&mut transcript, expanded_input);
-
-                    let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
-
-                    // `PreToolUse` (ticket 49, hooks-tracer-bullet; replaced
-                    // here by ticket 50, hooks-remaining-events-and-config,
-                    // with the real `hooks` config schema -- the interim
-                    // `ROKR_PRETOOLUSE_HOOK` env var this superseded is
-                    // gone, mirroring how ticket 45's `mcp` config schema
-                    // superseded ticket 44's `ROKR_MCP_SERVER` env var):
-                    // runs every configured `PreToolUse` hook whose
-                    // `matcher` glob matches the tool name about to be
-                    // called (`matching_hook_entries`), in order, stopping
-                    // at the first that denies. A hook that exits 2 vetoes
-                    // UNLESS its own config entry sets `blocking: false`,
-                    // in which case the veto is downgraded to a logged
-                    // non-blocking notice -- see `HookEntry::blocking`'s doc
-                    // comment in `rokr-config` for why that escape hatch
-                    // exists. Any other outcome (success, non-blocking
-                    // failure, or a downgraded block) falls through to
-                    // `Allow`, matching `execute_hook`'s own
-                    // non-blocking-failure contract
-                    // (`docs/adr/0012-hooks-execution-trust-model.md`).
-                    let pre_tool_hook: &rokr_core::PreToolHookCallback<'_> =
-                        &|request: rokr_core::PreToolHookRequest| {
-                            let hooks_config = hooks_config.clone();
-                            Box::pin(async move {
-                                let entries = matching_hook_entries(
-                                    &hooks_config,
-                                    "PreToolUse",
-                                    Some(&request.tool_name),
-                                );
-                                for entry in entries {
-                                    let payload = rokr_hooks::HookPayload::PreToolUse {
-                                        tool_name: request.tool_name.clone(),
-                                        tool_input: request.tool_input.clone(),
-                                    };
-                                    match run_hook_entry(entry, &payload).await {
-                                        rokr_hooks::HookResult::Success { .. } => {}
-                                        rokr_hooks::HookResult::Blocked { stderr } => {
-                                            if entry.blocking.unwrap_or(true) {
-                                                return rokr_core::PreToolHookOutcome::Deny(
-                                                    stderr,
-                                                );
-                                            }
-                                            eprintln!(
-                                                "PreToolUse hook exited 2 but its config entry \
-                                                 sets blocking: false, allowing the tool call \
-                                                 through: {stderr}"
-                                            );
-                                        }
-                                        rokr_hooks::HookResult::NonBlockingFailure { message } => {
-                                            eprintln!(
-                                                "PreToolUse hook failed non-blocking, allowing \
-                                                 the tool call through: {message}"
-                                            );
-                                        }
-                                    }
-                                }
-                                rokr_core::PreToolHookOutcome::Allow
-                            })
-                        };
-
-                    // `PostToolUse` (ticket 50, hooks-remaining-events-and-config;
-                    // PRD "Hooks", architect decision: "mirrors PreToolUse's
-                    // callback shape, non-blocking observational"): runs
-                    // every configured `PostToolUse` hook whose `matcher`
-                    // matches the tool that just ran, AFTER its result is
-                    // already decided. `PostToolHookCallback` returns `()`
-                    // (see that type's doc comment) -- nothing this closure
-                    // does can change the `ToolResult` already produced;
-                    // every outcome (including a stray exit 2) is just
-                    // logged via `log_observational_hook_outcome`.
-                    let post_tool_hook: &rokr_core::PostToolHookCallback<'_> =
-                        &|request: rokr_core::PostToolHookRequest| {
-                            let hooks_config = hooks_config.clone();
-                            Box::pin(async move {
-                                let entries = matching_hook_entries(
-                                    &hooks_config,
-                                    "PostToolUse",
-                                    Some(&request.tool_name),
-                                );
-                                for entry in entries {
-                                    let payload = rokr_hooks::HookPayload::PostToolUse {
-                                        tool_name: request.tool_name.clone(),
-                                        tool_input: request.tool_input.clone(),
-                                        tool_output: request.tool_output.clone(),
-                                        is_error: request.is_error,
-                                    };
-                                    let result = run_hook_entry(entry, &payload).await;
-                                    log_observational_hook_outcome("PostToolUse", &result);
-                                }
-                            })
-                        };
-
-                    let (reply, usage) = rokr_core::run_tool_loop(
-                        &provider,
-                        &system_prompt,
-                        repo_map_snapshot.as_deref(),
-                        &mut transcript,
-                        &tools,
-                        request_permission,
-                        Some(pre_tool_hook),
-                        Some(post_tool_hook),
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?;
-
-                    // `Stop` (ticket 50, hooks-remaining-events-and-config;
-                    // PRD "Hooks", architect decision: "Stop when agent
-                    // finishes a turn"): fires here, once `run_tool_loop`
-                    // has produced this turn's final reply, fire-and-observe
-                    // like `PostToolUse` above (no veto semantics -- the
-                    // turn has already finished).
-                    for entry in matching_hook_entries(&hooks_config, "Stop", None) {
-                        let result = run_hook_entry(entry, &rokr_hooks::HookPayload::Stop).await;
-                        log_observational_hook_outcome("Stop", &result);
-                    }
-
-                    // Schema v2 (architect ruling, phase-5): exactly ONE
-                    // `Turn` record per submit, appended after
-                    // `run_tool_loop` returns and BEFORE the auto-compaction
-                    // check below, carrying the FULL exchange
-                    // (`transcript[start..]`) -- the @path-mention-EXPANDED
-                    // user message (what actually went out on the wire) plus
-                    // every assistant/tool-use/tool-result/final message the
-                    // loop appended. Atomic: the whole exchange or nothing (a
-                    // crash mid-loop drops the in-flight turn), intentionally
-                    // not split into an early user append and a later
-                    // assistant append. Note this supersedes ticket 34's
-                    // earlier behavior of persisting the raw pre-expansion
-                    // `input`.
-                    {
-                        let session_handle_guard = session_handle.read().await;
-                        if let Some(session_handle) = session_handle_guard.as_ref() {
-                            session_handle.append_turn(
-                                transcript[start..].to_vec(),
-                                rokr_session::UsageRecord::from(usage),
-                                now_timestamp(),
-                            );
-                        }
-                    }
-
-                    // Ticket 38 (checkpoint-pre-images): incremented AFTER
-                    // this turn's own `Turn` record has been appended above
-                    // (or would have been, if persistence is degraded) --
-                    // every gated tool call's snapshot taken during THIS
-                    // turn's `run_tool_loop` call above used the
-                    // pre-increment value, which is exactly the index this
-                    // turn's own `Turn` record occupies once appended (see
-                    // `turn_index`'s own doc comment, and `fold`'s
-                    // `next_turn_index` semantics in rokr-session).
-                    *turn_index.lock().unwrap() += 1;
-
-                    // Auto-compaction (ticket 20): checked once per
-                    // submitted turn using that turn's own final usage
-                    // figure. Runs inside this same async submit future —
-                    // no new thread, nothing here blocks the render loop.
-                    // On failure the transcript is left untouched and a
-                    // notice is prepended to this turn's reply instead of
-                    // losing history.
-                    let (prior_usage, effective_usage_for_percent) = {
-                        let mut guard = last_known_usage.lock().unwrap();
-                        let prior = *guard;
-                        let effective = if usage.input_tokens != 0 || usage.output_tokens != 0 {
-                            *guard = Some(usage);
-                            usage
-                        } else {
-                            // F-011 (argus review): some OpenAI-compatible
-                            // proxies intermittently omit real usage for a
-                            // turn (an all-zero figure) -- treating that as
-                            // "this turn used zero tokens" would visibly
-                            // drop the status line's percentage to 0%. Fall
-                            // back to whatever was last known (or the same
-                            // all-zero `usage` if nothing real has ever
-                            // been reported this session, matching today's
-                            // very first-turn behavior).
-                            guard.unwrap_or(usage)
-                        };
-                        (prior, effective)
-                    };
-
-                    // Ticket 43 (mouse-scroll-status-line): sent after every
-                    // turn's usage is known, regardless of whether it was
-                    // just folded into `last_known_usage` above (even an
-                    // all-zero usage figure is still worth reflecting in the
-                    // status line rather than leaving the previous turn's
-                    // percentage stale). `context_window_size` is the same
-                    // `u32` already captured by this closure for
-                    // `should_compact` below. F-011: uses
-                    // `effective_usage_for_percent` (falls back to the last
-                    // known real usage on an all-zero report) rather than
-                    // the raw `usage` -- scoped ONLY to this status-line
-                    // percentage; `should_compact` below still sees the raw
-                    // `usage`/`prior_usage` unchanged.
-                    let context_percent = (effective_usage_for_percent.input_tokens
-                        + effective_usage_for_percent.output_tokens)
-                        as f64
-                        / context_window_size as f64;
-                    let _ = status_tx.send(rokr_tui::SessionStatus {
-                        context_percent,
-                        notice: None,
-                    });
-
-                    let notice = if rokr_core::should_compact(
-                        usage,
-                        prior_usage,
-                        &transcript,
-                        context_window_size,
-                        auto_compact_threshold,
-                    ) {
-                        match rokr_core::compact_transcript(&provider, &transcript).await {
-                            Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
-                                // RULING 2: persist a Compaction record. At
-                                // this point `turn_index` has already been
-                                // incremented for THIS turn (see above), so
-                                // its value is the raw turn count; the retained
-                                // tail turn is `raw_turn_count - 1` and the
-                                // summary replaces through `raw_turn_count - 2`.
-                                let raw_turn_count = *turn_index.lock().unwrap();
-                                append_compaction_record(
-                                    &session_handle,
-                                    &compacted,
-                                    raw_turn_count,
-                                )
-                                .await;
-                                *transcript = compacted;
-                                None
-                            }
-                            Ok(rokr_core::CompactionOutcome::NothingToCompact) => None,
-                            Err(err) => Some(format!(
-                                "[auto-compaction failed, continuing with full history: {err}]"
-                            )),
-                        }
-                    } else {
-                        None
-                    };
-
-                    Ok(match notice {
-                        Some(notice) => format!("{notice}\n{}", reply.text()),
-                        None => reply.text(),
-                    })
-                }
+                runner.run_submission(input, permission)
             };
 
             // Ticket 36 (session-index-list-jump): `/sessions` is added to
@@ -1627,43 +865,6 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Appends a new user-turn message onto the running conversation transcript.
-/// `run_tool_loop` appends the corresponding assistant/tool-call/tool-result
-/// messages as it executes; this is the seam where a fresh prompt joins that
-/// running history.
-fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
-    transcript.push(rokr_core::Message::user_text(input));
-}
-
-/// Ticket 47 (mcp-permission-polish): formats a `PermissionPayload::ToolCall`
-/// into the `rokr_tui::PermissionDetail::Text` shown in the permission
-/// prompt -- one `label: value` line per field, server then tool then the
-/// pretty-printed input. Kept as discrete lines (rather than one
-/// interpolated blob) so ticket 48 (Streamable HTTP) can append an
-/// `origin: ...` line for a remote server's permission prompt without
-/// reshaping this format. Shared by both `request_permission` and
-/// `subagent_request_permission` below, which build identical prompt text
-/// for a `ToolCall` payload.
-///
-/// Ticket 48 (mcp-http-transport), PRD "MCP permissions": `origin` is
-/// `Some(url)` when `server` is an HTTP-transport MCP server (looked up by
-/// the caller from config, NOT carried on `PermissionPayload::ToolCall`
-/// itself -- see `mcp_http_origins`'s doc comment above for why), `None`
-/// for a stdio server. An HTTP server's origin is a data-exfiltration
-/// signal, so it's appended as its own line when present.
-fn format_tool_call_permission_text(
-    server: &str,
-    tool: &str,
-    input_pretty: &str,
-    origin: Option<&str>,
-) -> String {
-    let mut text = format!("server: {server}\ntool: {tool}\ninput: {input_pretty}");
-    if let Some(origin) = origin {
-        text.push_str(&format!("\norigin: {origin}"));
-    }
-    text
-}
-
 /// F-002: gates `/mcp reconnect <server>` to `Degraded` servers only --
 /// reconnecting a `Starting` or already-`Ready` server would spin up a
 /// second, redundant lifecycle task racing the one already running (the
@@ -1843,139 +1044,6 @@ fn format_hooks_listing(
         }
     }
     lines.join("\n")
-}
-
-/// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management
-/// decision 4: on a GRANTED write/edit permission decision, captures the
-/// file's pre-image under `sessions/<id>/snapshots/` (reusing the `old`
-/// content already computed for the permission-preview diff -- no new file
-/// read) and appends a correlating `Checkpoint` record. Called from BOTH
-/// `submit`'s own `request_permission` closure and the mirrored
-/// `subagent_request_permission` closure in `crates/rokr/src/main.rs`,
-/// after `permission.request(...)`'s decision comes back `true` -- a DENY
-/// must produce no snapshot and no `Checkpoint` record, which this
-/// signature enforces structurally: callers only invoke it once already
-/// inside their own `if granted` branch.
-///
-/// `diff_path_and_old` is `Some((path, old))` for a `PermissionPayload::Diff`
-/// (write/edit) and `None` for `PermissionPayload::Command` (bash) --
-/// bash-driven mutations are explicitly out of scope for checkpointing
-/// (documented gap, not oversight), so this is a no-op for that case,
-/// falling out of the match in the caller rather than a runtime
-/// special-case here.
-///
-/// No-ops (logging a warning, never panicking) if no session is currently
-/// active (persistence degraded at startup) -- checkpointing is best-effort
-/// alongside session persistence, not a separate hard requirement.
-///
-/// First-write-wins de-duplication (ticket 38 scope-amendment, F-001 per
-/// argus review): a turn's tool loop can mutate the SAME path more than
-/// once (e.g. `write` then `edit`) -- `CheckpointStore::snapshot`'s
-/// `newly_written` return only reports `true` for the first capture of a
-/// given `(turn_index, path)` key, and a `Checkpoint` record is appended
-/// ONLY when it's `true`. This avoids appending a second `Checkpoint`
-/// record with a duplicate `snapshot_id` for a later mutation whose `old`
-/// is already post-first-mutation content, not the real turn-start
-/// pre-image.
-///
-/// Known limitation (see this ticket's `## Scope Amendment`):
-/// `PermissionPayload::Diff`'s `old: String` field collapses "file did not
-/// exist" and "file existed but was empty" into the same empty string, with
-/// no separate boolean carried through (the architect's ruling fixed
-/// `Preview::Diff`/`PermissionPayload::Diff`'s shape to exactly `{ path,
-/// old, new }`, and adding a second field for this was judged out of scope
-/// for this ticket). So an empty `old` is treated here as "absent"
-/// (`None`), which is lossy for the rare case of a genuinely-empty
-/// pre-existing file -- `CheckpointStore::snapshot` itself DOES support the
-/// real distinction (`Option<&str>`), this call site just cannot supply it
-/// today.
-async fn capture_checkpoint_if_granted_diff(
-    diff_path_and_old: Option<(String, String)>,
-    data_dir: &std::path::Path,
-    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
-    turn_index: &std::sync::Mutex<usize>,
-) {
-    let Some((path, old)) = diff_path_and_old else {
-        return;
-    };
-
-    let session_handle_guard = session_handle.read().await;
-    let Some(session_handle) = session_handle_guard.as_ref() else {
-        // F-002 (argus review): matches this fn's own doc comment ("no-ops,
-        // logging a warning") -- persistence being degraded at startup is
-        // the same class of condition `create_session`'s own failure path
-        // (near the top of `main`) already logs via `eprintln!` rather than
-        // silently swallowing.
-        eprintln!(
-            "skipping pre-image checkpoint snapshot for {path}: no session is currently active"
-        );
-        return;
-    };
-
-    let current_turn_index = *turn_index.lock().unwrap();
-    let checkpoint_store = rokr_session::CheckpointStore::open(data_dir, session_handle.session_id());
-    let old_content: Option<&str> = if old.is_empty() { None } else { Some(old.as_str()) };
-
-    match checkpoint_store.snapshot(current_turn_index, &path, old_content) {
-        Ok((snapshot_id, newly_written)) => {
-            if newly_written {
-                session_handle.append_checkpoint(current_turn_index, snapshot_id);
-            }
-        }
-        Err(err) => {
-            eprintln!("failed to capture pre-image checkpoint snapshot for {path}: {err}");
-        }
-    }
-}
-
-/// The exact wrapper `rokr_core::compact_transcript` prepends to a fresh
-/// summary (and `rokr_session::fold` re-applies on resume). RULING 2 strips
-/// it back off before persisting a `Compaction` record's `summary` so the
-/// stored text is RAW -- storing the already-wrapped text would double-wrap
-/// it on the next resume.
-const COMPACTION_SUMMARY_WRAPPER_PREFIX: &str =
-    "[Earlier conversation summary — compacted to save context]\n\n";
-
-/// RULING 2 (architect ruling, phase-5): appends a `Compaction` record for a
-/// just-completed compaction, shared by BOTH the auto-compaction branch in
-/// `submit` and the manual `/compact` handler in `command`.
-///
-/// `compacted` is `compact_transcript`'s output: `compacted[0]` is the
-/// summary message with the wrapper prefix already baked in, and
-/// `compacted[1..]` is the untouched tail turn. This strips the wrapper back
-/// off `compacted[0]`'s text (falling back to the raw text if the prefix
-/// somehow isn't present) to recover the RAW summary to store, because
-/// `fold` re-applies that same wrapper on resume.
-///
-/// `raw_turn_count` is `*turn_index` at the compaction decision point (AFTER
-/// the per-turn increment in `submit`; the plain current value in
-/// `/compact`, which never increments). Compaction always retains exactly the
-/// tail turn (raw index `raw_turn_count - 1`), so the summary replaces
-/// through `(raw_turn_count - 1) - 1 == raw_turn_count - 2`. If that
-/// underflows (fewer than 2 raw turns -- `compact_transcript` should never
-/// return `Compacted` then, but guard defensively), NO record is appended.
-///
-/// No-ops if no session is currently active (persistence degraded at
-/// startup), matching `capture_checkpoint_if_granted_diff`'s handling.
-async fn append_compaction_record(
-    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
-    compacted: &[rokr_core::Message],
-    raw_turn_count: usize,
-) {
-    let Some(replaced_through) = raw_turn_count.checked_sub(2) else {
-        return;
-    };
-
-    let wrapped = compacted.first().map(|m| m.text()).unwrap_or_default();
-    let raw_summary = wrapped
-        .strip_prefix(COMPACTION_SUMMARY_WRAPPER_PREFIX)
-        .unwrap_or(&wrapped)
-        .to_string();
-
-    let guard = session_handle.read().await;
-    if let Some(handle) = guard.as_ref() {
-        handle.append_compaction(raw_summary, replaced_through);
-    }
 }
 
 /// Ticket 35 (resume-session): resolves a concrete `session_id` (already
@@ -2312,20 +1380,6 @@ fn default_data_dir() -> std::path::PathBuf {
     base.join("rokr")
 }
 
-/// Returns the current time as a plain Unix-epoch-seconds string. There is
-/// no date/time-formatting crate in this workspace today (see
-/// `rokr-provider::auth`'s own `expires_at` field, which is a plain `u64`
-/// seconds-since-epoch for the same reason) — `SessionRecord`'s
-/// `created_at`/`timestamp` fields are typed `String` with no enforced
-/// format, so epoch seconds serialized as a string satisfies that type
-/// without pulling in a new dependency for this ticket.
-fn now_timestamp() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
-
 /// Resolves `name` to a concrete backend and writes it into the shared
 /// active-provider state under a single write lock (ticket 29: `/model`;
 /// F-003: one lock, one write, no second lock to keep in sync -- see
@@ -2370,6 +1424,10 @@ async fn set_active_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rokr_app::{
+        accumulate_user_turn, capture_checkpoint_if_granted_diff,
+        COMPACTION_SUMMARY_WRAPPER_PREFIX,
+    };
     use rokr_core::{Message, Provider, Role};
     use rokr_session::UsageRecord;
 

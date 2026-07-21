@@ -1,0 +1,21 @@
+[package]
+name = "rokr-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rokr-tui = { path = "../rokr-tui" }
+rokr-core = { path = "../rokr-core" }
+rokr-provider = { path = "../rokr-provider" }
+rokr-tools = { path = "../rokr-tools" }
+rokr-config = { path = "../rokr-config" }
+rokr-session = { path = "../rokr-session" }
+rokr-mcp = { path = "../rokr-mcp" }
+rokr-hooks = { path = "../rokr-hooks" }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }

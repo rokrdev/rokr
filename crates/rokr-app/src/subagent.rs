@@ -13,7 +13,7 @@
 //! `rokr_tools::Tool` wrapped by `rokr_core`'s `impl_executable_tool!`
 //! macro (that macro is private to `rokr-core` besides). `SubagentTool`
 //! implements `rokr_core::ExecutableTool` directly, by hand, here in the
-//! `rokr` binary crate, which already depends on all of `rokr-core`,
+//! `rokr-app` library crate, which already depends on all of `rokr-core`,
 //! `rokr-provider`, `rokr-tools`, and `rokr-config`.
 
 use std::future::Future;
@@ -27,8 +27,8 @@ use std::pin::Pin;
 /// parameter. Deliberately not `rokr_tui::PermissionHandle` directly: this
 /// keeps `SubagentTool` decoupled from rokr-tui's concrete type, the same
 /// way `run_tool_loop`'s own signature stays decoupled from it (see
-/// rokr-tui's `run` doc comment on this seam). `main.rs` bridges the two,
-/// passing a clone of the SAME `PermissionHandle` the parent's own
+/// rokr-tui's `run` doc comment on this seam). The `SessionRunner` bridges
+/// the two, passing a clone of the SAME `PermissionHandle` the parent's own
 /// top-level `request_permission` callback uses -- see `run_subagent`'s
 /// doc comment on where the tagging with the subagent's name happens.
 pub type PermissionCallback = Box<
@@ -136,11 +136,11 @@ impl rokr_core::ExecutableTool for SubagentTool {
                 })?;
 
             // Depth cap (PRD Phase 4 "Subagents"): this is exactly the Plan
-            // tier's read-only tool set (see main.rs's `AgentTier::Plan`
-            // arm), deliberately excluding the `subagent` tool itself --
-            // that omission is what keeps delegation depth capped at one; a
-            // subagent built from this set has no way to spawn a further
-            // subagent.
+            // tier's read-only tool set (see the `SessionRunner`'s
+            // `AgentTier::Plan` arm), deliberately excluding the `subagent`
+            // tool itself -- that omission is what keeps delegation depth
+            // capped at one; a subagent built from this set has no way to
+            // spawn a further subagent.
             let read = rokr_tools::read::ReadTool;
             let glob = rokr_tools::glob::GlobTool;
             let grep = rokr_tools::grep::GrepTool;

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rokr-app = { path = "../rokr-app" }
 rokr-tui = { path = "../rokr-tui" }
 rokr-core = { path = "../rokr-core" }
 rokr-provider = { path = "../rokr-provider" }
@@ -27,6 +28,7 @@ rokr-mcp = { path = "../rokr-mcp" }
 # `hooks` config schema (per-event lists, glob matcher, per-hook
 # `timeout_ms`/`blocking`), still through this same dependency edge.
 rokr-hooks = { path = "../rokr-hooks" }
+clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 

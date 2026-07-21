@@ -431,3 +431,29 @@ async fn startup_uses_factory_constructed_provider_for_submit() {
          rokr_provider::factory::build_provider"
     );
 }
+
+
+/// Ticket 52 (clap-and-sessionrunner-extraction) acceptance test: the
+/// clap-generated `--help` must enumerate the same surface today's
+/// hand-rolled `USAGE` string documents -- `--agent`, `--resume`,
+/// `--continue`, and the `auth` (login) subcommand -- printed to stdout and
+/// exiting 0. RED before this ticket: the pre-clap binary had no `--help`
+/// handling at all; `--help` fell through the `--version`/`auth login`
+/// match to `parse_agent_tier`, which rejected it, printed `USAGE` to
+/// STDERR, and exited nonzero -- so `.assert().success()` fails today and
+/// only passes once clap owns argument parsing.
+#[test]
+fn rokr_help_lists_agent_resume_continue_and_auth_login_flags() {
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd.arg("--help").assert().success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in ["--agent", "--resume", "--continue", "auth"] {
+        assert!(
+            stdout.contains(needle),
+            "expected clap-generated `rokr --help` stdout to enumerate {needle:?} \
+             (matching today's USAGE string), got: {stdout}"
+        );
+    }
+}
