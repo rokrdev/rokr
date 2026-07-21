@@ -19,6 +19,63 @@ pub struct Config {
     /// gets the runtime default; the field is never written back.
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold: f64,
+    /// Configured MCP servers, keyed by server name. Additive-optional
+    /// (ADR 0010): an existing file missing this field gets an empty map
+    /// at runtime; the field is never written back. See
+    /// docs/adr/0011-rokr-mcp-crate-boundary.md and ticket 45
+    /// (mcp-config-and-lifecycle), which replaces ticket 44's
+    /// `ROKR_MCP_SERVER` env-var interim wiring with this real schema. Per
+    /// docs/adr/0012-hooks-execution-trust-model.md decision 2 and the
+    /// PRD's "Config schema" section, `mcp` (like `hooks` below) is loaded
+    /// from user-scope config ONLY -- `load_or_init` reads exactly the one
+    /// `config_dir` path it is given and nothing else; see ticket 51's
+    /// `project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader`
+    /// test for the enforcement guard.
+    #[serde(default)]
+    pub mcp: std::collections::HashMap<String, McpServerConfig>,
+    /// Configured hooks, keyed by event name (`"PreToolUse"`,
+    /// `"PostToolUse"`, `"SessionStart"`, `"UserPromptSubmit"`, `"Stop"`,
+    /// `"SessionEnd"`). Additive-optional (ADR 0010): an existing file
+    /// missing this field gets an empty map at runtime; the field is never
+    /// written back. Keyed by a plain `String` rather than
+    /// `rokr_hooks::HookEvent` so this crate stays dependency-free of
+    /// `rokr-hooks`, matching how `mcp` above defines its own
+    /// `McpServerConfig`/`McpTransport` types rather than reusing
+    /// `rokr-mcp`'s; `crates/rokr/src/main.rs` is the one place that knows
+    /// both this string key and `rokr_hooks::HookEvent` and maps between
+    /// them. Per docs/adr/0012-hooks-execution-trust-model.md and the PRD's
+    /// "Config schema" section, `hooks` (like `mcp`) is loaded from
+    /// user-scope config ONLY -- there is no project-scope config loader
+    /// at all yet for either field to be read from by mistake; ticket 51's
+    /// `project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader`
+    /// test is the forward regression guard for once one exists (Phase 7).
+    #[serde(default)]
+    pub hooks: std::collections::HashMap<String, Vec<HookEntry>>,
+}
+
+/// One configured hook entry (PRD "Config schema"). `matcher` is a glob
+/// against the tool name (`rokr_hooks::matches_tool_name`) for
+/// `PreToolUse`/`PostToolUse` only -- `None` behaves like `"*"` (match every
+/// tool) at the call site, and the field is ignored entirely for lifecycle
+/// events. `timeout_ms` overrides `rokr_hooks::DEFAULT_TIMEOUT` (60s) when
+/// present. `blocking` lets a hook opt out of the exit-code-2 blocking
+/// contract (`docs/adr/0012-hooks-execution-trust-model.md`'s exit-code
+/// contract) even for an event that otherwise honors it (`PreToolUse`,
+/// `UserPromptSubmit`) -- `None`/`Some(true)` keeps the default blocking
+/// behavior; `Some(false)` downgrades an exit-2 result to a non-blocking
+/// failure, e.g. for a hook script whose author wants "observe only, never
+/// actually veto" even if the script's exit code is wrong. Events that are
+/// unconditionally non-blocking by design (`PostToolUse`, `Stop`,
+/// `SessionEnd`) ignore this field.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HookEntry {
+    #[serde(default)]
+    pub matcher: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub blocking: Option<bool>,
 }
 
 fn default_context_window_size() -> u32 {
@@ -27,6 +84,69 @@ fn default_context_window_size() -> u32 {
 
 fn default_auto_compact_threshold() -> f64 {
     0.7
+}
+
+/// Argus F-005: an MCP server block with no explicit `enabled` key defaults
+/// to enabled. Previously defaulted to `false` (plain `#[serde(default)]`
+/// on a `bool`), which silently disabled any server whose config the user
+/// forgot to mark `"enabled": true` -- a footgun, since the field reads as
+/// optional/informational rather than an opt-in gate. `"enabled": false` is
+/// now the only way to opt a server out.
+fn default_true() -> bool {
+    true
+}
+
+/// One configured MCP server (PRD "Config schema"). `auto_approve` (ticket
+/// 47, mcp-permission-polish) is a per-server allowlist of UNQUALIFIED
+/// tool names (the server-local name as reported by `tools/list`, e.g.
+/// `"echo"` -- not the `mcp__<server>__<tool>` model-facing form), since
+/// the list is already scoped to one server by virtue of living on its
+/// `McpServerConfig`. A tool whose name appears here skips the interactive
+/// permission prompt and executes directly.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct McpServerConfig {
+    pub transport: McpTransport,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
+}
+
+/// A server's transport configuration. `Stdio` is ticket 45's; `Http`
+/// (ticket 48, stretch scope) slots in additively as this enum's default
+/// (externally-tagged) serde representation already anticipated --
+/// `{"stdio": {...}}` or `{"http": {...}}` -- with no migration. `Http`
+/// carries a static bearer/env-token `headers` map only -- no OAuth 2.1
+/// (PRD "Out of Scope").
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio(StdioTransportConfig),
+    Http(HttpTransportConfig),
+}
+
+/// A stdio MCP server's launch spec: the command to spawn, its arguments,
+/// and any extra environment variables to set on the child process.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StdioTransportConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+/// A Streamable HTTP MCP server's launch spec (ticket 48,
+/// mcp-http-transport, stretch scope): the server's URL and any static
+/// HTTP headers to send with every request (e.g. `"Authorization": "Bearer
+/// ..."`). No OAuth 2.1 support -- PRD "Out of Scope" -- so `headers` is
+/// deliberately a plain string map the caller already resolved, not a
+/// token-refresh flow.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HttpTransportConfig {
+    pub url: String,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 /// Clamps an out-of-range `auto_compact_threshold` (loaded from an existing
@@ -150,6 +270,13 @@ pub fn load_project_context(cwd: &Path) -> Option<String> {
 ///
 /// Also scaffolds `agents/plan.md` and `agents/build.md` under `config_dir`
 /// with default prompt content, if they do not already exist.
+///
+/// `config_dir` is the ONLY location ever read -- there is no fallback to
+/// (nor merge with) any project-local config file, regardless of the
+/// process's current directory or any other "nearby" location. This is the
+/// user-scope trust boundary `Config::mcp`/`Config::hooks` document (ADR
+/// 0012 decision 2); see ticket 51's
+/// `project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader` test.
 pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
     std::fs::create_dir_all(config_dir)?;
     let file_path = config_dir.join("rokr.json");
@@ -180,6 +307,8 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
         version: 1,
         context_window_size: default_context_window_size(),
         auto_compact_threshold: default_auto_compact_threshold(),
+        mcp: std::collections::HashMap::new(),
+        hooks: std::collections::HashMap::new(),
     };
     let json = serde_json::to_string_pretty(&config).expect("Config serialization is infallible");
     std::fs::write(&file_path, json)?;
@@ -307,6 +436,210 @@ mod tests {
             config.auto_compact_threshold, 0.7,
             "an out-of-range auto_compact_threshold must be clamped to the default"
         );
+    }
+
+    #[test]
+    fn load_or_init_applies_empty_mcp_default_when_field_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        std::fs::write(&file_path, r#"{"version": 1}"#).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        assert!(
+            config.mcp.is_empty(),
+            "expected empty mcp map when field absent, got: {:?}",
+            config.mcp
+        );
+    }
+
+    #[test]
+    fn config_deserializes_stdio_mcp_server_block() {
+        let json = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": {
+                            "command": "/path/to/server",
+                            "args": ["--flag"],
+                            "env": {"KEY": "value"}
+                        }
+                    },
+                    "enabled": true
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert!(server.enabled);
+        match &server.transport {
+            McpTransport::Stdio(stdio) => {
+                assert_eq!(stdio.command, "/path/to/server");
+                assert_eq!(stdio.args, vec!["--flag".to_string()]);
+                assert_eq!(stdio.env.get("KEY"), Some(&"value".to_string()));
+            }
+            other => panic!("expected McpTransport::Stdio, got {other:?}"),
+        }
+    }
+
+    /// Ticket 48 (mcp-http-transport), PRD "Config schema": the `http`
+    /// transport variant ticket 45's `McpTransport` doc comment designed
+    /// for -- `{"url": "...", "headers": {...}}`, externally tagged
+    /// alongside `stdio` with no migration needed. `headers` carries a
+    /// static bearer/env-token value the caller already resolved (no
+    /// OAuth 2.1 -- PRD "Out of Scope"), so this is a plain string map,
+    /// deserialized the same way `StdioTransportConfig.env` already is.
+    /// Argus F-005: `enabled` defaulted to `false` when absent was a
+    /// silently-disabled-server footgun -- a server block with no explicit
+    /// `enabled` key must default to `true`; `"enabled": false` is now the
+    /// only way to opt a server out.
+    #[test]
+    fn mcp_server_without_explicit_enabled_field_defaults_to_true() {
+        let json = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": { "command": "/path/to/server" }
+                    }
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert!(
+            server.enabled,
+            "expected enabled to default to true when the field is absent"
+        );
+    }
+
+    #[test]
+    fn mcp_server_transport_deserializes_http_variant_with_headers() {
+        let json = r#"{
+            "version": 1,
+            "mcp": {
+                "remote-server": {
+                    "transport": {
+                        "http": {
+                            "url": "https://example.com/mcp",
+                            "headers": {"Authorization": "Bearer test-token"}
+                        }
+                    },
+                    "enabled": true
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let server = config.mcp.get("remote-server").expect("expected remote-server entry");
+        assert!(server.enabled);
+        match &server.transport {
+            McpTransport::Http(http) => {
+                assert_eq!(http.url, "https://example.com/mcp");
+                assert_eq!(
+                    http.headers.get("Authorization"),
+                    Some(&"Bearer test-token".to_string())
+                );
+            }
+            other => panic!("expected McpTransport::Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_auto_approve_list_deserializes_and_defaults_to_empty() {
+        let json_without_auto_approve = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": { "command": "/path/to/server" }
+                    },
+                    "enabled": true
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json_without_auto_approve).unwrap();
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert!(
+            server.auto_approve.is_empty(),
+            "expected empty auto_approve when field absent, got: {:?}",
+            server.auto_approve
+        );
+
+        let json_with_auto_approve = r#"{
+            "version": 1,
+            "mcp": {
+                "my-server": {
+                    "transport": {
+                        "stdio": { "command": "/path/to/server" }
+                    },
+                    "enabled": true,
+                    "auto_approve": ["tool_a"]
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json_with_auto_approve).unwrap();
+        let server = config.mcp.get("my-server").expect("expected my-server entry");
+        assert_eq!(server.auto_approve, vec!["tool_a".to_string()]);
+    }
+
+    /// Ticket 50 (hooks-remaining-events-and-config), PRD "Config schema":
+    /// `hooks` is additive-optional (defaults to an empty map when absent,
+    /// mirroring `mcp`'s own default test above) and, when present, is a map
+    /// of event name -> list of `{ matcher?, command, timeout_ms?, blocking? }`
+    /// entries.
+    #[test]
+    fn hooks_config_field_deserializes_per_event_entries_and_defaults_to_empty() {
+        let json_without_hooks = r#"{"version": 1}"#;
+        let config: Config = serde_json::from_str(json_without_hooks).unwrap();
+        assert!(
+            config.hooks.is_empty(),
+            "expected empty hooks map when field absent, got: {:?}",
+            config.hooks
+        );
+
+        let json_with_hooks = r#"{
+            "version": 1,
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "bash*", "command": "/path/to/hook.sh", "timeout_ms": 5000 }
+                ],
+                "SessionStart": [
+                    { "command": "/path/to/session-start.sh" }
+                ]
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json_with_hooks).unwrap();
+
+        let pre_tool_use = config
+            .hooks
+            .get("PreToolUse")
+            .expect("expected PreToolUse entry");
+        assert_eq!(pre_tool_use.len(), 1);
+        assert_eq!(pre_tool_use[0].matcher.as_deref(), Some("bash*"));
+        assert_eq!(pre_tool_use[0].command, "/path/to/hook.sh");
+        assert_eq!(pre_tool_use[0].timeout_ms, Some(5000));
+        assert_eq!(
+            pre_tool_use[0].blocking, None,
+            "expected blocking to default to None (unspecified) when absent"
+        );
+
+        let session_start = config
+            .hooks
+            .get("SessionStart")
+            .expect("expected SessionStart entry");
+        assert_eq!(session_start.len(), 1);
+        assert_eq!(session_start[0].matcher, None);
+        assert_eq!(session_start[0].command, "/path/to/session-start.sh");
+        assert_eq!(session_start[0].timeout_ms, None);
     }
 
     #[test]
@@ -494,6 +827,79 @@ mod tests {
         assert_eq!(
             context, None,
             "a non-NotFound read error on AGENTS.md must yield no project context"
+        );
+    }
+
+    /// Ticket 51 (mcp-hooks-introspection), docs/adr/0012-hooks-execution-trust-model.md
+    /// decision 2 ("User-scope-only trust boundary"), PRD "Config schema":
+    /// `mcp`/`hooks` must be loaded from user-scope config ONLY -- a
+    /// project-local config file (however project-scope config is
+    /// eventually discovered, once that concept exists -- deferred to
+    /// Phase 7) must have zero effect. There is no project-scope reader
+    /// anywhere in this codebase today, so this is a forward regression
+    /// guard: `load_or_init` must keep reading ONLY the one explicit
+    /// `config_dir` path it's given, never anything "nearby" like the
+    /// process's current directory -- proven here by making a poisoned
+    /// project-local `rokr.json` sit at the process's cwd (the most
+    /// plausible way a future, careless project-scope implementation might
+    /// "discover" it) while loading from a genuinely separate, real
+    /// user-scope directory.
+    #[test]
+    fn project_scope_mcp_and_hooks_blocks_are_never_read_by_the_loader() {
+        static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = CWD_GUARD.lock().unwrap();
+
+        let user_scope_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // A project-local rokr.json with `mcp`/`hooks` blocks populated with
+        // distinctive marker values -- if the loader ever read this file
+        // (directly, or by falling back to the current directory), those
+        // markers would leak into the loaded config below.
+        let poisoned = serde_json::json!({
+            "version": 1,
+            "mcp": {
+                "project-injected-server": {
+                    "transport": {
+                        "stdio": { "command": "evil", "args": [], "env": {} }
+                    },
+                    "enabled": true,
+                    "auto_approve": []
+                }
+            },
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "command": "project-injected-hook.sh" }
+                ]
+            }
+        });
+        std::fs::write(
+            project_dir.path().join("rokr.json"),
+            serde_json::to_string_pretty(&poisoned).unwrap(),
+        )
+        .unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_dir.path()).unwrap();
+
+        let result = load_or_init(user_scope_dir.path());
+
+        std::env::set_current_dir(original_cwd).unwrap();
+
+        let config = result.expect("expected load_or_init to succeed against the user-scope dir");
+        assert!(
+            config.mcp.is_empty(),
+            "loader must never read `mcp` from a project-local config file; got: {:?}",
+            config.mcp
+        );
+        assert!(
+            config.hooks.is_empty(),
+            "loader must never read `hooks` from a project-local config file; got: {:?}",
+            config.hooks
+        );
+        assert!(
+            !config.mcp.contains_key("project-injected-server"),
+            "project-local mcp block leaked into the loaded config"
         );
     }
 }

@@ -8,6 +8,8 @@ members = [
     "crates/rokr-tools",
     "crates/rokr-config",
     "crates/rokr-session",
+    "crates/rokr-mcp",
+    "crates/rokr-hooks",
 ]
 
 [workspace.package]

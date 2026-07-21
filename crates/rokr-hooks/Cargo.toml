@@ -1,0 +1,35 @@
+[package]
+name = "rokr-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Deliberately NO dependency on rokr-core or any other rokr crate
+# (architect decision, ticket 49, hooks-tracer-bullet, mirrored by
+# docs/adr/0012-hooks-execution-trust-model.md): this crate owns hook
+# event/payload types and the subprocess executor as a standalone concern,
+# reusable outside the agent loop. `rokr-core`'s `run_tool_loop` gains a
+# hook-callback SEAM (an optional closure), never a dependency on this
+# crate -- `crates/rokr/src/main.rs` is the only place that depends on both
+# and wires one into the other.
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# Argus F-006: `execute_hook`'s timeout path only killed the direct `sh`
+# child, orphaning any grandchild a compound/backgrounded command spawned
+# (e.g. `cmd & sleep 30`). `libc::killpg` (Unix-only, `execute_hook`'s
+# process-group kill is `#[cfg(unix)]`-gated with the pre-existing
+# single-child `kill_on_drop` behavior as the non-Unix fallback) sends
+# SIGKILL to the whole process group the child was made leader of via
+# `process_group(0)`. A single FFI call for one syscall doesn't warrant
+# pulling in `nix`'s larger safe-wrapper surface.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+# Ticket 50 (hooks-remaining-events-and-config): the tool-name glob matcher
+# (`matches_tool_name` in `src/lib.rs`) is hand-rolled (`*`/`?` only, no
+# character classes/brace expansion) rather than pulling in `glob` or
+# `globset` -- the PRD's matcher shape only ever needs those two symbols
+# (`mcp__*`, `bash*`, ...), a ~15-line recursive matcher covers it exactly,
+# and it avoids a new dependency (plus its transitive graph) for a surface
+# this small. Revisit if a future ticket needs richer glob syntax.

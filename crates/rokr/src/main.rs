@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use rokr_core::Provider;
+use rokr_core::{ExecutableTool, Provider};
 
 mod subagent;
 
@@ -92,6 +92,89 @@ fn parse_agent_tier(args: &[String]) -> Result<AgentTier, ()> {
     }
 }
 
+/// Runs `entry`'s command against `payload`, honoring its `timeout_ms`
+/// override (falling back to `rokr_hooks::DEFAULT_TIMEOUT` when absent).
+/// Ticket 50 (hooks-remaining-events-and-config): shared by every hook call
+/// site below (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`,
+/// `SessionStart`, `Stop`, `SessionEnd`) so the timeout-override lookup
+/// lives in exactly one place.
+async fn run_hook_entry(
+    entry: &rokr_config::HookEntry,
+    payload: &rokr_hooks::HookPayload,
+) -> rokr_hooks::HookResult {
+    let timeout = entry
+        .timeout_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(rokr_hooks::DEFAULT_TIMEOUT);
+    rokr_hooks::execute_hook(&entry.command, payload, timeout).await
+}
+
+/// Every hook entry configured for `event`, matcher-filtered against
+/// `tool_name` when `Some` (`PreToolUse`/`PostToolUse`) or left unfiltered
+/// when `None` -- every lifecycle event (`SessionStart`, `UserPromptSubmit`,
+/// `Stop`, `SessionEnd`) ignores `matcher` entirely, per the PRD's "Matcher
+/// shape" note, simply by always being called with `tool_name: None` at its
+/// call sites below. An entry with no `matcher` set behaves like `"*"`
+/// (matches every tool), same as a missing `matcher` string would via
+/// `rokr_hooks::matches_tool_name`.
+fn matching_hook_entries<'a>(
+    hooks_config: &'a std::collections::HashMap<String, Vec<rokr_config::HookEntry>>,
+    event: &str,
+    tool_name: Option<&str>,
+) -> Vec<&'a rokr_config::HookEntry> {
+    hooks_config
+        .get(event)
+        .into_iter()
+        .flatten()
+        .filter(|entry| match tool_name {
+            Some(tool_name) => entry
+                .matcher
+                .as_deref()
+                .is_none_or(|matcher| rokr_hooks::matches_tool_name(matcher, tool_name)),
+            None => true,
+        })
+        .collect()
+}
+
+/// Logs a one-line notice for a fire-and-observe hook's outcome
+/// (`PostToolUse`, `Stop`, `SessionEnd` -- none of which can veto anything,
+/// architect decision: "Stop/SessionEnd: fire-and-observe, exit codes
+/// logged, non-blocking"), extended here to `PostToolUse` for the identical
+/// reason (it always runs after the tool it's attached to has already
+/// executed, so there's nothing left to veto). A `Success` outcome is the
+/// silent default (nothing to report); `Blocked` (exit 2) is logged as an
+/// IGNORED veto attempt, since these events have no veto to honor;
+/// `NonBlockingFailure` is logged as-is.
+///
+/// Known wart (ticket 51, mcp-hooks-introspection, flagged for Phase 7):
+/// `eprintln!` here (and at the two `PreToolUse` outcome sites in `submit`
+/// just above `run_tool_loop`'s call) writes to stderr while the TUI may
+/// still hold the alt-screen -- fine for the `SessionStart`/`SessionEnd`
+/// call sites (both fire outside `rokr_tui::run`'s active window), but the
+/// `PostToolUse`/`Stop` call sites inside `submit`'s closure fire WHILE the
+/// TUI is rendering. Routing these through the existing `SessionStatus`
+/// notice channel (`status_tx`, already captured in `submit`'s closure)
+/// would need: a `context_percent` value to pair with the notice (no
+/// "current" figure exists mid-turn without adding new state -- unlike the
+/// MCP notice-forwarder task above, which has `last_known_usage` handy),
+/// and splitting this function's signature (or adding a sibling wrapper)
+/// since `SessionStart`/`SessionEnd` must stay `eprintln!`-based. Judged
+/// out of scope for this ticket.
+fn log_observational_hook_outcome(event: &str, result: &rokr_hooks::HookResult) {
+    match result {
+        rokr_hooks::HookResult::Success { .. } => {}
+        rokr_hooks::HookResult::Blocked { stderr } => {
+            eprintln!(
+                "{event} hook exited 2 (a blocking exit code), but {event} is fire-and-observe \
+                 only and cannot veto anything -- ignoring: {stderr}"
+            );
+        }
+        rokr_hooks::HookResult::NonBlockingFailure { message } => {
+            eprintln!("{event} hook failed non-blocking: {message}");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -174,6 +257,50 @@ async fn main() -> ExitCode {
                 if let Some(project_context) = rokr_config::load_project_context(cwd) {
                     system_prompt.push_str("\n\n");
                     system_prompt.push_str(&project_context);
+                }
+            }
+
+            // Ticket 50 (hooks-remaining-events-and-config): loaded once
+            // here (user-scope config only -- `rokr_config::load_or_init_default`
+            // never reads a project-local file, so this can never be
+            // influenced by a cloned repo, per
+            // docs/adr/0012-hooks-execution-trust-model.md's trust
+            // boundary) and shared via `Arc` with `submit` below (a clone
+            // moved in) and with the `SessionEnd` firing point after
+            // `rokr_tui::run` returns (the original, still in scope here).
+            let hooks_config: Arc<std::collections::HashMap<String, Vec<rokr_config::HookEntry>>> =
+                Arc::new(config.hooks.clone());
+            // A separate clone for `submit` to move wholesale into its own
+            // `move` closure below -- `hooks_config` itself stays alive in
+            // this scope for the `SessionEnd` firing point after
+            // `rokr_tui::run` returns, near the bottom of this function.
+            let hooks_config_for_submit = hooks_config.clone();
+            // Ticket 51 (mcp-hooks-introspection): a third clone, for
+            // `command`'s own `move` closure below (built alongside the
+            // other `command_*` clones near `command_provider`), so
+            // `/hooks` can list every configured hook without disturbing
+            // either of the two clones above.
+            let command_hooks_config = hooks_config.clone();
+
+            // `SessionStart` (PRD "Hooks"; architect decision: "SessionStart
+            // at startup"): fires once, here, before the TUI ever renders.
+            // Every configured hook's exit-0 stdout is concatenated and
+            // folded into the system prompt exactly like AGENTS.md project
+            // context above -- "follow existing context-assembly patterns"
+            // (architect decision). A hook that fails (non-blocking) or
+            // exits 2 never blocks startup: `SessionStart` has no veto
+            // semantics (there is nothing yet to veto), so both outcomes
+            // just log a one-line notice via `log_observational_hook_outcome`
+            // and startup continues.
+            for entry in matching_hook_entries(&hooks_config, "SessionStart", None) {
+                match run_hook_entry(entry, &rokr_hooks::HookPayload::SessionStart).await {
+                    rokr_hooks::HookResult::Success { stdout } => {
+                        if !stdout.trim().is_empty() {
+                            system_prompt.push_str("\n\n");
+                            system_prompt.push_str(stdout.trim());
+                        }
+                    }
+                    other => log_observational_hook_outcome("SessionStart", &other),
                 }
             }
 
@@ -479,6 +606,139 @@ async fn main() -> ExitCode {
             // ends).
             let (status_tx, status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
 
+            // Ticket 45 (mcp-config-and-lifecycle): each enabled stdio
+            // server configured in user-scope rokr.json is spawned on its
+            // own background tokio task inside rokr-mcp
+            // (`rokr_mcp::spawn_stdio_server`), strictly off the render
+            // path -- first paint never waits on any MCP server (PRD "MCP
+            // lifecycle"). A server's tools become available once it
+            // reports ready (`McpServerHandle::tools`); a server whose init
+            // fails contributes zero tools and surfaces a one-line status
+            // notice instead of crashing or blocking the rest of rokr.
+            // Replaces ticket 44's `ROKR_MCP_SERVER` env-var interim wiring
+            // wholesale (see docs/adr/0011-rokr-mcp-crate-boundary.md's
+            // Consequences section). PC-1 ruling (supersedes ticket 46's
+            // whole-session freeze): each server's contribution instead
+            // freezes individually at its own first `Ready`
+            // (`McpServerHandle::joined`) -- see `submit`'s
+            // `mcp_tools_snapshot` below.
+            let (mcp_notice_tx, mcp_notice_rx) = std::sync::mpsc::channel::<String>();
+            // Bridges rokr-mcp's plain `String` notices (rokr-mcp depends
+            // on rokr-core only -- ADR 0011 -- so it can't know about
+            // `rokr_tui::SessionStatus` itself) onto the SAME SessionStatus
+            // channel ticket 43 built for context-percent updates, so a
+            // degraded-server notice shows up in the header status line
+            // without a second render-loop channel. Reads the current
+            // last-known context percent (rather than hardcoding 0.0) so a
+            // notice arriving after a real turn has already reported usage
+            // doesn't stomp that figure back to zero. `mcp_notice_rx.recv()`
+            // blocks its thread until a notice arrives (or every sender
+            // drops), so this runs via `spawn_blocking` rather than inline
+            // in an async task, matching this codebase's existing rule
+            // (ADR 0008) that blocking work never runs on an async task
+            // that could otherwise be polled on the render thread.
+            {
+                let status_tx = status_tx.clone();
+                let last_known_usage = last_known_usage.clone();
+                tokio::task::spawn_blocking(move || {
+                    while let Ok(notice) = mcp_notice_rx.recv() {
+                        let context_percent = last_known_usage
+                            .lock()
+                            .unwrap()
+                            .map(|usage| {
+                                (usage.input_tokens + usage.output_tokens) as f64
+                                    / context_window_size as f64
+                            })
+                            .unwrap_or(0.0);
+                        let _ = status_tx.send(rokr_tui::SessionStatus {
+                            context_percent,
+                            notice: Some(notice),
+                        });
+                    }
+                });
+            }
+
+            let mcp_server_handles: Arc<Vec<rokr_mcp::McpServerHandle>> = Arc::new(
+                config
+                    .mcp
+                    .iter()
+                    .filter(|(_, server)| server.enabled)
+                    .map(|(name, server)| match &server.transport {
+                        rokr_config::McpTransport::Stdio(stdio) => rokr_mcp::spawn_stdio_server(
+                            name.clone(),
+                            stdio.command.clone(),
+                            stdio.args.clone(),
+                            stdio.env.clone(),
+                            mcp_notice_tx.clone(),
+                            server.auto_approve.clone(),
+                        ),
+                        // Ticket 48 (mcp-http-transport, stretch scope):
+                        // same lifecycle machinery as the stdio arm above,
+                        // via `rokr_mcp::spawn_http_server`.
+                        rokr_config::McpTransport::Http(http) => rokr_mcp::spawn_http_server(
+                            name.clone(),
+                            http.url.clone(),
+                            http.headers.clone(),
+                            mcp_notice_tx.clone(),
+                            server.auto_approve.clone(),
+                        ),
+                    })
+                    .collect(),
+            );
+
+            // Ticket 51 (mcp-hooks-introspection): clones for `command`'s
+            // own `move` closure below (built alongside the other
+            // `command_*` clones near `command_provider`), so `/mcp` and
+            // `/mcp reconnect` can list/reconnect servers. `command_mcp_configs`
+            // is the raw, unfiltered `config.mcp` (not just the handles
+            // above) because a server with `enabled: false` never gets a
+            // handle at all -- this is `/mcp`'s only way to report it as
+            // "disabled" rather than silently omitting it.
+            let command_mcp_server_handles = mcp_server_handles.clone();
+            let command_mcp_configs: Arc<
+                std::collections::HashMap<String, rokr_config::McpServerConfig>,
+            > = Arc::new(config.mcp.clone());
+
+            // Ticket 48 (mcp-http-transport), PRD "MCP permissions": an
+            // HTTP server's origin is a data-exfiltration signal, so it's
+            // surfaced in the permission-prompt text
+            // (`format_tool_call_permission_text` below) for a
+            // `PermissionPayload::ToolCall` whose server is HTTP-transport.
+            // Built once here (server name -> URL, HTTP servers only)
+            // rather than adding an `origin` field to
+            // `PermissionPayload::ToolCall` itself (`rokr-core`) -- that
+            // type's own doc comment (ticket 47) already anticipated this
+            // exact bridge-side lookup as the intended seam, so this is
+            // the smallest change that satisfies it.
+            let mcp_http_origins: Arc<std::collections::HashMap<String, String>> = Arc::new(
+                config
+                    .mcp
+                    .iter()
+                    .filter_map(|(name, server)| match &server.transport {
+                        rokr_config::McpTransport::Http(http) => {
+                            Some((name.clone(), http.url.clone()))
+                        }
+                        rokr_config::McpTransport::Stdio(_) => None,
+                    })
+                    .collect(),
+            );
+
+            // PC-1 ruling (supersedes ticket 46's "the MCP tool set is
+            // frozen for the lifetime of a session" whole-session
+            // `OnceLock` freeze): each server's tool contribution now
+            // freezes individually, in `McpServerHandle::joined`, at that
+            // server's own first `Ready` (or a later explicit `/mcp
+            // reconnect` success) -- see `rokr_mcp::snapshot_tools`'s doc
+            // comment. `submit` below therefore calls `snapshot_tools`
+            // FRESH every turn rather than caching it in a `OnceLock`:
+            // that's cheap (no I/O, just iterating handles' already-frozen
+            // `joined` state) and always safe, since the underlying
+            // per-server freeze is what actually provides the "no
+            // turn-to-turn mutation of an already-joined server" guarantee
+            // -- a session simply sees whichever servers have joined AS OF
+            // that turn, in deterministic sorted order.
+            let submit_mcp_notice_tx = mcp_notice_tx.clone();
+
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = provider.clone();
                 let transcript = transcript.clone();
@@ -490,6 +750,10 @@ async fn main() -> ExitCode {
                 let turn_index = turn_index.clone();
                 let data_dir = data_dir.clone();
                 let status_tx = status_tx.clone();
+                let mcp_server_handles = mcp_server_handles.clone();
+                let mcp_notice_tx = submit_mcp_notice_tx.clone();
+                let mcp_http_origins = mcp_http_origins.clone();
+                let hooks_config = hooks_config_for_submit.clone();
                 async move {
                     let provider = provider?;
                     // F-003: ONE read lock, ONE clone of the current
@@ -564,9 +828,11 @@ async fn main() -> ExitCode {
                     let request_permission_session_handle = session_handle.clone();
                     let request_permission_turn_index = turn_index.clone();
                     let request_permission_data_dir = data_dir.clone();
+                    let request_permission_mcp_http_origins = mcp_http_origins.clone();
                     let subagent_request_permission_session_handle = session_handle.clone();
                     let subagent_request_permission_turn_index = turn_index.clone();
                     let subagent_request_permission_data_dir = data_dir.clone();
+                    let subagent_request_permission_mcp_http_origins = mcp_http_origins.clone();
 
                     // Bridges rokr-core's `PermissionRequest` (tool name +
                     // `PermissionPayload`) to rokr-tui's primitive
@@ -587,6 +853,7 @@ async fn main() -> ExitCode {
                         let session_handle = request_permission_session_handle.clone();
                         let turn_index = request_permission_turn_index.clone();
                         let data_dir = request_permission_data_dir.clone();
+                        let mcp_http_origins = request_permission_mcp_http_origins.clone();
                         async move {
                             let (detail, diff_path_and_old) = match request.payload {
                                 rokr_core::PermissionPayload::Command(command) => {
@@ -599,6 +866,24 @@ async fn main() -> ExitCode {
                                     },
                                     Some((path, old)),
                                 ),
+                                rokr_core::PermissionPayload::ToolCall {
+                                    server,
+                                    tool,
+                                    input_pretty,
+                                } => {
+                                    let origin = mcp_http_origins.get(&server).map(String::as_str);
+                                    (
+                                        rokr_tui::PermissionDetail::Text(
+                                            format_tool_call_permission_text(
+                                                &server,
+                                                &tool,
+                                                &input_pretty,
+                                                origin,
+                                            ),
+                                        ),
+                                        None,
+                                    )
+                                }
                             };
                             let granted = permission
                                 .request(rokr_tui::PermissionRequest {
@@ -637,6 +922,8 @@ async fn main() -> ExitCode {
                             let session_handle = subagent_request_permission_session_handle.clone();
                             let turn_index = subagent_request_permission_turn_index.clone();
                             let data_dir = subagent_request_permission_data_dir.clone();
+                            let mcp_http_origins =
+                                subagent_request_permission_mcp_http_origins.clone();
                             Box::pin(async move {
                                 let (detail, diff_path_and_old) = match request.payload {
                                     rokr_core::PermissionPayload::Command(command) => {
@@ -649,6 +936,25 @@ async fn main() -> ExitCode {
                                         },
                                         Some((path, old)),
                                     ),
+                                    rokr_core::PermissionPayload::ToolCall {
+                                        server,
+                                        tool,
+                                        input_pretty,
+                                    } => {
+                                        let origin =
+                                            mcp_http_origins.get(&server).map(String::as_str);
+                                        (
+                                            rokr_tui::PermissionDetail::Text(
+                                                format_tool_call_permission_text(
+                                                    &server,
+                                                    &tool,
+                                                    &input_pretty,
+                                                    origin,
+                                                ),
+                                            ),
+                                            None,
+                                        )
+                                    }
                                 };
                                 let granted = permission
                                     .request(rokr_tui::PermissionRequest {
@@ -677,6 +983,35 @@ async fn main() -> ExitCode {
                         subagent_request_permission,
                     );
 
+                    // PC-1 ruling (supersedes ticket 46's whole-session
+                    // `OnceLock` freeze): the session's MCP tool-set
+                    // snapshot -- sorted deterministically by (server,
+                    // tool) via `rokr_mcp::snapshot_tools` -- is now
+                    // recomputed fresh every Build-tier `submit`, but each
+                    // individual server's contribution within it is
+                    // ALREADY frozen (`McpServerHandle::joined`, written at
+                    // most once per server: that server's own first
+                    // `Ready`, or again on a later explicit `/mcp
+                    // reconnect` success -- never on an automatic
+                    // Ready-after-Fail flap). So a server that's still
+                    // `Starting` on turn 1 and reaches `Ready` before turn
+                    // 2 DOES appear starting turn 2 (this is the intended,
+                    // one-time auto-join, not "mutation"); a server that
+                    // was already joined on turn 1 contributes the EXACT
+                    // SAME tools on turn 2 even if its live tool list
+                    // somehow changed, since this reads each server's
+                    // frozen `joined` snapshot, never its live one.
+                    // Declared here, as owned `Arc<McpTool>`s, BEFORE
+                    // `tools` below so the `&dyn ExecutableTool` references
+                    // pushed into `tools` borrow from something that
+                    // outlives the `run_tool_loop` call.
+                    let mcp_tools_snapshot: Vec<Arc<rokr_mcp::McpTool>> =
+                        if matches!(agent, AgentTier::Build) {
+                            rokr_mcp::snapshot_tools(&mcp_server_handles, &mcp_notice_tx)
+                        } else {
+                            Vec::new()
+                        };
+
                     let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
                         AgentTier::Plan => vec![&read, &glob, &grep, &ls],
                         AgentTier::Build => {
@@ -688,6 +1023,14 @@ async fn main() -> ExitCode {
                     };
                     if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
                         tools.push(websearch);
+                    }
+                    // MCP tools are gated (`McpTool::preview` always returns
+                    // `Some(...)`), so -- like bash/write/edit/webfetch
+                    // above -- they only join the tool set for the `Build`
+                    // tier, never `Plan` (ticket 44's original gating
+                    // behavior, preserved here).
+                    for tool in &mcp_tools_snapshot {
+                        tools.push(tool.as_ref() as &dyn rokr_core::ExecutableTool);
                     }
 
                     // Expand any `@path` mentions in the raw input BEFORE it
@@ -703,12 +1046,64 @@ async fn main() -> ExitCode {
                     // `read` tool's own io-error-to-failure behavior: any
                     // read error (missing file, permissions, non-UTF-8,
                     // ...) is treated as `NotFound`.
-                    let expanded_input = rokr_core::mentions::expand_mentions(&input, |path| {
-                        match std::fs::read_to_string(path) {
-                            Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
-                            Err(_) => rokr_core::mentions::MentionResolution::NotFound,
+                    let mut expanded_input =
+                        rokr_core::mentions::expand_mentions(&input, |path| {
+                            match std::fs::read_to_string(path) {
+                                Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
+                                Err(_) => rokr_core::mentions::MentionResolution::NotFound,
+                            }
+                        });
+
+                    // `UserPromptSubmit` (PRD "Hooks"; architect decision:
+                    // "UserPromptSubmit before each prompt is sent"): runs
+                    // BEFORE this turn's user message joins the transcript
+                    // at all, so a blocking deny (exit 2, unless the entry
+                    // opts out via `blocking: false`) can short-circuit the
+                    // whole submission with an early `Err` -- same "denied
+                    // before anything is recorded" shape `PreToolUse`'s
+                    // ordering rule gives tool calls, just one level up.
+                    // Every matching hook's exit-0 stdout is concatenated
+                    // and appended to `expanded_input`, injecting fresh
+                    // context into THIS turn's own user message (reusing
+                    // the plain user-text path, same reasoning as the
+                    // `@path`-mention expansion above: at least one
+                    // supported provider rejects an orphan tool-role
+                    // message on the wire).
+                    let mut injected_user_prompt_context = String::new();
+                    for entry in matching_hook_entries(&hooks_config, "UserPromptSubmit", None) {
+                        let payload = rokr_hooks::HookPayload::UserPromptSubmit {
+                            prompt: expanded_input.clone(),
+                        };
+                        match run_hook_entry(entry, &payload).await {
+                            rokr_hooks::HookResult::Success { stdout } => {
+                                if !stdout.trim().is_empty() {
+                                    if !injected_user_prompt_context.is_empty() {
+                                        injected_user_prompt_context.push_str("\n\n");
+                                    }
+                                    injected_user_prompt_context.push_str(stdout.trim());
+                                }
+                            }
+                            rokr_hooks::HookResult::Blocked { stderr } => {
+                                if entry.blocking.unwrap_or(true) {
+                                    return Err(stderr);
+                                }
+                                eprintln!(
+                                    "UserPromptSubmit hook exited 2 but its config entry sets \
+                                     blocking: false, allowing the prompt through: {stderr}"
+                                );
+                            }
+                            rokr_hooks::HookResult::NonBlockingFailure { message } => {
+                                eprintln!(
+                                    "UserPromptSubmit hook failed non-blocking, continuing \
+                                     without its injected context: {message}"
+                                );
+                            }
                         }
-                    });
+                    }
+                    if !injected_user_prompt_context.is_empty() {
+                        expanded_input =
+                            format!("{expanded_input}\n\n{injected_user_prompt_context}");
+                    }
 
                     let mut transcript = transcript.lock().await;
                     // Schema v2 (architect ruling, phase-5): capture the
@@ -723,6 +1118,97 @@ async fn main() -> ExitCode {
 
                     let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
 
+                    // `PreToolUse` (ticket 49, hooks-tracer-bullet; replaced
+                    // here by ticket 50, hooks-remaining-events-and-config,
+                    // with the real `hooks` config schema -- the interim
+                    // `ROKR_PRETOOLUSE_HOOK` env var this superseded is
+                    // gone, mirroring how ticket 45's `mcp` config schema
+                    // superseded ticket 44's `ROKR_MCP_SERVER` env var):
+                    // runs every configured `PreToolUse` hook whose
+                    // `matcher` glob matches the tool name about to be
+                    // called (`matching_hook_entries`), in order, stopping
+                    // at the first that denies. A hook that exits 2 vetoes
+                    // UNLESS its own config entry sets `blocking: false`,
+                    // in which case the veto is downgraded to a logged
+                    // non-blocking notice -- see `HookEntry::blocking`'s doc
+                    // comment in `rokr-config` for why that escape hatch
+                    // exists. Any other outcome (success, non-blocking
+                    // failure, or a downgraded block) falls through to
+                    // `Allow`, matching `execute_hook`'s own
+                    // non-blocking-failure contract
+                    // (`docs/adr/0012-hooks-execution-trust-model.md`).
+                    let pre_tool_hook: &rokr_core::PreToolHookCallback<'_> =
+                        &|request: rokr_core::PreToolHookRequest| {
+                            let hooks_config = hooks_config.clone();
+                            Box::pin(async move {
+                                let entries = matching_hook_entries(
+                                    &hooks_config,
+                                    "PreToolUse",
+                                    Some(&request.tool_name),
+                                );
+                                for entry in entries {
+                                    let payload = rokr_hooks::HookPayload::PreToolUse {
+                                        tool_name: request.tool_name.clone(),
+                                        tool_input: request.tool_input.clone(),
+                                    };
+                                    match run_hook_entry(entry, &payload).await {
+                                        rokr_hooks::HookResult::Success { .. } => {}
+                                        rokr_hooks::HookResult::Blocked { stderr } => {
+                                            if entry.blocking.unwrap_or(true) {
+                                                return rokr_core::PreToolHookOutcome::Deny(
+                                                    stderr,
+                                                );
+                                            }
+                                            eprintln!(
+                                                "PreToolUse hook exited 2 but its config entry \
+                                                 sets blocking: false, allowing the tool call \
+                                                 through: {stderr}"
+                                            );
+                                        }
+                                        rokr_hooks::HookResult::NonBlockingFailure { message } => {
+                                            eprintln!(
+                                                "PreToolUse hook failed non-blocking, allowing \
+                                                 the tool call through: {message}"
+                                            );
+                                        }
+                                    }
+                                }
+                                rokr_core::PreToolHookOutcome::Allow
+                            })
+                        };
+
+                    // `PostToolUse` (ticket 50, hooks-remaining-events-and-config;
+                    // PRD "Hooks", architect decision: "mirrors PreToolUse's
+                    // callback shape, non-blocking observational"): runs
+                    // every configured `PostToolUse` hook whose `matcher`
+                    // matches the tool that just ran, AFTER its result is
+                    // already decided. `PostToolHookCallback` returns `()`
+                    // (see that type's doc comment) -- nothing this closure
+                    // does can change the `ToolResult` already produced;
+                    // every outcome (including a stray exit 2) is just
+                    // logged via `log_observational_hook_outcome`.
+                    let post_tool_hook: &rokr_core::PostToolHookCallback<'_> =
+                        &|request: rokr_core::PostToolHookRequest| {
+                            let hooks_config = hooks_config.clone();
+                            Box::pin(async move {
+                                let entries = matching_hook_entries(
+                                    &hooks_config,
+                                    "PostToolUse",
+                                    Some(&request.tool_name),
+                                );
+                                for entry in entries {
+                                    let payload = rokr_hooks::HookPayload::PostToolUse {
+                                        tool_name: request.tool_name.clone(),
+                                        tool_input: request.tool_input.clone(),
+                                        tool_output: request.tool_output.clone(),
+                                        is_error: request.is_error,
+                                    };
+                                    let result = run_hook_entry(entry, &payload).await;
+                                    log_observational_hook_outcome("PostToolUse", &result);
+                                }
+                            })
+                        };
+
                     let (reply, usage) = rokr_core::run_tool_loop(
                         &provider,
                         &system_prompt,
@@ -730,9 +1216,22 @@ async fn main() -> ExitCode {
                         &mut transcript,
                         &tools,
                         request_permission,
+                        Some(pre_tool_hook),
+                        Some(post_tool_hook),
                     )
                     .await
                     .map_err(|err| err.to_string())?;
+
+                    // `Stop` (ticket 50, hooks-remaining-events-and-config;
+                    // PRD "Hooks", architect decision: "Stop when agent
+                    // finishes a turn"): fires here, once `run_tool_loop`
+                    // has produced this turn's final reply, fire-and-observe
+                    // like `PostToolUse` above (no veto semantics -- the
+                    // turn has already finished).
+                    for entry in matching_hook_entries(&hooks_config, "Stop", None) {
+                        let result = run_hook_entry(entry, &rokr_hooks::HookPayload::Stop).await;
+                        log_observational_hook_outcome("Stop", &result);
+                    }
 
                     // Schema v2 (architect ruling, phase-5): exactly ONE
                     // `Turn` record per submit, appended after
@@ -814,7 +1313,10 @@ async fn main() -> ExitCode {
                         + effective_usage_for_percent.output_tokens)
                         as f64
                         / context_window_size as f64;
-                    let _ = status_tx.send(rokr_tui::SessionStatus { context_percent });
+                    let _ = status_tx.send(rokr_tui::SessionStatus {
+                        context_percent,
+                        notice: None,
+                    });
 
                     let notice = if rokr_core::should_compact(
                         usage,
@@ -890,6 +1392,9 @@ async fn main() -> ExitCode {
                 let last_known_usage = command_last_known_usage.clone();
                 let turn_index = command_turn_index.clone();
                 let data_dir = command_data_dir.clone();
+                let mcp_server_handles = command_mcp_server_handles.clone();
+                let mcp_configs = command_mcp_configs.clone();
+                let hooks_config = command_hooks_config.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
@@ -964,6 +1469,41 @@ async fn main() -> ExitCode {
                         };
                     }
 
+                    // Ticket 51 (mcp-hooks-introspection): `/mcp reconnect
+                    // <server>` is the only MUTATING introspection command
+                    // (resets ONE named server's retry state -- never
+                    // touches config on disk). Checked before the bare
+                    // `/mcp` match arm below, same `strip_prefix` shape as
+                    // `/search ` above.
+                    if let Some(server_name) = input.strip_prefix("/mcp reconnect ") {
+                        let server_name = server_name.trim();
+                        return match mcp_server_handles
+                            .iter()
+                            .find(|handle| handle.name == server_name)
+                        {
+                            Some(handle) => match mcp_reconnect_gate(&handle.status()) {
+                                Ok(()) => {
+                                    handle.reconnect();
+                                    format!("Reconnecting MCP server '{server_name}'.")
+                                }
+                                // F-002: PC-1/F-002's "auto-join is
+                                // once-per-server, re-entry only via
+                                // explicit reconnect" guard only makes
+                                // sense if reconnect itself is gated to
+                                // `Degraded` servers -- reconnecting an
+                                // already-`Ready`/`Starting` server would
+                                // spin up a second concurrent lifecycle
+                                // task for no reason (F-002's race the
+                                // generation fence guards against).
+                                Err(state_word) => format!(
+                                    "server '{server_name}' is {state_word}; reconnect only \
+                                     applies to degraded servers"
+                                ),
+                            },
+                            None => format!("no such MCP server: '{server_name}'"),
+                        };
+                    }
+
                     match input.as_str() {
                         "/sessions" => match store.list_sessions() {
                             Ok(entries) if entries.is_empty() => {
@@ -1034,6 +1574,8 @@ async fn main() -> ExitCode {
                                 }
                             }
                         }
+                        "/mcp" => format_mcp_listing(&mcp_configs, &mcp_server_handles),
+                        "/hooks" => format_hooks_listing(&hooks_config),
                         _ => format!("unknown command: {input}"),
                     }
                 }
@@ -1047,7 +1589,26 @@ async fn main() -> ExitCode {
                 }
             };
 
-            match rokr_tui::run(submit, command, prompt_history, on_history_append, status_rx).await {
+            let run_result =
+                rokr_tui::run(submit, command, prompt_history, on_history_append, status_rx).await;
+
+            // `SessionEnd` (ticket 50, hooks-remaining-events-and-config;
+            // PRD "Hooks", architect decision: "SessionEnd at exit"): fires
+            // once, here, after the TUI has already returned control
+            // (regardless of whether it exited cleanly, hit a non-tty, or
+            // errored) and before this process' own exit code is decided.
+            // Fire-and-observe like `Stop`/`PostToolUse` -- nothing it does
+            // can change `run_result` below. `run_hook_entry`'s existing
+            // timeout contract (default 60s, per-entry override) is what
+            // keeps this from delaying process exit unboundedly; it is NOT
+            // itself further time-boxed beyond that, matching every other
+            // hook call site in this file.
+            for entry in matching_hook_entries(&hooks_config, "SessionEnd", None) {
+                let result = run_hook_entry(entry, &rokr_hooks::HookPayload::SessionEnd).await;
+                log_observational_hook_outcome("SessionEnd", &result);
+            }
+
+            match run_result {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) if err.is_not_a_tty() => {
                     // Not an error in a scripting/piping context: config is
@@ -1072,6 +1633,216 @@ async fn main() -> ExitCode {
 /// running history.
 fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
     transcript.push(rokr_core::Message::user_text(input));
+}
+
+/// Ticket 47 (mcp-permission-polish): formats a `PermissionPayload::ToolCall`
+/// into the `rokr_tui::PermissionDetail::Text` shown in the permission
+/// prompt -- one `label: value` line per field, server then tool then the
+/// pretty-printed input. Kept as discrete lines (rather than one
+/// interpolated blob) so ticket 48 (Streamable HTTP) can append an
+/// `origin: ...` line for a remote server's permission prompt without
+/// reshaping this format. Shared by both `request_permission` and
+/// `subagent_request_permission` below, which build identical prompt text
+/// for a `ToolCall` payload.
+///
+/// Ticket 48 (mcp-http-transport), PRD "MCP permissions": `origin` is
+/// `Some(url)` when `server` is an HTTP-transport MCP server (looked up by
+/// the caller from config, NOT carried on `PermissionPayload::ToolCall`
+/// itself -- see `mcp_http_origins`'s doc comment above for why), `None`
+/// for a stdio server. An HTTP server's origin is a data-exfiltration
+/// signal, so it's appended as its own line when present.
+fn format_tool_call_permission_text(
+    server: &str,
+    tool: &str,
+    input_pretty: &str,
+    origin: Option<&str>,
+) -> String {
+    let mut text = format!("server: {server}\ntool: {tool}\ninput: {input_pretty}");
+    if let Some(origin) = origin {
+        text.push_str(&format!("\norigin: {origin}"));
+    }
+    text
+}
+
+/// F-002: gates `/mcp reconnect <server>` to `Degraded` servers only --
+/// reconnecting a `Starting` or already-`Ready` server would spin up a
+/// second, redundant lifecycle task racing the one already running (the
+/// exact scenario F-002's generation fence in `rokr-mcp` exists to survive,
+/// but there's no reason to invite it from a command whose whole point is
+/// "this server is broken, try again"). `Ok(())` means reconnect may
+/// proceed; `Err(word)` carries the state word for the refusal message.
+/// A free function (rather than inlined at the one call site) so it's
+/// unit-testable without spinning up a real `McpServerHandle`/lifecycle
+/// task.
+fn mcp_reconnect_gate(status: &rokr_mcp::McpServerStatus) -> Result<(), &'static str> {
+    match status {
+        rokr_mcp::McpServerStatus::Degraded { .. } => Ok(()),
+        rokr_mcp::McpServerStatus::Starting => Err("starting"),
+        rokr_mcp::McpServerStatus::Ready => Err("connected"),
+    }
+}
+
+#[cfg(test)]
+mod mcp_reconnect_gate_tests {
+    use super::*;
+
+    /// F-002 done-when: reconnect is refused for a `Ready` (connected)
+    /// server -- only a `Degraded` server may reconnect.
+    #[test]
+    fn reconnect_on_connected_server_is_refused() {
+        let result = mcp_reconnect_gate(&rokr_mcp::McpServerStatus::Ready);
+        assert_eq!(
+            result,
+            Err("connected"),
+            "expected reconnect to be refused for an already-connected server"
+        );
+    }
+
+    #[test]
+    fn reconnect_on_starting_server_is_refused() {
+        let result = mcp_reconnect_gate(&rokr_mcp::McpServerStatus::Starting);
+        assert_eq!(result, Err("starting"));
+    }
+
+    #[test]
+    fn reconnect_on_degraded_server_is_permitted() {
+        let result = mcp_reconnect_gate(&rokr_mcp::McpServerStatus::Degraded {
+            reason: "boom".to_string(),
+        });
+        assert_eq!(result, Ok(()));
+    }
+}
+
+/// Ticket 51 (mcp-hooks-introspection), `/mcp`: renders one line per
+/// configured MCP server (PRD "connection state (connected/degraded/
+/// disabled)"), sorted by name for deterministic output. `configs` is the
+/// raw, unfiltered `config.mcp` -- a server with `enabled: false` never
+/// gets a `McpServerHandle` at all (see `mcp_server_handles`'s
+/// construction in `main`), so `configs` is what lets this report
+/// "disabled" for it instead of silently omitting it; `handles` supplies
+/// live status/tools for every server that DID get spawned. State/field
+/// values are printed as single `key=value` tokens with no internal
+/// spaces (`state=connected`, not `state: connected`) so they survive
+/// ratatui's cell-diff rendering (unchanged cells, including blank spaces,
+/// aren't redrawn) as one contiguous run of bytes in a raw terminal
+/// capture.
+fn format_mcp_listing(
+    configs: &std::collections::HashMap<String, rokr_config::McpServerConfig>,
+    handles: &[rokr_mcp::McpServerHandle],
+) -> String {
+    if configs.is_empty() {
+        return "No MCP servers configured.".to_string();
+    }
+
+    let mut names: Vec<&String> = configs.keys().collect();
+    names.sort();
+
+    names
+        .into_iter()
+        .map(|name| {
+            let server_config = &configs[name];
+            let transport = match server_config.transport {
+                rokr_config::McpTransport::Stdio(_) => "stdio",
+                rokr_config::McpTransport::Http(_) => "http",
+            };
+
+            if !server_config.enabled {
+                return format!("{name} | transport={transport} | state=disabled | tools=[]");
+            }
+
+            let handle = handles.iter().find(|handle| &handle.name == name);
+            let (state, tools) = match handle.map(|handle| handle.status()) {
+                Some(rokr_mcp::McpServerStatus::Starting) => {
+                    ("state=starting".to_string(), Vec::new())
+                }
+                Some(rokr_mcp::McpServerStatus::Ready) => {
+                    // PC-1 ruling: reflects this server's live JOIN state
+                    // (`joined`, frozen at its own first Ready or a later
+                    // explicit reconnect success) rather than its raw live
+                    // `tools()` -- this is what's actually contributing to
+                    // every session's assembled snapshot right now, so
+                    // there's no separate "restart to pick up tools" note
+                    // needed: whatever's listed here is already active.
+                    let tool_names = handle
+                        .expect("handle present for a Ready status")
+                        .joined()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect::<Vec<_>>();
+                    ("state=connected".to_string(), tool_names)
+                }
+                Some(rokr_mcp::McpServerStatus::Degraded { reason }) => {
+                    (format!("state=degraded (reason: {reason})"), Vec::new())
+                }
+                None => ("state=unknown".to_string(), Vec::new()),
+            };
+
+            format!(
+                "{name} | transport={transport} | {state} | tools=[{}]",
+                tools.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Ticket 51 (mcp-hooks-introspection): the six hook event names actually
+/// wired to a hook call site somewhere in this file (`main`'s
+/// `SessionStart` firing point; `submit`'s `UserPromptSubmit`,
+/// `PreToolUse`, `PostToolUse`, `Stop`; and the `SessionEnd` firing point
+/// after `rokr_tui::run` returns) -- matches every literal event string
+/// passed to `matching_hook_entries` elsewhere in this file exactly. Used
+/// by `format_hooks_listing` below to flag a hook entry configured under
+/// any OTHER key (a typo, or one of the events the PRD defers to Phase 7
+/// -- `SubagentStop`, `PreCompact`, `Notification`) as `state=inactive`:
+/// real config `/hooks` should still list, just flagged since nothing will
+/// ever run it.
+const SUPPORTED_HOOK_EVENTS: [&str; 6] = [
+    "PreToolUse",
+    "PostToolUse",
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "SessionEnd",
+];
+
+/// Ticket 51 (mcp-hooks-introspection), `/hooks`: renders one line per
+/// configured hook entry, sorted by event name for deterministic output.
+/// See `SUPPORTED_HOOK_EVENTS`'s doc comment for what `state=active` /
+/// `state=inactive` means; see `format_mcp_listing`'s doc comment for why
+/// fields are printed as single `key=value` tokens.
+fn format_hooks_listing(
+    hooks_config: &std::collections::HashMap<String, Vec<rokr_config::HookEntry>>,
+) -> String {
+    if hooks_config.is_empty() {
+        return "No hooks configured.".to_string();
+    }
+
+    let mut events: Vec<&String> = hooks_config.keys().collect();
+    events.sort();
+
+    let mut lines = Vec::new();
+    for event in events {
+        let active = SUPPORTED_HOOK_EVENTS.contains(&event.as_str());
+        let state = if active { "state=active" } else { "state=inactive" };
+        for entry in &hooks_config[event] {
+            let matcher = entry.matcher.as_deref().unwrap_or("*");
+            let timeout_ms = entry
+                .timeout_ms
+                .unwrap_or(rokr_hooks::DEFAULT_TIMEOUT.as_millis() as u64);
+            let blocking = entry
+                .blocking
+                .map(|blocking| blocking.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            lines.push(format!(
+                "{event} | matcher={matcher} | command={} | timeout_ms={timeout_ms} | \
+                 blocking={blocking} | {state}",
+                entry.command
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management

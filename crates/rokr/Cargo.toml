@@ -11,6 +11,22 @@ rokr-provider = { path = "../rokr-provider" }
 rokr-tools = { path = "../rokr-tools" }
 rokr-config = { path = "../rokr-config" }
 rokr-session = { path = "../rokr-session" }
+# Ticket 44 (mcp-tracer-bullet): not in the ticket's `files-touched` list,
+# but mechanically required -- `main.rs`'s interim MCP wiring (also listed
+# in `files-touched`) cannot call into `rokr-mcp` at all without this
+# dependency edge. Flagged in the ticket report as a deviation.
+rokr-mcp = { path = "../rokr-mcp" }
+# Ticket 49 (hooks-tracer-bullet): not in that ticket's `files-touched`
+# list, but mechanically required -- `main.rs`'s hook wiring (also listed
+# in `files-touched`) cannot call into `rokr-hooks` at all without this
+# dependency edge. Same mechanical necessity as ticket 44's `rokr-mcp`
+# dependency add above; flagged in that ticket's report as a deviation,
+# pre-authorized by the ticket brief. Ticket 49's original wiring here was
+# the interim `ROKR_PRETOOLUSE_HOOK` env var; ticket 50
+# (hooks-remaining-events-and-config) replaced it wholesale with the real
+# `hooks` config schema (per-event lists, glob matcher, per-hook
+# `timeout_ms`/`blocking`), still through this same dependency edge.
+rokr-hooks = { path = "../rokr-hooks" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 

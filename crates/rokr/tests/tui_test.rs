@@ -2870,6 +2870,859 @@ async fn bash_tool_call_skips_execution_on_reject() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// Ticket 49 (hooks-tracer-bullet) acceptance test, updated by ticket 50
+/// (hooks-remaining-events-and-config) to configure the hook via a real
+/// `rokr.json` `hooks.PreToolUse` entry (`write_hooks_config`) instead of
+/// ticket 49's interim `ROKR_PRETOOLUSE_HOOK` env var, which ticket 50
+/// removes entirely from `main.rs`: a real shell-command `PreToolUse` hook
+/// that exits 2 must veto a `bash` tool call before the permission prompt
+/// ever renders. Mirrors
+/// `bash_tool_call_renders_permission_prompt_and_runs_on_accept`/
+/// `bash_tool_call_skips_execution_on_reject`'s structure, but asserts the
+/// ABSENCE of the permission prompt (the marker path text, which only ever
+/// appears in that prompt's rendered command line) rather than waiting for
+/// it and then accepting/rejecting interactively.
+#[tokio::test]
+async fn pretooluse_hook_script_denies_bash_call_before_permission_prompt_appears() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterHookVetoForTesting";
+
+    let temp_dir = unique_temp_dir("hook-veto-target");
+    let marker_path = temp_dir.join("hookveto-marker");
+    let marker_path_str = marker_path.to_string_lossy().into_owned();
+    let bash_command = format!("touch {marker_path_str}");
+
+    // First call: the model asks to invoke the `bash` tool -- the
+    // PreToolUse hook below must veto this before any permission prompt
+    // renders.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-veto",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // The loop must continue after the hook veto (same "loop continues"
+    // shape as an interactive rejection): the model gets an error tool
+    // result and still produces a final reply.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-veto-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-hook-veto");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-hook-veto");
+    // The hook: reads (and discards) its JSON stdin payload, then always
+    // exits 2 -- a blocking veto regardless of which tool call it saw.
+    write_hooks_config(
+        &xdg_config_home,
+        "PreToolUse",
+        "cat >/dev/null; echo 'vetoed: no bash allowed' >&2; exit 2",
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"runbash\r")
+        .expect("failed to write prompt to pty");
+
+    // No "y"/"n" keypress is ever sent: a hook veto must short-circuit
+    // before the permission prompt runs at all, so the loop should reach
+    // the final reply on its own.
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after the hook veto (the \
+         loop must continue on its own, with no permission keypress needed), got: {output:?}"
+    );
+    assert!(
+        !output.contains("hookveto-marker"),
+        "the marker path only ever appears in a rendered permission-prompt command line -- its \
+         presence would mean the prompt rendered despite the hook's veto, got: {output:?}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "the bash command must never run after the PreToolUse hook vetoed it"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config) acceptance test: a
+/// `rokr.json` with a `SessionStart` hook whose command echoes distinctive
+/// text to stdout must have that text folded into the outgoing system
+/// prompt at startup -- proven the same way
+/// `agents_md_content_appears_in_outgoing_system_prompt` proves AGENTS.md's
+/// project-context injection: by inspecting the FIRST request's raw body
+/// via the mock server's request recording, not by scraping rendered pty
+/// bytes (ratatui's own line-wrapping of a long system prompt would make a
+/// literal on-screen substring match unreliable).
+#[tokio::test]
+async fn sessionstart_hook_stdout_appears_in_transcript_context_at_startup() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let canned_response = "MockedAssistantReplyForSessionStartHookTesting";
+    let session_start_marker = "DistinctiveSessionStartHookStdoutForTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-sessionstart-hook",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": canned_response
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-sessionstart-hook");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-sessionstart-hook");
+    write_hooks_config(
+        &xdg_config_home,
+        "SessionStart",
+        &format!("echo '{session_start_marker}'"),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"helloworld\r")
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(canned_response) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(canned_response),
+        "expected pty output to contain the mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least 1 request to /chat/completions, got 0"
+    );
+
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+
+    assert!(
+        first_request_body.contains(session_start_marker),
+        "expected the outgoing request body to contain the SessionStart hook's stdout, proving \
+         it was injected into the conversation context at startup, got: {first_request_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config) acceptance test: a
+/// `rokr.json` with a `UserPromptSubmit` hook whose command echoes
+/// distinctive text to stdout must have that text injected into EVERY
+/// submitted turn's outgoing request, not just the first -- proven across
+/// two separate submissions (mirroring
+/// `second_prompt_includes_prior_turn_in_request_body`'s two-turn PTY
+/// structure), inspecting each turn's own raw request body via the mock
+/// server's request recording.
+#[tokio::test]
+async fn userpromptsubmit_hook_injects_context_before_each_prompt_is_sent() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let first_reply_text = "FirstReplyAfterUserPromptSubmitHookForTesting";
+    let second_reply_text = "SecondReplyAfterUserPromptSubmitHookForTesting";
+    let user_prompt_submit_marker = "DistinctiveUserPromptSubmitHookStdoutForTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-userpromptsubmit-hook-first",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": first_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-userpromptsubmit-hook-second",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": second_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-userpromptsubmit-hook");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-userpromptsubmit-hook");
+    write_hooks_config(
+        &xdg_config_home,
+        "UserPromptSubmit",
+        &format!("echo '{user_prompt_submit_marker}'"),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"firstpromptunique\r")
+        .expect("failed to write first prompt to pty");
+
+    let first_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < first_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain the first mocked assistant response, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"secondpromptunique\r")
+        .expect("failed to write second prompt to pty");
+
+    let second_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < second_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain the second mocked assistant response, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording should be enabled on the mock server by default");
+
+    assert!(
+        received_requests.len() >= 2,
+        "expected at least 2 requests to /chat/completions, got {}: {received_requests:?}",
+        received_requests.len()
+    );
+
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    let second_request_body = String::from_utf8_lossy(&received_requests[1].body).into_owned();
+
+    assert!(
+        first_request_body.contains(user_prompt_submit_marker),
+        "expected the first turn's outgoing request body to contain the UserPromptSubmit hook's \
+         stdout, got: {first_request_body}"
+    );
+    // A plain `.contains()` check here would be tautological: turn 1's
+    // injected marker is already persisted into the transcript as part of
+    // that turn's user message, and turn 2's request body carries the
+    // WHOLE transcript so far (proven separately by
+    // `second_prompt_includes_prior_turn_in_request_body`) -- so the marker
+    // would appear in the second body even if the hook never fired again.
+    // Counting occurrences is what actually proves a SECOND, fresh
+    // injection happened: one carried over from turn 1's transcript entry,
+    // one newly injected into turn 2's own user message.
+    let second_body_marker_count = second_request_body
+        .matches(user_prompt_submit_marker)
+        .count();
+    assert!(
+        second_body_marker_count >= 2,
+        "expected the SECOND turn's outgoing request body to contain the UserPromptSubmit \
+         hook's stdout TWICE (once carried over from turn 1's transcript entry, once freshly \
+         injected into turn 2's own prompt) -- it must fire before EVERY submitted prompt, not \
+         just the first; got {second_body_marker_count} occurrence(s) in: {second_request_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config) acceptance test: the glob
+/// matcher must only fire a `PreToolUse` hook for tool names it actually
+/// matches. A hook configured with `matcher: "mcp__*"` (which always exits
+/// 2, i.e. would veto everything if it fired) must NOT veto a `bash` call --
+/// mirrors `bash_tool_call_renders_permission_prompt_and_runs_on_accept`'s
+/// exact structure (permission prompt renders, accepting it lets the
+/// command actually run), the opposite assertion from
+/// `pretooluse_hook_script_denies_bash_call_before_permission_prompt_appears`
+/// above, which uses no `matcher` (defaulting to match-everything) and DOES
+/// veto.
+#[tokio::test]
+async fn pretooluse_hook_matcher_only_vetoes_matching_tool_names() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterNonMatchingHookForTesting";
+
+    let temp_dir = unique_temp_dir("hook-matcher-target");
+    let marker_path = temp_dir.join("hookmatcher-marker");
+    let marker_path_str = marker_path.to_string_lossy().into_owned();
+    let bash_command = format!("touch {marker_path_str}");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-matcher",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-matcher-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-hook-matcher");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-hook-matcher");
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+    let config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "mcp__*",
+                    "command": "cat >/dev/null; echo 'should never veto bash' >&2; exit 2"
+                }
+            ]
+        }
+    });
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"runbash\r")
+        .expect("failed to write prompt to pty");
+
+    // The non-matching hook must NOT veto: the permission prompt should
+    // still render, exactly like the no-hook-configured case.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("bash") && output.contains("hookmatcher-marker") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("bash") && output.contains("hookmatcher-marker"),
+        "expected the permission prompt to render (proving the non-matching 'mcp__*' hook did \
+         NOT veto the bash call), got: {output:?}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "the bash command must not have run before permission was granted"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply, got: {output:?}"
+    );
+    assert!(
+        marker_path.exists(),
+        "the bash command must have run after permission was granted (the non-matching hook \
+         must never have vetoed it)"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 #[tokio::test]
 async fn plan_agent_bash_tool_call_yields_unavailable_tool_result_without_prompt() {
     use wiremock::matchers::{method, path};
@@ -8185,6 +9038,2524 @@ async fn zero_usage_turn_leaves_context_percentage_at_previous_known_value() {
         output.contains("50%"),
         "expected the Header to still show a 50% context-usage figure after the zero-usage \
          second turn, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// The fake stdio MCP server fixture's fixed `tools/call` response text
+/// (`crates/rokr-mcp/tests/fixtures/fake_mcp_server.rs::FIXED_RESPONSE_TEXT`).
+/// A bin target's items aren't importable from another crate, so this is a
+/// deliberate duplicate literal, not a shared constant -- keep both sides
+/// in sync if either changes.
+const FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT: &str = "fake-mcp-server-echo-response-9f3c2a";
+
+/// The fake stdio MCP server fixture's `[[bin]]` executable
+/// (`crates/rokr-mcp/Cargo.toml`) lives in a sibling crate, so
+/// `CARGO_BIN_EXE_fake_mcp_server` (only populated for bin targets of the
+/// package under test) isn't available here. The whole workspace shares
+/// one `target/<profile>/` directory, so deriving the path from the
+/// already-available `CARGO_BIN_EXE_rokr` (same directory, different
+/// filename) is reliable without depending on that env var. Requires the
+/// fixture to have actually been built -- true whenever the fixture ran as
+/// part of a full workspace `cargo test`, which is how this suite is meant
+/// to be run.
+fn fake_mcp_server_path() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_BIN_EXE_rokr"));
+    path.set_file_name(if cfg!(windows) {
+        "fake_mcp_server.exe"
+    } else {
+        "fake_mcp_server"
+    });
+    assert!(
+        path.exists(),
+        "fake_mcp_server fixture binary not found at {path:?} -- run a full workspace \
+         `cargo test` (not `cargo test -p rokr` alone) so rokr-mcp's [[bin]] fixture gets built"
+    );
+    path
+}
+
+/// Writes a `rokr.json` declaring one ENABLED stdio MCP server into
+/// `xdg_config_home/rokr/rokr.json` (`rokr_config::default_config_dir`'s
+/// resolution when `XDG_CONFIG_HOME` is set) BEFORE the `rokr` binary is
+/// spawned, so `load_or_init` takes its "existing file" branch and parses
+/// this real `mcp` block -- ticket 45 (mcp-config-and-lifecycle) replaces
+/// ticket 44's `ROKR_MCP_SERVER` env-var wiring with exactly this
+/// config-driven path. Thin wrapper over `write_mcp_config_servers` below
+/// (ticket 46, mcp-namespace-multi-server-freeze) for the common
+/// one-server case every earlier test uses.
+fn write_mcp_config(
+    xdg_config_home: &std::path::Path,
+    server_name: &str,
+    command: &std::path::Path,
+    env: serde_json::Value,
+) {
+    write_mcp_config_servers(xdg_config_home, &[(server_name, command, env)]);
+}
+
+/// Ticket 46 (mcp-namespace-multi-server-freeze): same as `write_mcp_config`
+/// above, but declares MULTIPLE enabled stdio MCP servers in one
+/// `rokr.json` -- needed for the two-server namespacing/collision
+/// acceptance test, which must configure two independent fake servers in a
+/// single session.
+fn write_mcp_config_servers(
+    xdg_config_home: &std::path::Path,
+    servers: &[(&str, &std::path::Path, serde_json::Value)],
+) {
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+
+    let mut mcp = serde_json::Map::new();
+    for (server_name, command, env) in servers {
+        mcp.insert(
+            server_name.to_string(),
+            serde_json::json!({
+                "transport": {
+                    "stdio": {
+                        "command": command.to_string_lossy(),
+                        "args": [],
+                        "env": env
+                    }
+                },
+                "enabled": true
+            }),
+        );
+    }
+    let config = serde_json::json!({ "version": 1, "mcp": mcp });
+
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+}
+
+/// Ticket 50 (hooks-remaining-events-and-config): writes a `rokr.json`
+/// declaring exactly one hook entry for `event` into
+/// `xdg_config_home/rokr/rokr.json` BEFORE the `rokr` binary is spawned,
+/// mirroring `write_mcp_config` above (same "existing file" `load_or_init`
+/// branch, same user-scope-only trust boundary this ticket's config schema
+/// shares with `mcp`'s). `command` is a real shell command string (run via
+/// `sh -c`, same as `execute_hook`), not a script path -- matching how
+/// `pretooluse_hook_script_denies_bash_call_before_permission_prompt_appears`
+/// already inlines its hook logic as a one-line shell command rather than a
+/// separate fixture file.
+fn write_hooks_config(xdg_config_home: &std::path::Path, event: &str, command: &str) {
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+
+    let config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            event: [
+                { "command": command }
+            ]
+        }
+    });
+
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+}
+
+/// Ticket 44 (mcp-tracer-bullet) acceptance test: a model tool-call to a
+/// fake stdio MCP server's tool, driven end-to-end through the running
+/// rokr binary, produces a real `ToolResult` via the new `McpTool:
+/// ExecutableTool` adapter after a permission prompt is accepted. Same PTY
+/// + wiremock harness as `bash_tool_call_renders_permission_prompt_and_runs_on_accept`
+/// above, with one added strictness: the SECOND mock (the provider's
+/// post-tool-call reply) only matches if the outgoing request body
+/// actually contains the fixture's fixed response text -- so unless
+/// `McpTool::execute_boxed` really carried that exact text from the real
+/// `rmcp` client, through the permission-gated tool loop, into the
+/// `ToolResult` sent back on the wire, no mock matches, the loop errors,
+/// and the PTY never renders `final_reply_text` -- the test times out and
+/// fails instead of silently passing on a stub.
+#[tokio::test]
+async fn mcp_tool_call_renders_permission_prompt_and_returns_result_from_fake_stdio_server() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterMcpAcceptForTesting";
+
+    // Ticket 44's interim wiring (crates/rokr/src/main.rs) hardcodes the
+    // server name "interim" for the one env-var-configured MCP server;
+    // `rokr_mcp::qualified_name` is the SAME function that wiring calls,
+    // so this can't drift from what main.rs actually computes.
+    let qualified_tool_name = rokr_mcp::qualified_name("interim", "echo");
+
+    // First call: the model asks to invoke the MCP tool.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-accept",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_tool_name,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Second call: only matches if the tool result the loop fed back
+    // actually contains the fixture's real response text -- see this
+    // test's doc comment.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-accept-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-accept");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-accept");
+    // Ticket 45 (mcp-config-and-lifecycle): configured via rokr.json now,
+    // not the ROKR_MCP_SERVER env var ticket 44 used -- the server name
+    // stays "interim" since `qualified_tool_name` above is computed from
+    // it.
+    write_mcp_config(&xdg_config_home, "interim", &fake_mcp_server_path(), serde_json::json!({}));
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call the mcp tool\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the permission prompt to render, showing the qualified MCP
+    // tool name -- every MCP call is gated (`McpTool::preview` always
+    // returns `Some(...)`), before we've granted anything.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_tool_name) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(&qualified_tool_name),
+        "expected pty output to contain the qualified MCP tool name '{qualified_tool_name}' in \
+         a permission prompt, got: {output:?}"
+    );
+    assert!(
+        !output.contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT),
+        "the MCP tool must not have run before permission was granted, but its response text \
+         already appears in the output: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the MCP tool \
+         call, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 48 (mcp-http-transport) stretch-scope: the `tools/call` fixed
+/// response text a fake Streamable HTTP MCP server (below) returns.
+/// Distinct from `FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT` (the stdio
+/// fixture's) so a test can't accidentally pass by matching the wrong
+/// transport's marker.
+const FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT: &str = "fake-http-mcp-server-echo-response-7e1b4d";
+
+/// Ticket 48: a minimal wiremock-backed fake Streamable HTTP MCP server,
+/// duplicated (not shared) from `rokr-mcp`'s own copy of this responder --
+/// the two crates' test doubles can't share code across the crate
+/// boundary, mirroring this file's existing
+/// `FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT` duplicate-literal precedent.
+/// Mirrors `tests/fixtures/fake_mcp_server.rs`'s JSON-RPC result shapes
+/// exactly, replying over HTTP instead of stdio. Only handles POST --
+/// `StreamableHttpClientTransportConfig::allow_stateless` defaults to
+/// `true` and no `Mcp-Session-Id` response header is set below, so the
+/// real `rmcp` client never opens a GET/SSE stream.
+struct FakeHttpMcpResponder;
+
+impl wiremock::Respond for FakeHttpMcpResponder {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let body: serde_json::Value = request.body_json().unwrap_or(serde_json::Value::Null);
+        let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let Some(id) = body.get("id").cloned() else {
+            // A notification (e.g. `notifications/initialized`) gets no
+            // JSON-RPC reply -- 202 Accepted with no body is what
+            // `post_message`'s reqwest impl treats as
+            // `StreamableHttpPostResponse::Accepted`.
+            return wiremock::ResponseTemplate::new(202);
+        };
+        let result = match method {
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "fake-http-mcp-server", "version": "0.1.0" }
+            }),
+            "tools/list" => serde_json::json!({
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": "Echoes back a fixed marker string.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": { "message": { "type": "string" } }
+                        }
+                    }
+                ]
+            }),
+            "tools/call" => serde_json::json!({
+                "content": [
+                    { "type": "text", "text": FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT }
+                ],
+                "isError": false
+            }),
+            _ => serde_json::json!({}),
+        };
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        }))
+    }
+}
+
+/// Writes a `rokr.json` declaring one ENABLED Streamable HTTP MCP server
+/// (ticket 48) into `xdg_config_home/rokr/rokr.json` -- the `http`
+/// transport variant's real config shape (`{"url": "...", "headers":
+/// {...}}"`), analogous to `write_mcp_config`'s stdio block above.
+fn write_http_mcp_config(
+    xdg_config_home: &std::path::Path,
+    server_name: &str,
+    url: &str,
+    bearer_token: &str,
+) {
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+
+    let config = serde_json::json!({
+        "version": 1,
+        "mcp": {
+            server_name: {
+                "transport": {
+                    "http": {
+                        "url": url,
+                        "headers": { "Authorization": format!("Bearer {bearer_token}") }
+                    }
+                },
+                "enabled": true
+            }
+        }
+    });
+
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+}
+
+/// Ticket 48 (mcp-http-transport) acceptance test -- PRD "MCP permissions":
+/// a configured Streamable HTTP MCP server with a static bearer token
+/// completes `initialize` and exposes tools identically to a stdio server
+/// (same `McpTool`/permission-gated path as
+/// `mcp_tool_call_renders_permission_prompt_and_returns_result_from_fake_stdio_server`
+/// above), with the ADDED strictness that the permission prompt text must
+/// also contain the HTTP server's origin -- a data-exfiltration signal a
+/// stdio server's prompt never carries. The fake MCP server's mock only
+/// matches requests carrying the configured bearer header, so a missing
+/// header on ANY request in the initialize/tools-list/tools-call sequence
+/// 404s and the test times out instead of silently passing.
+#[tokio::test]
+async fn http_mcp_server_tool_call_surfaces_origin_in_permission_prompt() {
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let provider_mock_server = MockServer::start().await;
+    let mcp_mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterHttpMcpAcceptForTesting";
+    let bearer_token = "test-static-bearer-token-for-http-mcp";
+    let qualified_tool_name = rokr_mcp::qualified_name("remote", "echo");
+
+    // The fake HTTP MCP server: only responds to a request carrying the
+    // configured static bearer token -- proves the token is sent, not
+    // just configured.
+    Mock::given(method("POST"))
+        .and(header("authorization", format!("Bearer {bearer_token}")))
+        .respond_with(FakeHttpMcpResponder)
+        .mount(&mcp_mock_server)
+        .await;
+
+    // First provider call: the model asks to invoke the HTTP MCP tool.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-http-mcp-accept",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_tool_name,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&provider_mock_server)
+        .await;
+
+    // Second provider call: only matches if the tool result the loop fed
+    // back actually contains the fake HTTP MCP server's real response
+    // text -- proving the HTTP-transport tool call really ran end-to-end.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-http-mcp-accept-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&provider_mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-http-mcp-accept");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-http-mcp-accept");
+    write_http_mcp_config(&xdg_config_home, "remote", &mcp_mock_server.uri(), bearer_token);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", provider_mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call the mcp tool\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the permission prompt to render, showing the qualified MCP
+    // tool name -- every MCP call is gated (`McpTool::preview` always
+    // returns `Some(...)`), before we've granted anything.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_tool_name) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(&qualified_tool_name),
+        "expected pty output to contain the qualified MCP tool name '{qualified_tool_name}' in \
+         a permission prompt, got: {output:?}"
+    );
+    // PRD "MCP permissions": a remote (HTTP) server's origin is a
+    // data-exfiltration signal, so it's surfaced in the permission-prompt
+    // text -- a stdio server's prompt never carries this. The wiremock
+    // server's own URI IS that origin, so this is the strictest possible
+    // check: the exact configured URL, not just some origin-shaped text.
+    let mcp_origin = mcp_mock_server.uri();
+    assert!(
+        output.contains(&mcp_origin),
+        "expected pty output to contain the HTTP MCP server's origin '{mcp_origin}' in the \
+         permission prompt, got: {output:?}"
+    );
+    assert!(
+        !output.contains(FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT),
+        "the HTTP MCP tool must not have run before permission was granted, but its response \
+         text already appears in the output: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the HTTP MCP \
+         tool call, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 45 (mcp-config-and-lifecycle) acceptance test: a `rokr.json` with
+/// one enabled stdio server (configured via the real `mcp` config schema,
+/// not ticket 44's `ROKR_MCP_SERVER` env var) produces that server's tools
+/// after startup, and first paint (Header/View/Prompt rendering) is not
+/// delayed by MCP startup -- the render loop appears well before the model
+/// ever gets a chance to call the MCP tool, since submitting the prompt
+/// that triggers the tool call is itself gated on first paint having
+/// already happened.
+#[tokio::test]
+async fn mcp_server_configured_via_rokr_json_appears_in_tool_set_after_startup() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterConfigDrivenMcpForTesting";
+    let qualified_tool_name = rokr_mcp::qualified_name("scripted", "echo");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-config",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_tool_name,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Only matches if the tool result the loop fed back actually contains
+    // the fixture's real response text -- proving the configured server's
+    // real tool ran, not a stub.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-config-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-config");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-config");
+    write_mcp_config(&xdg_config_home, "scripted", &fake_mcp_server_path(), serde_json::json!({}));
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    // First paint must not be delayed by MCP startup: this deadline is the
+    // SAME bound used everywhere else in this file for a render that has
+    // no MCP server configured at all -- if MCP init were on the render
+    // path, a real (if fast) subprocess spawn + initialize handshake would
+    // still show up as added latency here.
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call the mcp tool\r")
+        .expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_tool_name) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(&qualified_tool_name),
+        "expected the configured server's tool ('{qualified_tool_name}') to be in the \
+         submitted turn's tool set (rendered in the permission prompt), got: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 45 (mcp-config-and-lifecycle) acceptance test: a configured stdio
+/// server that exits before ever responding to `initialize` contributes
+/// zero tools, a one-line status notice becomes visible in the header
+/// status line, and the session is otherwise unaffected -- first paint
+/// still succeeds promptly and an ordinary (non-MCP) turn still completes.
+#[tokio::test]
+async fn failed_mcp_server_shows_status_notice_and_session_continues_without_its_tools() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let ordinary_reply_text = "OrdinaryReplyAfterMcpFailureForTesting";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-failure",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": ordinary_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-failure");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-failure");
+    // The `FAKE_MCP_SERVER_FAIL_INIT` env var (rokr-mcp/tests/fixtures/
+    // fake_mcp_server.rs) makes the fixture exit immediately instead of
+    // responding to `initialize` -- exercising the genuine failed-handshake
+    // path, not a faked JSON-RPC error.
+    write_mcp_config(
+        &xdg_config_home,
+        "flaky",
+        &fake_mcp_server_path(),
+        serde_json::json!({ "FAKE_MCP_SERVER_FAIL_INIT": "1" }),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    // First paint must still succeed promptly even though the configured
+    // server is about to fail -- proving startup isn't blocked/wedged by
+    // it.
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // The bounded retry+backoff in rokr_mcp::run_lifecycle adds real
+    // wall-clock delay (a handful of short backoffs) before the notice
+    // fires -- well under this 10s deadline.
+    //
+    // Checked as separate single-word tokens, not one contiguous phrase:
+    // the header Paragraph renders unwrapped, and ratatui/crossterm's
+    // cell-diff rendering skips redrawing a cell whose content is
+    // unchanged from the previous frame (e.g. a space at a column that was
+    // already blank) -- so a multi-word phrase like "failed to start" gets
+    // its inter-word spaces skipped and its cursor hopped between words,
+    // meaning it never appears as one contiguous run of bytes in the raw
+    // PTY stream even though it's genuinely rendered on screen (see the
+    // `/model anthropic` test's own comment on this exact quirk, elsewhere
+    // in this file, for precedent).
+    let notice_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < notice_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("flaky") && output.contains("failed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("flaky") && output.contains("failed"),
+        "expected a one-line status notice mentioning the failed server 'flaky', got: {output:?}"
+    );
+
+    // The session must otherwise still work: an ordinary, non-MCP turn
+    // completes normally.
+    writer
+        .write_all(b"say something ordinary\r")
+        .expect("failed to write prompt to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(ordinary_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(ordinary_reply_text),
+        "expected the session to complete an ordinary turn despite the failed MCP server, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+
+/// Ticket 51 (mcp-hooks-introspection) acceptance test: `/mcp` lists every
+/// configured server's connection state and (for a connected server) its
+/// current tool list -- one server reaches `Ready` normally, the other is
+/// configured with `FAKE_MCP_SERVER_FAIL_INIT` (same knob
+/// `failed_mcp_server_shows_status_notice_and_session_continues_without_its_tools`
+/// above uses) so it exhausts its bounded retry and lands on `Degraded`.
+/// No live model turn is needed here -- MCP servers spawn unconditionally
+/// at startup regardless of agent tier (`main.rs`), so this is a plain PTY
+/// command-dispatch check, mirroring `/sessions`'s/`/search`'s own tests
+/// rather than the wiremock-backed MCP tool-call tests elsewhere in this
+/// file.
+#[test]
+fn mcp_command_lists_servers_connection_state_and_tools() {
+    let home = unique_temp_dir("home-mcp-list");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-list");
+
+    write_mcp_config_servers(
+        &xdg_config_home,
+        &[
+            ("healthy", &fake_mcp_server_path(), serde_json::json!({})),
+            (
+                "flaky",
+                &fake_mcp_server_path(),
+                serde_json::json!({ "FAKE_MCP_SERVER_FAIL_INIT": "1" }),
+            ),
+        ],
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Give the flaky server's bounded retry+backoff time to exhaust into
+    // Degraded before asking for the listing -- otherwise /mcp could race
+    // it and observe a transient Starting state instead.
+    let degrade_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < degrade_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("flaky") && output.contains("failed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+
+    let listing_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < listing_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("state=connected") && output.contains("state=degraded") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("healthy"),
+        "expected /mcp output to mention 'healthy', got: {output:?}"
+    );
+    assert!(
+        output.contains("flaky"),
+        "expected /mcp output to mention 'flaky', got: {output:?}"
+    );
+    assert!(
+        output.contains("state=connected"),
+        "expected /mcp output to show the healthy server as state=connected, got: {output:?}"
+    );
+    assert!(
+        output.contains("state=degraded"),
+        "expected /mcp output to show the flaky server as state=degraded, got: {output:?}"
+    );
+    assert!(
+        output.contains("echo"),
+        "expected /mcp output to list the connected server's 'echo' tool, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 51 (mcp-hooks-introspection) acceptance test: `/hooks` lists
+/// every configured hook per event plus whether that event is actually
+/// wired anywhere in `main.rs` (`state=active`) or not (`state=inactive`
+/// -- e.g. a hook configured under `PreCompact`, one of the PRD's events
+/// explicitly deferred to Phase 7, which `matching_hook_entries`'s call
+/// sites never look up). `write_hooks_config` only writes one event/command
+/// pair, so this writes `rokr.json` directly, mirroring
+/// `write_mcp_config_servers`'s inline JSON-building style.
+#[test]
+fn hooks_command_lists_configured_hooks_per_event_and_active_state() {
+    let home = unique_temp_dir("home-hooks-list");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-hooks-list");
+
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+    let config = serde_json::json!({
+        "version": 1,
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "bash", "command": "activehooktoken.sh" }
+            ],
+            "PreCompact": [
+                { "command": "inactivehooktoken.sh" }
+            ]
+        }
+    });
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/hooks\r")
+        .expect("failed to write /hooks to pty");
+
+    let listing_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < listing_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("activehooktoken.sh") && output.contains("inactivehooktoken.sh") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("PreToolUse"),
+        "expected /hooks output to mention event 'PreToolUse', got: {output:?}"
+    );
+    assert!(
+        output.contains("activehooktoken.sh"),
+        "expected /hooks output to mention the PreToolUse hook's command, got: {output:?}"
+    );
+    assert!(
+        output.contains("PreCompact"),
+        "expected /hooks output to mention event 'PreCompact', got: {output:?}"
+    );
+    assert!(
+        output.contains("inactivehooktoken.sh"),
+        "expected /hooks output to mention the PreCompact hook's command, got: {output:?}"
+    );
+    assert!(
+        output.contains("state=active"),
+        "expected /hooks output to mark the wired PreToolUse hook state=active, got: {output:?}"
+    );
+    assert!(
+        output.contains("state=inactive"),
+        "expected /hooks output to mark the unwired PreCompact hook state=inactive, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 51 (mcp-hooks-introspection) acceptance test: `/mcp reconnect
+/// <server>` restarts a `Degraded` server's connect+`list_tools` retry
+/// loop, and a SUBSEQUENT `/mcp` shows it `state=connected` again with its
+/// tool list restored -- proving the reconnect actually re-spawned and
+/// succeeded, not merely accepted the command text. Uses the
+/// `FAKE_MCP_SERVER_FAIL_UNTIL_FILE` fixture flag (ticket 51 addition,
+/// `fake_mcp_server.rs`): the server fails every attempt while the marker
+/// file is absent (driving it to `Degraded`, same shape as
+/// `FAKE_MCP_SERVER_FAIL_INIT` elsewhere in this file), then succeeds once
+/// the test creates the marker file and issues `/mcp reconnect` --
+/// `FAKE_MCP_SERVER_FAIL_INIT` alone can't express this since it fails for
+/// the entire life of the env var, with no way to later flip a live
+/// subprocess's env out from under it.
+#[test]
+fn mcp_reconnect_command_restarts_a_degraded_server() {
+    let home = unique_temp_dir("home-mcp-reconnect");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-reconnect");
+    let marker_dir = unique_temp_dir("marker-mcp-reconnect");
+    let marker_path = marker_dir.join("recover.marker");
+
+    write_mcp_config_servers(
+        &xdg_config_home,
+        &[(
+            "flaky",
+            &fake_mcp_server_path(),
+            serde_json::json!({ "FAKE_MCP_SERVER_FAIL_UNTIL_FILE": marker_path.to_string_lossy() }),
+        )],
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Let the bounded retry+backoff exhaust into Degraded first.
+    let degrade_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < degrade_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("flaky") && output.contains("failed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("flaky") && output.contains("failed"),
+        "expected a one-line status notice mentioning the failed server 'flaky', got: {output:?}"
+    );
+
+    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+    let degraded_listing_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < degraded_listing_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("state=degraded") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("state=degraded"),
+        "expected /mcp to show 'flaky' as state=degraded before reconnect, got: {output:?}"
+    );
+
+    // Now let the fixture succeed on its next spawn, and trigger it.
+    std::fs::create_dir_all(&marker_dir).expect("failed to create marker dir");
+    std::fs::write(&marker_path, "").expect("failed to write recovery marker file");
+
+    writer
+        .write_all(b"/mcp reconnect flaky\r")
+        .expect("failed to write /mcp reconnect to pty");
+
+    // The freshly spawned subprocess (marker file now present) succeeds on
+    // its very first attempt -- no backoff delay -- but still needs a beat
+    // for the real connect+list_tools round-trip to complete before a
+    // fresh `/mcp` reflects it.
+    thread::sleep(Duration::from_millis(500));
+    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+
+    let reconnect_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < reconnect_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("state=connected") && output.contains("echo") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("state=connected"),
+        "expected 'flaky' to show state=connected after /mcp reconnect, got: {output:?}"
+    );
+    assert!(
+        output.contains("echo"),
+        "expected 'flaky's tool list to be restored (containing 'echo') after reconnect, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&marker_dir);
+}
+
+
+/// Ticket 46 (mcp-namespace-multi-server-freeze) acceptance test: two
+/// configured stdio servers ("server_a", "server_b") each expose a tool
+/// with the identical RAW name "search" (`FAKE_MCP_SERVER_TOOL_NAME`, a
+/// ticket-46 fixture addition -- see `fake_mcp_server.rs`). The model
+/// issues both tool calls in ONE assistant turn; both must be reachable
+/// and individually executable via their namespaced names
+/// (`mcp__server_a__search` / `mcp__server_b__search`) without either
+/// colliding with or shadowing the other -- the whole point of
+/// `qualified_name`'s per-server namespacing (PRD "Namespacing").
+#[tokio::test]
+async fn two_mcp_servers_with_colliding_tool_name_both_reachable_by_namespaced_name() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterBothMcpServersForTesting";
+    let qualified_a = rokr_mcp::qualified_name("server_a", "search");
+    let qualified_b = rokr_mcp::qualified_name("server_b", "search");
+
+    // The model calls BOTH servers' "search" tool in the same assistant
+    // turn -- `run_tool_loop` executes tool calls in order, so this drives
+    // two sequential permission prompts within one submit.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-two-servers",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_a",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_a,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            },
+                            {
+                                "id": "call_b",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_b,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Only matches once BOTH tool results have round-tripped back into the
+    // request body -- proving both namespaced calls actually ran against
+    // their own (real, separately-spawned) fixture server, not a stub.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-two-servers-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-two-servers");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-two-servers");
+    let fixture = fake_mcp_server_path();
+    write_mcp_config_servers(
+        &xdg_config_home,
+        &[
+            (
+                "server_a",
+                fixture.as_path(),
+                serde_json::json!({ "FAKE_MCP_SERVER_TOOL_NAME": "search" }),
+            ),
+            (
+                "server_b",
+                fixture.as_path(),
+                serde_json::json!({ "FAKE_MCP_SERVER_TOOL_NAME": "search" }),
+            ),
+        ],
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call both mcp servers\r")
+        .expect("failed to write prompt to pty");
+
+    // First permission prompt: server_a's namespaced tool name.
+    let prompt_a_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_a_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_a) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(&qualified_a),
+        "expected pty output to contain '{qualified_a}' in the first permission prompt, got: \
+         {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for server_a to pty");
+
+    // Second permission prompt: server_b's namespaced tool name -- must be
+    // distinguishable from server_a's despite both wrapping the identical
+    // raw tool name "search".
+    let prompt_b_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_b_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&qualified_b) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(&qualified_b),
+        "expected pty output to contain '{qualified_b}' in the second permission prompt, got: \
+         {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for server_b to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting both \
+         namespaced MCP tool calls, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// PC-1 ruling acceptance test (supersedes ticket 46's whole-session
+/// `OnceLock` freeze and this test's original "must NOT retroactively add
+/// its tool" semantics): a server's tool contribution joins the session
+/// snapshot EXACTLY ONCE, at its own first `Ready` -- never re-frozen for
+/// the whole session up front. A server held in `Starting` (via the
+/// `FAKE_MCP_SERVER_READY_GATE_FILE` fixture knob) contributes zero tools
+/// to turn 1's outgoing tool list; releasing the gate and letting it reach
+/// `Ready` before turn 2 means it DOES join and appear in turn 2's outgoing
+/// tool list -- this is the intended one-time auto-join, not a forbidden
+/// "turn-to-turn mutation" (an already-joined server's own contribution
+/// staying byte-for-byte identical turn-to-turn is the invariant that
+/// still holds; a not-yet-joined server joining for the first time is not
+/// a mutation of anything).
+#[tokio::test]
+async fn slow_server_joins_snapshot_on_first_ready_reached_between_turns() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let first_reply_text = "OrdinaryFirstReplyBeforeSlowServerReadyForTesting";
+    let second_reply_text = "OrdinarySecondReplyAfterSlowServerReadyForTesting";
+    let slow_server_qualified_name = rokr_mcp::qualified_name("slow", "echo");
+
+    // Turn 1: ordinary reply, no tool call -- this is the submit whose
+    // (empty, "slow" isn't Ready yet) MCP snapshot gets frozen.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-freeze-turn1",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": first_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Turn 2: also an ordinary reply -- the interesting assertion is on the
+    // outgoing REQUEST body (captured via `received_requests()` below),
+    // not this response.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-freeze-turn2",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": second_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-freeze");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-freeze");
+    let ready_gate_dir = unique_temp_dir("mcp-freeze-ready-gate");
+    let ready_gate_file = ready_gate_dir.join("ready");
+    write_mcp_config(
+        &xdg_config_home,
+        "slow",
+        &fake_mcp_server_path(),
+        serde_json::json!({
+            "FAKE_MCP_SERVER_READY_GATE_FILE": ready_gate_file.to_string_lossy()
+        }),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    // First paint must not be delayed by the still-gated "slow" server.
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Turn 1, submitted while "slow" is still gated (never responded to
+    // `initialize`, so it's stuck in `Starting`) -- this is when the
+    // session's MCP tool snapshot is taken and frozen, empty.
+    writer
+        .write_all(b"say something ordinary\r")
+        .expect("failed to write turn1 prompt to pty");
+
+    let turn1_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(first_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(first_reply_text),
+        "expected pty output to contain turn 1's reply, got: {output:?}"
+    );
+
+    // Release the gate: "slow" can now complete `initialize` + `tools/list`
+    // and reach `Ready` with its "echo" tool -- a genuine mid-session
+    // tool-availability change happening strictly AFTER turn 1's snapshot
+    // was already taken.
+    std::fs::write(&ready_gate_file, b"go").expect("failed to write mcp ready-gate file");
+    // Give the background lifecycle task real wall-clock time to finish
+    // the handshake and flip status to `Ready` before turn 2 submits --
+    // generous relative to the fixture's own 25ms poll interval.
+    thread::sleep(Duration::from_millis(500));
+
+    // Turn 2: if the tool snapshot were (incorrectly) recomputed fresh per
+    // submit, "slow"'s now-Ready "echo" tool would appear in this turn's
+    // outgoing tool-spec list.
+    writer
+        .write_all(b"say something else ordinary\r")
+        .expect("failed to write turn2 prompt to pty");
+
+    let turn2_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn2_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(second_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(second_reply_text),
+        "expected pty output to contain turn 2's reply, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        received_requests.len() >= 2,
+        "expected at least two outgoing requests (one per turn), got: {}",
+        received_requests.len()
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        !first_request_body.contains(&slow_server_qualified_name),
+        "expected turn 1's outgoing request to NOT contain '{slow_server_qualified_name}' -- \
+         'slow' was still gated (Starting), never having reached Ready, so it had not yet \
+         joined the session's tool set; got body: {first_request_body:?}"
+    );
+    let second_request_body =
+        String::from_utf8_lossy(&received_requests[1].body).into_owned();
+    assert!(
+        second_request_body.contains(&slow_server_qualified_name),
+        "expected turn 2's outgoing request to CONTAIN '{slow_server_qualified_name}' -- PC-1: \
+         'slow' reached Ready (and therefore joined) between turn 1 and turn 2, and a server's \
+         first Ready is exactly when it's supposed to join the session's tool set, not \
+         something a stale whole-session freeze should hold back until a future session; got \
+         body: {second_request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&ready_gate_dir);
+}
+
+/// Ticket 47 (mcp-permission-polish): same as `write_mcp_config` above but
+/// also sets a per-server `auto_approve` list, needed for the allowlist
+/// bypass acceptance test below. A separate helper (rather than adding a
+/// parameter to `write_mcp_config`/`write_mcp_config_servers`) so this
+/// doesn't touch either existing helper's signature or any of their many
+/// existing call sites above.
+fn write_mcp_config_with_auto_approve(
+    xdg_config_home: &std::path::Path,
+    server_name: &str,
+    command: &std::path::Path,
+    env: serde_json::Value,
+    auto_approve: &[&str],
+) {
+    let config_dir = xdg_config_home.join("rokr");
+    std::fs::create_dir_all(&config_dir).expect("failed to create rokr config dir for test");
+
+    let config = serde_json::json!({
+        "version": 1,
+        "mcp": {
+            server_name: {
+                "transport": {
+                    "stdio": {
+                        "command": command.to_string_lossy(),
+                        "args": [],
+                        "env": env
+                    }
+                },
+                "enabled": true,
+                "auto_approve": auto_approve
+            }
+        }
+    });
+
+    std::fs::write(
+        config_dir.join("rokr.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize test rokr.json"),
+    )
+    .expect("failed to write test rokr.json");
+}
+
+/// Ticket 47 (mcp-permission-polish) acceptance test: an MCP tool call for
+/// a server/tool NOT on that server's (empty, here -- `write_mcp_config`
+/// sets no `auto_approve` at all) allowlist renders a permission prompt
+/// whose text carries the server name, tool name, and pretty-printed input
+/// JSON via the new `PermissionPayload::ToolCall` -> `PermissionDetail::Text`
+/// bridge, rather than ticket 44's interim opaque `Command(String)` blob.
+/// Checks individual word-tokens against the accumulated PTY output rather
+/// than one contiguous phrase (this suite's PTY-assertion convention --
+/// rendering can wrap/space content unpredictably).
+#[tokio::test]
+async fn mcp_tool_call_renders_server_and_tool_in_permission_prompt_text() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterMcpPromptTextForTesting";
+    let qualified_tool_name = rokr_mcp::qualified_name("interim", "echo");
+
+    // First call: the model asks to invoke the MCP tool.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-prompt-text",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_tool_name,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Second call: only matches once the tool result the loop fed back
+    // actually contains the fixture's real response text -- proves the
+    // tool really executed after the granted permission, not before.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-prompt-text-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-prompt-text");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-prompt-text");
+    // No `auto_approve` set at all -- defaults to empty, so "echo" is NOT
+    // on the allowlist and the call must be gated through a prompt.
+    write_mcp_config(&xdg_config_home, "interim", &fake_mcp_server_path(), serde_json::json!({}));
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call the mcp tool\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the permission prompt to render, then check that its text
+    // carries the server name, the tool name, and the pretty-printed input
+    // -- individually, since ratatui wrapping can split/space them
+    // unpredictably across rendered rows.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("permission needed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("interim"),
+        "expected pty output to contain the server name 'interim' in the permission prompt, \
+         got: {output:?}"
+    );
+    assert!(
+        output.contains("echo"),
+        "expected pty output to contain the tool name 'echo' in the permission prompt, \
+         got: {output:?}"
+    );
+    assert!(
+        output.contains("message"),
+        "expected pty output to contain the pretty-printed input's key 'message' in the \
+         permission prompt, got: {output:?}"
+    );
+    assert!(
+        output.contains("hi"),
+        "expected pty output to contain the pretty-printed input's value 'hi' in the \
+         permission prompt, got: {output:?}"
+    );
+    assert!(
+        !output.contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT),
+        "the MCP tool must not have run before permission was granted, but its response text \
+         already appears in the output: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after granting permission, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 47 (mcp-permission-polish) acceptance test: an MCP tool ON its
+/// server's `auto_approve` list executes with NO permission prompt shown at
+/// all -- the config-driven allowlist pre-approves it, the same way an
+/// interactively-granted gated tool would run, just without the interactive
+/// step.
+#[tokio::test]
+async fn mcp_tool_on_auto_approve_list_executes_without_permission_prompt() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterMcpAutoApproveForTesting";
+    let qualified_tool_name = rokr_mcp::qualified_name("interim", "echo");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-auto-approve",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": qualified_tool_name,
+                                    "arguments": serde_json::json!({ "message": "hi" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(FAKE_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-mcp-auto-approve-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-mcp-auto-approve");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-auto-approve");
+    write_mcp_config_with_auto_approve(
+        &xdg_config_home,
+        "interim",
+        &fake_mcp_server_path(),
+        serde_json::json!({}),
+        &["echo"],
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"call the mcp tool\r")
+        .expect("failed to write prompt to pty");
+
+    // No permission prompt should ever appear: the allowlisted tool call
+    // should sail straight through to the final reply without pausing for
+    // a y/n keypress. Poll directly for the final reply text.
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after the allowlisted MCP \
+         tool call ran without a prompt, got: {output:?}"
+    );
+    assert!(
+        !output.contains("permission needed"),
+        "expected no permission prompt to ever be shown for an auto_approve-listed MCP tool, \
+         got: {output:?}"
     );
 
     writer.write_all(b"q").expect("failed to write q to pty");
