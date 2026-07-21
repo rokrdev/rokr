@@ -921,6 +921,66 @@ async fn main() -> ExitCode {
 
                     let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
 
+                    // Ticket 49 (hooks-tracer-bullet): interim, throwaway
+                    // wiring for exactly one `PreToolUse` hook, configured
+                    // via a single env var holding the hook's shell command
+                    // (e.g. `ROKR_PRETOOLUSE_HOOK="/path/to/hook.sh"`, run
+                    // verbatim via `sh -c`, no matcher/multiple-hooks
+                    // support) -- ticket 50 replaces this wholesale with
+                    // the real `hooks` config schema (per-event hook
+                    // lists, glob matcher, per-hook `timeout_ms`), mirroring
+                    // ticket 44's `ROKR_MCP_SERVER` interim pattern (later
+                    // replaced by ticket 45's `mcp` config schema). A
+                    // missing env var means no hook is configured: every
+                    // tool call is allowed through unchanged, at the cost
+                    // of one cheap `std::env::var` lookup per tool call
+                    // (never a subprocess spawn) rather than reading it
+                    // once up front -- this closure runs fresh per
+                    // `run_tool_loop` tool-call iteration, so re-reading
+                    // here keeps it self-contained without threading a
+                    // captured `Option<String>` through from outside.
+                    //
+                    // A hook whose exit code is 0 or any non-2 nonzero (or
+                    // that times out) degrades to `Allow` -- a one-line
+                    // `eprintln!` notice for the non-blocking-failure case,
+                    // never a crash or a wedged loop -- matching
+                    // `execute_hook`'s own non-blocking-failure contract
+                    // (`docs/adr/0012-hooks-execution-trust-model.md`).
+                    let pre_tool_hook: &rokr_core::PreToolHookCallback<'_> =
+                        &|request: rokr_core::PreToolHookRequest| {
+                            Box::pin(async move {
+                                let Ok(command) = std::env::var("ROKR_PRETOOLUSE_HOOK") else {
+                                    return rokr_core::PreToolHookOutcome::Allow;
+                                };
+                                let payload = rokr_hooks::HookPayload::PreToolUse {
+                                    tool_name: request.tool_name,
+                                    tool_input: request.tool_input,
+                                };
+                                match rokr_hooks::execute_hook(
+                                    &command,
+                                    &payload,
+                                    rokr_hooks::DEFAULT_TIMEOUT,
+                                )
+                                .await
+                                {
+                                    rokr_hooks::HookResult::Success { .. } => {
+                                        rokr_core::PreToolHookOutcome::Allow
+                                    }
+                                    rokr_hooks::HookResult::Blocked { stderr } => {
+                                        rokr_core::PreToolHookOutcome::Deny(stderr)
+                                    }
+                                    rokr_hooks::HookResult::NonBlockingFailure { message } => {
+                                        eprintln!(
+                                            "PreToolUse hook (ROKR_PRETOOLUSE_HOOK) failed \
+                                             non-blocking, allowing the tool call through: \
+                                             {message}"
+                                        );
+                                        rokr_core::PreToolHookOutcome::Allow
+                                    }
+                                }
+                            })
+                        };
+
                     let (reply, usage) = rokr_core::run_tool_loop(
                         &provider,
                         &system_prompt,
@@ -928,6 +988,7 @@ async fn main() -> ExitCode {
                         &mut transcript,
                         &tools,
                         request_permission,
+                        Some(pre_tool_hook),
                     )
                     .await
                     .map_err(|err| err.to_string())?;

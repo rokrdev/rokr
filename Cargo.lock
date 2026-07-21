@@ -2340,6 +2340,7 @@ dependencies = [
  "portable-pty",
  "rokr-config",
  "rokr-core",
+ "rokr-hooks",
  "rokr-mcp",
  "rokr-provider",
  "rokr-session",
@@ -2365,6 +2366,15 @@ name = "rokr-core"
 version = "0.1.0"
 dependencies = [
  "rokr-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rokr-hooks"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
  "tokio",

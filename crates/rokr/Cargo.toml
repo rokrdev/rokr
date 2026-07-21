@@ -16,6 +16,13 @@ rokr-session = { path = "../rokr-session" }
 # in `files-touched`) cannot call into `rokr-mcp` at all without this
 # dependency edge. Flagged in the ticket report as a deviation.
 rokr-mcp = { path = "../rokr-mcp" }
+# Ticket 49 (hooks-tracer-bullet): not in the ticket's `files-touched` list,
+# but mechanically required -- `main.rs`'s interim `ROKR_PRETOOLUSE_HOOK`
+# wiring (also listed in `files-touched`) cannot call into `rokr-hooks` at
+# all without this dependency edge. Same mechanical necessity as ticket
+# 44's `rokr-mcp` dependency add above; flagged in the ticket report as a
+# deviation, pre-authorized by the ticket brief.
+rokr-hooks = { path = "../rokr-hooks" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 

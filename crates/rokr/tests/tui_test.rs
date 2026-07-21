@@ -2870,6 +2870,216 @@ async fn bash_tool_call_skips_execution_on_reject() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// Ticket 49 (hooks-tracer-bullet) acceptance test: a real shell-script
+/// `PreToolUse` hook (wired via the interim `ROKR_PRETOOLUSE_HOOK` env var
+/// -- see `main.rs`'s doc comment on that wiring) that exits 2 must veto a
+/// `bash` tool call before the permission prompt ever renders. Mirrors
+/// `bash_tool_call_renders_permission_prompt_and_runs_on_accept`/
+/// `bash_tool_call_skips_execution_on_reject`'s structure, but asserts the
+/// ABSENCE of the permission prompt (the marker path text, which only ever
+/// appears in that prompt's rendered command line) rather than waiting for
+/// it and then accepting/rejecting interactively.
+#[tokio::test]
+async fn pretooluse_hook_script_denies_bash_call_before_permission_prompt_appears() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterHookVetoForTesting";
+
+    let temp_dir = unique_temp_dir("hook-veto-target");
+    let marker_path = temp_dir.join("hookveto-marker");
+    let marker_path_str = marker_path.to_string_lossy().into_owned();
+    let bash_command = format!("touch {marker_path_str}");
+
+    // First call: the model asks to invoke the `bash` tool -- the
+    // PreToolUse hook below must veto this before any permission prompt
+    // renders.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-veto",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // The loop must continue after the hook veto (same "loop continues"
+    // shape as an interactive rejection): the model gets an error tool
+    // result and still produces a final reply.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-hook-veto-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-hook-veto");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-hook-veto");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    // The hook: reads (and discards) its JSON stdin payload, then always
+    // exits 2 -- a blocking veto regardless of which tool call it saw.
+    cmd.env(
+        "ROKR_PRETOOLUSE_HOOK",
+        "cat >/dev/null; echo 'vetoed: no bash allowed' >&2; exit 2",
+    );
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"runbash\r")
+        .expect("failed to write prompt to pty");
+
+    // No "y"/"n" keypress is ever sent: a hook veto must short-circuit
+    // before the permission prompt runs at all, so the loop should reach
+    // the final reply on its own.
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after the hook veto (the \
+         loop must continue on its own, with no permission keypress needed), got: {output:?}"
+    );
+    assert!(
+        !output.contains("hookveto-marker"),
+        "the marker path only ever appears in a rendered permission-prompt command line -- its \
+         presence would mean the prompt rendered despite the hook's veto, got: {output:?}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "the bash command must never run after the PreToolUse hook vetoed it"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 #[tokio::test]
 async fn plan_agent_bash_tool_call_yields_unavailable_tool_result_without_prompt() {
     use wiremock::matchers::{method, path};

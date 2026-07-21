@@ -81,6 +81,66 @@ pub struct PermissionRequest {
     pub payload: PermissionPayload,
 }
 
+/// A tool-call attempt about to go through `run_tool_loop`'s permission
+/// gate, handed to an optional `PreToolUse` hook callback (ticket 49,
+/// hooks-tracer-bullet; PRD "Hooks") BEFORE that gate ever runs. Mirrors
+/// [`PermissionRequest`]'s "primitives only" shape, but carries the raw
+/// tool-input JSON rather than a preview-computed [`PermissionPayload`]:
+/// a hook may want to veto a call to ANY tool the model named, gated or
+/// not, not just ones that implement `PreviewableTool`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreToolHookRequest {
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+}
+
+/// What a `PreToolUse` hook decided about a [`PreToolHookRequest`] (PRD
+/// "Hooks", exit-code contract). `rokr-core` never depends on `rokr-hooks`
+/// (architect decision) -- `rokr-hooks`' own richer exit-code/timeout
+/// result type (`rokr_hooks::HookResult`) maps down to this two-variant
+/// outcome at the one place both crates are known: `crates/rokr/src/main.rs`'s
+/// wiring of a real hook callback into `run_tool_loop`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreToolHookOutcome {
+    /// Exit 0, a non-blocking nonzero exit, or a timeout -- the call
+    /// proceeds to the normal preview/permission/execute path unchanged.
+    Allow,
+    /// Exit 2 (blocking) -- the tool call is vetoed before the permission
+    /// prompt ever runs. The `String` is the hook's stderr, used verbatim
+    /// as the error `ToolResult` content: identical shape to an
+    /// interactive permission rejection (same `ContentBlock::ToolResult`
+    /// with `is_error: true`), just a different content string and a
+    /// different (earlier) short-circuit point in the loop.
+    Deny(String),
+}
+
+/// A caller-supplied `PreToolUse` hook check, injected into `run_tool_loop`
+/// the same way `request_permission` is (a caller-supplied async closure),
+/// but as a boxed `dyn Fn` behind an `Option<&_>` rather than a second
+/// generic type parameter. Seam choice (architect decision left open,
+/// "a small trait or a second optional closure"): `request_permission` is a
+/// REQUIRED generic closure `F`, monomorphized once per call site, which
+/// works because every call site always has a real closure to pass. This
+/// callback is OPTIONAL -- most call sites (e.g. `crates/rokr/src/subagent.rs`'s
+/// subagent loop, this ticket) pass `None` -- and a generic `Option<F>`
+/// parameter would force even those call sites to spell out a concrete
+/// "no-op" closure type by hand just to name `None::<F>`. A non-generic
+/// trait-object type sidesteps that: `None` just works. The cost is one
+/// boxed-future allocation per tool call when a hook IS configured, an
+/// acceptable trade against `run_tool_loop` gaining a second monomorphized
+/// generic parameter for a rarely-exercised path.
+///
+/// Ticket 50 is expected to add a second, identically-shaped
+/// `PostToolHookCallback` parameter alongside this one (PRD "Core seam":
+/// "`run_tool_loop` gains optional pre-tool and post-tool hook callback
+/// parameters") -- this type's shape (a standalone type alias, not
+/// entangled with `PreToolHookCallback`) is chosen so that lands as a pure
+/// addition, not a reshape of this one.
+pub type PreToolHookCallback<'a> = dyn Fn(PreToolHookRequest) -> Pin<Box<dyn Future<Output = PreToolHookOutcome> + Send + 'a>>
+    + Send
+    + Sync
+    + 'a;
+
 /// Object-safe veneer over `rokr_tools::Tool`, needed because `Tool::execute`
 /// is a native `async fn` and therefore not itself dyn-compatible. The tool
 /// loop needs to hold a heterogeneous, runtime-selectable set of tools (the
@@ -256,6 +316,16 @@ impl_executable_tool_gated!(rokr_tools::webfetch::WebfetchTool);
 /// the call that produced it (Phase 3), so a caller can decide whether that
 /// turn's usage crosses the auto-compaction threshold (see
 /// [`should_compact`]) before submitting the next one.
+///
+/// `pre_tool_hook` (ticket 49, hooks-tracer-bullet; PRD "Hooks", "Ordering
+/// rule") is consulted for EVERY tool-call attempt, before the
+/// preview/permission gate described above ever runs -- a
+/// [`PreToolHookOutcome::Deny`] short-circuits the call entirely (the
+/// permission machinery, interactive or otherwise, never runs for a call a
+/// hook already vetoed) and produces an error `ToolResult` from the hook's
+/// message, identical in shape to a rejected permission request.
+/// [`PreToolHookOutcome::Allow`] (or `None`, meaning no hook is configured)
+/// falls through to the unchanged preview/permission/execute path.
 pub async fn run_tool_loop<P, F, Fut>(
     provider: &P,
     system_prompt: &str,
@@ -263,6 +333,7 @@ pub async fn run_tool_loop<P, F, Fut>(
     transcript: &mut Vec<Message>,
     tools: &[&dyn ExecutableTool],
     request_permission: F,
+    pre_tool_hook: Option<&PreToolHookCallback<'_>>,
 ) -> Result<(Message, Usage), P::Error>
 where
     P: Provider,
@@ -310,29 +381,54 @@ where
 
         let mut result_blocks = Vec::with_capacity(tool_uses.len());
         for (id, name, input) in tool_uses {
-            let (content, is_error) = match tools.iter().find(|tool| tool.name() == name.as_str()) {
-                Some(tool) => match tool.preview(input.clone()) {
-                    None => match tool.execute_boxed(input).await {
-                        Ok(output) => (output, false),
-                        Err(err) => (err.to_string(), true),
-                    },
-                    Some(Err(preview_err)) => (preview_err.to_string(), true),
-                    Some(Ok(payload)) => {
-                        let request = PermissionRequest {
-                            tool_name: name.clone(),
-                            payload,
-                        };
-                        if request_permission(request).await {
-                            match tool.execute_boxed(input).await {
-                                Ok(output) => (output, false),
-                                Err(err) => (err.to_string(), true),
-                            }
-                        } else {
-                            ("permission denied by user".to_string(), true)
-                        }
+            // Ticket 49 (hooks-tracer-bullet), PRD "Hooks" ordering rule:
+            // `PreToolUse` hooks run first, before the permission prompt --
+            // for EVERY tool-call attempt, gated or not, since a hook may
+            // want to veto a call to any tool the model named. A deny
+            // short-circuits the whole match below (`request_permission`
+            // and `execute_boxed` are never reached for a vetoed call).
+            let hook_denial = match pre_tool_hook {
+                Some(hook) => {
+                    let outcome = hook(PreToolHookRequest {
+                        tool_name: name.clone(),
+                        tool_input: input.clone(),
+                    })
+                    .await;
+                    match outcome {
+                        PreToolHookOutcome::Deny(message) => Some(message),
+                        PreToolHookOutcome::Allow => None,
                     }
-                },
-                None => (format!("unknown tool: {name}"), true),
+                }
+                None => None,
+            };
+
+            let (content, is_error) = if let Some(message) = hook_denial {
+                (message, true)
+            } else {
+                match tools.iter().find(|tool| tool.name() == name.as_str()) {
+                    Some(tool) => match tool.preview(input.clone()) {
+                        None => match tool.execute_boxed(input).await {
+                            Ok(output) => (output, false),
+                            Err(err) => (err.to_string(), true),
+                        },
+                        Some(Err(preview_err)) => (preview_err.to_string(), true),
+                        Some(Ok(payload)) => {
+                            let request = PermissionRequest {
+                                tool_name: name.clone(),
+                                payload,
+                            };
+                            if request_permission(request).await {
+                                match tool.execute_boxed(input).await {
+                                    Ok(output) => (output, false),
+                                    Err(err) => (err.to_string(), true),
+                                }
+                            } else {
+                                ("permission denied by user".to_string(), true)
+                            }
+                        }
+                    },
+                    None => (format!("unknown tool: {name}"), true),
+                }
             };
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: id,
@@ -736,6 +832,7 @@ mod tests {
             &mut transcript,
             &tools,
             |_request| async { true },
+            None,
         )
         .await
         .expect("loop should succeed");
@@ -861,6 +958,7 @@ mod tests {
             &mut transcript,
             &tools,
             |_request| async { false },
+            None,
         )
         .await
         .expect("loop should succeed even when permission is rejected");
@@ -892,6 +990,99 @@ mod tests {
                         || content.to_lowercase().contains("reject"),
                     "result content should reflect the rejection, got: {content}"
                 );
+            }
+            other => panic!("expected a single ToolResult block, got {other:?}"),
+        }
+    }
+
+    /// Ticket 49 (hooks-tracer-bullet), PRD "Hooks" testing decision:
+    /// extends `loop_skips_execution_when_permission_rejected`'s exact
+    /// fixtures (`ScriptedProvider`/`FakeGatedTool`) with a stubbed
+    /// `PreToolUse` hook callback that denies, proving the ordering rule --
+    /// a hook deny short-circuits BEFORE `request_permission` is invoked at
+    /// all, not merely before the tool executes.
+    #[tokio::test]
+    async fn loop_skips_permission_prompt_and_execution_when_pretooluse_hook_denies() {
+        let tool_call_reply = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "fake_gated".to_string(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }],
+        };
+        let final_reply = Message::assistant_text("final answer after hook veto");
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_reply.clone(),
+                final_reply.clone(),
+            ])),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gated_tool = FakeGatedTool {
+            executed: executed.clone(),
+        };
+        let tools: [&dyn ExecutableTool; 1] = [&gated_tool];
+
+        let mut transcript = vec![Message::user_text("run the command")];
+
+        let permission_prompt_invoked =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let permission_prompt_invoked_for_closure = permission_prompt_invoked.clone();
+
+        let pre_tool_hook = |_request: PreToolHookRequest| {
+            Box::pin(async move { PreToolHookOutcome::Deny("vetoed by hook".to_string()) })
+                as Pin<Box<dyn Future<Output = PreToolHookOutcome> + Send>>
+        };
+
+        let (result, _usage) = run_tool_loop(
+            &provider,
+            "you are a test agent",
+            None,
+            &mut transcript,
+            &tools,
+            move |_request| {
+                permission_prompt_invoked_for_closure
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                async { true }
+            },
+            Some(&pre_tool_hook),
+        )
+        .await
+        .expect("loop should succeed even when a PreToolUse hook denies");
+
+        assert_eq!(result.text(), "final answer after hook veto");
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "tool must not execute when the PreToolUse hook denies"
+        );
+        assert!(
+            !permission_prompt_invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "request_permission must never be invoked for a call the hook already vetoed"
+        );
+
+        let calls = provider.calls.lock().unwrap();
+        // Second call: leading system message (index 0), initial user turn,
+        // the assistant's tool-call turn, and the (hook-vetoed) tool result
+        // turn at index 3.
+        match &calls[1][3].content[..] {
+            [ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            }] => {
+                assert_eq!(tool_use_id, "call_1");
+                assert!(
+                    *is_error,
+                    "a hook-vetoed tool call should be reflected as an error result, identical \
+                     shape to an interactive rejection"
+                );
+                assert_eq!(content, "vetoed by hook");
             }
             other => panic!("expected a single ToolResult block, got {other:?}"),
         }
@@ -992,6 +1183,7 @@ mod tests {
             &mut transcript,
             &tools,
             |_request| async { false },
+            None,
         )
         .await
         .expect("loop should succeed even when permission is rejected");

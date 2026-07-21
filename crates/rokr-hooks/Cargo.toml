@@ -1,0 +1,18 @@
+[package]
+name = "rokr-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Deliberately NO dependency on rokr-core or any other rokr crate
+# (architect decision, ticket 49, hooks-tracer-bullet, mirrored by
+# docs/adr/0012-hooks-execution-trust-model.md): this crate owns hook
+# event/payload types and the subprocess executor as a standalone concern,
+# reusable outside the agent loop. `rokr-core`'s `run_tool_loop` gains a
+# hook-callback SEAM (an optional closure), never a dependency on this
+# crate -- `crates/rokr/src/main.rs` is the only place that depends on both
+# and wires one into the other.
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
