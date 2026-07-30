@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::io::{self, IsTerminal, Stdout};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -576,6 +577,62 @@ fn run_editor_keybinding(
     Ok(())
 }
 
+/// Ticket 62 (memory-slash-command-opens-editor): spawns `editor_command`
+/// directly against `path`, an on-disk file (the project-scope memory
+/// file), rather than round-tripping a scratch buffer the way
+/// [`edit_buffer_with_editor`] does -- `/memory` edits a persistent file in
+/// place, so there is nothing to write beforehand or read back afterward;
+/// the editor process's own writes to `path` (or lack thereof) ARE the
+/// entire effect. Spawned via the user's own shell (`sh -c`), mirroring
+/// `edit_buffer_with_editor`'s F-010 rationale: `editor_command` may itself
+/// contain quoted arguments (e.g. `EDITOR="code --wait"`), and `path` is
+/// passed as `$1` (a real positional parameter, safely substituted
+/// regardless of special characters) rather than string-interpolated into
+/// the `-c` script text.
+fn spawn_editor_on_path(path: &Path, editor_command: &str) -> io::Result<()> {
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor_command} \"$1\""))
+        .arg("sh") // becomes $0 inside the -c script
+        .arg(path) // becomes $1 inside the -c script
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other("editor exited with a failure status"));
+    }
+    Ok(())
+}
+
+/// Handles the `/memory` command (ticket 62): reads `$EDITOR` (falling back
+/// to `vi` if unset or empty, same as [`run_editor_keybinding`]), suspends
+/// the terminal via `guard`, spawns the editor directly against
+/// `memory_path`, and resumes the terminal -- regardless of whether the
+/// editor invocation succeeded, so a spawn failure or non-zero exit can't
+/// strand the terminal in a suspended state. Unlike
+/// `run_editor_keybinding`, there is no buffer to load back on success
+/// (the editor wrote straight to `memory_path` itself); on failure, an
+/// error line is appended to `state.view_lines` for visibility, matching
+/// `run_editor_keybinding`'s failure handling. `terminal.clear()` forces a
+/// full repaint on the next draw, since the alternate-screen round trip
+/// through the suspended editor leaves ratatui's cached buffer stale.
+fn run_memory_command(
+    state: &mut AppState,
+    memory_path: &Path,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    guard: &TerminalGuard,
+) -> io::Result<()> {
+    let editor_command = resolve_editor_command(std::env::var("EDITOR").ok());
+
+    guard.suspend();
+    let result = spawn_editor_on_path(memory_path, &editor_command);
+    guard.resume()?;
+    terminal.clear()?;
+
+    if let Err(err) = result {
+        state.view_lines.push(format!("$EDITOR failed: {err}"));
+    }
+    Ok(())
+}
+
 /// Runs the TUI event loop: draws `Header`/`View`/`Prompt`, and exits on
 /// `q` (when the prompt is empty) or Ctrl+C (always), restoring the
 /// terminal on every exit path. Fails fast with [`TuiError::NotATty`] if
@@ -610,18 +667,61 @@ fn run_editor_keybinding(
 /// permission-request channel (there, rokr-tui owns both ends and hands the
 /// caller a `PermissionHandle`; here, the caller creates and owns the
 /// channel and rokr-tui just consumes the receiving end).
-pub async fn run<F, Fut, C, Fut2>(
+///
+/// `resolve_memory_path` (ticket 62, memory-slash-command-opens-editor) is
+/// called synchronously, on the crossterm-polling thread itself, whenever
+/// the user submits bare `/memory` (see [`event_loop`]) -- resolving (and,
+/// per its own contract, creating if absent) the on-disk memory file to
+/// suspend the terminal and open `$EDITOR` against. It is a plain sync
+/// closure rather than an async callback like `submit`/`command`: unlike
+/// those, this must run to completion BEFORE the terminal is suspended, not
+/// concurrently with the render loop, so there is no async round trip to
+/// support. Kept as a caller-supplied primitive (rather than rokr-tui
+/// hard-coding `cwd.join("AGENTS.md")` itself) so this crate stays
+/// decoupled from cwd/AGENTS.md specifics, mirroring why `command` takes a
+/// literal `String` rather than rokr-tui knowing what `/compact` means.
+///
+/// `resolve_custom_command` (ticket 63,
+/// custom-command-discovery-and-registry) is called synchronously, on the
+/// crossterm-polling thread, for every `/`-prefixed input that reaches
+/// [`InputRoute::Command`] (see [`event_loop`]) -- it returns `Some(expanded
+/// prompt text)` when `input` names a discovered custom command, `None`
+/// otherwise.
+///
+/// F-004 (pre-ship review): the caller (`main.rs`) is REQUIRED to filter
+/// `None` for any command NAME its own builtin dispatch claims, checked
+/// against the bare name rather than the full input string, before ever
+/// consulting the registry -- see `main.rs`'s `is_builtin_command` doc
+/// comment for why. This replaced an earlier design where `rokr-tui` ran
+/// `command`'s own dispatch first and compared its output text against an
+/// "unknown command: {input}" sentinel string to decide whether a `Some`
+/// here should be used; that string comparison was fragile (a brittle
+/// cross-crate text-format contract) AND insufficient on its own (a builtin
+/// invoked with unrecognized arguments, e.g. `/cost --today`, falls through
+/// to that same sentinel output even though its NAME is unambiguously a
+/// builtin). With the name-level filter now enforced by the closure itself,
+/// a `Some` and a builtin dispatch match can never both be true for the
+/// same `input`, so [`event_loop`] no longer needs to run `command` at all
+/// when `resolve_custom_command` returns `Some` -- see that function's
+/// `InputRoute::Command` arm. Kept as a plain sync closure (mirroring
+/// `resolve_memory_path`) so rokr-tui stays decoupled from `rokr-app`'s
+/// `CommandRegistry`/config-dir specifics.
+pub async fn run<F, Fut, C, Fut2, M, M2>(
     submit: F,
     command: C,
     history: Vec<String>,
     on_history_append: impl Fn(String) + Send + Sync + 'static,
     status_rx: mpsc::Receiver<SessionStatus>,
+    resolve_memory_path: M,
+    resolve_custom_command: M2,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
     C: Fn(String) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
+    M: Fn() -> io::Result<PathBuf> + Send + 'static,
+    M2: Fn(&str) -> Option<String> + Send + 'static,
 {
     if !io::stdout().is_terminal() {
         return Err(TuiError::NotATty);
@@ -636,25 +736,38 @@ where
     let on_history_append: Arc<dyn Fn(String) + Send + Sync> = Arc::new(on_history_append);
 
     tokio::task::spawn_blocking(move || {
-        run_blocking(handle, submit, command, history, on_history_append, status_rx)
+        run_blocking(
+            handle,
+            submit,
+            command,
+            history,
+            on_history_append,
+            status_rx,
+            resolve_memory_path,
+            resolve_custom_command,
+        )
     })
     .await
     .unwrap_or_else(|join_err| std::panic::resume_unwind(join_err.into_panic()))
 }
 
-fn run_blocking<F, Fut, C, Fut2>(
+fn run_blocking<F, Fut, C, Fut2, M, M2>(
     handle: tokio::runtime::Handle,
     submit: F,
     command: C,
     history: Vec<String>,
     on_history_append: Arc<dyn Fn(String) + Send + Sync>,
     status_rx: mpsc::Receiver<SessionStatus>,
+    resolve_memory_path: M,
+    resolve_custom_command: M2,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
     C: Fn(String) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
+    M: Fn() -> io::Result<PathBuf> + Send + 'static,
+    M2: Fn(&str) -> Option<String> + Send + 'static,
 {
     install_panic_hook();
     let guard = TerminalGuard::enter()?;
@@ -683,10 +796,12 @@ where
         &guard,
         start_instant,
         status_rx,
+        &resolve_memory_path,
+        &resolve_custom_command,
     )
 }
 
-fn event_loop<F, Fut, C, Fut2>(
+fn event_loop<F, Fut, C, Fut2, M, M2>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
     handle: &tokio::runtime::Handle,
@@ -696,12 +811,16 @@ fn event_loop<F, Fut, C, Fut2>(
     guard: &TerminalGuard,
     start_instant: Instant,
     status_rx: mpsc::Receiver<SessionStatus>,
+    resolve_memory_path: &M,
+    resolve_custom_command: &M2,
 ) -> Result<(), TuiError>
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
     C: Fn(String) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
+    M: Fn() -> io::Result<PathBuf> + Send + 'static,
+    M2: Fn(&str) -> Option<String> + Send + 'static,
 {
     // Carries the outcome of a spawned `submit` call back into the blocking
     // event loop without blocking it: each iteration does a non-blocking
@@ -847,28 +966,108 @@ where
                                 handle.spawn_blocking(move || cb(entry));
                             }
                             state.view_lines.push(format!("> {input}"));
-                            state.pending = true;
                             dirty = true;
 
-                            match route_input(input) {
-                                InputRoute::Submit(input) => {
-                                    let permission = PermissionHandle {
-                                        tx: perm_tx.clone(),
-                                    };
-                                    let submit_fut = submit(input, permission);
-                                    let tx = tx.clone();
-                                    handle.spawn(async move {
-                                        let outcome = submit_fut.await;
-                                        let _ = tx.send(outcome);
-                                    });
+                            // Ticket 62 (memory-slash-command-opens-editor):
+                            // intercepted here, BEFORE `route_input` and
+                            // BEFORE `state.pending` is set -- `/memory`
+                            // suspends/resumes the terminal synchronously,
+                            // right on this thread, the same way Ctrl+E's
+                            // `run_editor_keybinding` does below, rather
+                            // than going through the terminal-less async
+                            // `command` callback (which has no access to
+                            // `terminal`/`guard` and so could never suspend
+                            // the TUI). Setting `state.pending = true` for
+                            // this path would leave it stuck forever: unlike
+                            // `InputRoute::Submit`/`InputRoute::Command`,
+                            // nothing here ever sends on `tx` to clear it.
+                            if input == "/memory" {
+                                match resolve_memory_path() {
+                                    Ok(memory_path) => {
+                                        run_memory_command(state, &memory_path, terminal, guard)?;
+                                    }
+                                    Err(err) => {
+                                        state
+                                            .view_lines
+                                            .push(format!("/memory failed: {err}"));
+                                    }
                                 }
-                                InputRoute::Command(input) => {
-                                    let command_fut = command(input);
-                                    let tx = tx.clone();
-                                    handle.spawn(async move {
-                                        let outcome = command_fut.await;
-                                        let _ = tx.send(Ok(outcome));
-                                    });
+                                dirty = true;
+                            } else {
+                                state.pending = true;
+                                match route_input(input) {
+                                    InputRoute::Submit(input) => {
+                                        let permission = PermissionHandle {
+                                            tx: perm_tx.clone(),
+                                        };
+                                        let submit_fut = submit(input, permission);
+                                        let tx = tx.clone();
+                                        handle.spawn(async move {
+                                            let outcome = submit_fut.await;
+                                            let _ = tx.send(outcome);
+                                        });
+                                    }
+                                    InputRoute::Command(input) => {
+                                        // Ticket 63/64
+                                        // (custom-command-discovery-and-registry,
+                                        // custom-command-project-scope-and-trust-boundary),
+                                        // F-004 (pre-ship review):
+                                        // `resolve_custom_command` is
+                                        // consulted EAGERLY (synchronously,
+                                        // right here) so the resulting
+                                        // `submit_fut_if_custom` -- an owned,
+                                        // 'static future returned by calling
+                                        // `submit` -- can be moved into the
+                                        // spawned task below. `submit`
+                                        // itself is only a `&F` reference
+                                        // borrowed for this `event_loop`
+                                        // call, so it can't be captured
+                                        // *inside* a `handle.spawn`'d 'static
+                                        // async block; calling it here,
+                                        // outside the spawn, sidesteps that
+                                        // without needing `Arc<F>` plumbing.
+                                        //
+                                        // F-004: `resolve_custom_command`
+                                        // itself now filters by command NAME
+                                        // against `main.rs`'s builtin list
+                                        // BEFORE ever consulting the
+                                        // registry (see its own doc comment
+                                        // above `run`) -- so a `Some` here
+                                        // and a builtin match inside
+                                        // `command` below can never both be
+                                        // true for the same `input`. That
+                                        // means there's no longer any need
+                                        // to run `command` at all, or
+                                        // compare its output text against a
+                                        // sentinel string, to decide which
+                                        // one "wins": whichever branch below
+                                        // applies is unambiguous by
+                                        // construction, so `command` is only
+                                        // even called in the `None` branch.
+                                        let submit_fut_if_custom =
+                                            resolve_custom_command(&input).map(|expanded| {
+                                                let permission = PermissionHandle {
+                                                    tx: perm_tx.clone(),
+                                                };
+                                                submit(expanded, permission)
+                                            });
+                                        let tx = tx.clone();
+                                        match submit_fut_if_custom {
+                                            Some(submit_fut) => {
+                                                handle.spawn(async move {
+                                                    let result = submit_fut.await;
+                                                    let _ = tx.send(result);
+                                                });
+                                            }
+                                            None => {
+                                                let command_fut = command(input);
+                                                handle.spawn(async move {
+                                                    let outcome = command_fut.await;
+                                                    let _ = tx.send(Ok(outcome));
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

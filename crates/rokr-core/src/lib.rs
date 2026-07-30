@@ -6,6 +6,7 @@ use std::pin::Pin;
 pub mod context;
 pub mod mentions;
 pub mod message;
+pub mod pricing;
 
 pub use message::{CacheControl, CacheControlKind, ContentBlock, Message, Role};
 
@@ -344,10 +345,20 @@ impl_executable_tool_gated!(rokr_tools::webfetch::WebfetchTool);
 /// (`preview` returns `None`) skip the permission check and execute
 /// directly, exactly as before.
 ///
-/// Returns the final reply paired with the provider-reported [`Usage`] of
-/// the call that produced it (Phase 3), so a caller can decide whether that
-/// turn's usage crosses the auto-compaction threshold (see
-/// [`should_compact`]) before submitting the next one.
+/// Returns the final reply paired with a [`TurnUsage`] (F-001) covering
+/// every `Provider::send` round trip this call made: `final_call` is just
+/// the last response's [`Usage`] (what a caller should feed to
+/// [`should_compact`] -- it approximates the live context window's
+/// occupancy, not this turn's total spend), while `cumulative` sums every
+/// round trip's `Usage`, intermediate tool exchanges included, and is what a
+/// caller should persist/report for cost and usage accounting.
+///
+/// F-005: `max_iterations`, if `Some`, caps the number of `Provider::send`
+/// round trips before this call gives up with
+/// [`RunToolLoopError::MaxIterationsExceeded`] rather than looping forever
+/// against a provider that never stops emitting `ToolUse` blocks. `None`
+/// preserves unbounded looping (the TUI's choice, since a human can always
+/// interrupt); headless/eval callers should pass a conservative `Some(_)`.
 ///
 /// `pre_tool_hook` (ticket 49, hooks-tracer-bullet; PRD "Hooks", "Ordering
 /// rule") is consulted for EVERY tool-call attempt, before the
@@ -375,7 +386,14 @@ pub async fn run_tool_loop<P, F, Fut>(
     request_permission: F,
     pre_tool_hook: Option<&PreToolHookCallback<'_>>,
     post_tool_hook: Option<&PostToolHookCallback<'_>>,
-) -> Result<(Message, Usage), P::Error>
+    // F-005: caps the number of `Provider::send` round trips this call will
+    // make before giving up with `RunToolLoopError::MaxIterationsExceeded`,
+    // so a misbehaving/looping provider (e.g. one that never stops emitting
+    // `ToolUse` blocks) can't hang an unattended headless/eval run forever.
+    // `None` preserves the old unbounded behavior -- the TUI passes `None`
+    // since a human at the keyboard can always interrupt.
+    max_iterations: Option<u32>,
+) -> Result<(Message, TurnUsage), RunToolLoopError<P::Error>>
 where
     P: Provider,
     F: Fn(PermissionRequest) -> Fut,
@@ -383,7 +401,21 @@ where
 {
     let tool_specs: Vec<ToolSpec> = tools.iter().map(|tool| tool.to_tool_spec()).collect();
 
+    // F-001: summed across every `Provider::send` round trip this call
+    // makes, so a caller gets the FULL token cost of the turn (every
+    // intermediate tool-call exchange, not just the final reply) -- see
+    // `TurnUsage`'s own doc comment.
+    let mut cumulative_usage = Usage::default();
+    let mut iterations: u32 = 0;
+
     loop {
+        iterations += 1;
+        if let Some(max_iterations) = max_iterations {
+            if iterations > max_iterations {
+                return Err(RunToolLoopError::MaxIterationsExceeded);
+            }
+        }
+
         // Re-assembled on every send (not just once before the loop): a
         // single user submission can trigger multiple tool round-trips, and
         // every one of those wire sends needs the breakpoint-marked static
@@ -400,7 +432,13 @@ where
 
         let (reply, usage) = provider
             .send(&assembled.messages[..], &assembled.tools)
-            .await?;
+            .await
+            .map_err(RunToolLoopError::Provider)?;
+
+        cumulative_usage.input_tokens += usage.input_tokens;
+        cumulative_usage.output_tokens += usage.output_tokens;
+        cumulative_usage.cache_read_tokens += usage.cache_read_tokens;
+        cumulative_usage.cache_write_tokens += usage.cache_write_tokens;
 
         let tool_uses: Vec<(String, String, serde_json::Value)> = reply
             .content
@@ -415,7 +453,13 @@ where
 
         if tool_uses.is_empty() {
             transcript.push(reply.clone());
-            return Ok((reply, usage));
+            return Ok((
+                reply,
+                TurnUsage {
+                    final_call: usage,
+                    cumulative: cumulative_usage,
+                },
+            ));
         }
 
         transcript.push(reply);
@@ -572,6 +616,52 @@ pub struct Usage {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
 }
+
+/// The usage accounting [`run_tool_loop`] returns for one call (F-001).
+/// `final_call` is just the LAST `Provider::send` response's [`Usage`] --
+/// the right figure for compaction/context-percent math, where what matters
+/// is how full the live context window is right now, which only the most
+/// recent request/response pair reflects. `cumulative` sums EVERY
+/// `Provider::send` response's `Usage` across every round trip the loop
+/// made to reach that final reply -- the right figure for cost/usage
+/// reporting, where every token spent this turn (including intermediate
+/// tool-call exchanges the caller never sees individually) must be
+/// counted. Deliberately two separate fields rather than one: conflating
+/// them would either undercount cost (using only `final_call`) or corrupt
+/// the auto-compaction threshold with tokens that aren't in the current
+/// context window (using `cumulative`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TurnUsage {
+    pub final_call: Usage,
+    pub cumulative: Usage,
+}
+
+/// [`run_tool_loop`]'s error type (F-005): distinguishes a genuine
+/// [`Provider::send`] failure from exhausting `max_iterations`, so a caller
+/// (e.g. headless's `run_result_object`) can map only the latter onto a
+/// dedicated "gave up, didn't fail" outcome (`Subtype::ErrorMaxTurns` in
+/// `rokr-app`) instead of conflating it with an ordinary provider error.
+#[derive(Debug)]
+pub enum RunToolLoopError<E> {
+    /// The underlying `Provider::send` call failed.
+    Provider(E),
+    /// `max_iterations` `Provider::send` round trips were made without the
+    /// provider ever returning a reply with no `ToolUse` blocks.
+    MaxIterationsExceeded,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for RunToolLoopError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunToolLoopError::Provider(err) => write!(f, "{err}"),
+            RunToolLoopError::MaxIterationsExceeded => {
+                write!(f, "run_tool_loop exceeded its maximum iteration count")
+            }
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for RunToolLoopError<E> {}
 
 /// The system prompt for the dedicated summarization call [`compact_transcript`]
 /// makes to shrink a long-running transcript. Distinct from the agent's own
@@ -902,6 +992,7 @@ mod tests {
             |_request| async { true },
             None,
             None,
+            None,
         )
         .await
         .expect("loop should succeed");
@@ -947,6 +1038,199 @@ mod tests {
             }
             other => panic!("expected a single ToolResult block, got {other:?}"),
         }
+    }
+
+    /// Like `ScriptedProvider`, but scripts a distinct [`Usage`] alongside
+    /// each reply (that provider always returns `Usage::default()`) -- F-001
+    /// needs known, DISTINCT per-response usage figures to prove
+    /// `run_tool_loop` sums them into `TurnUsage::cumulative` rather than
+    /// reporting only the final response's.
+    struct ScriptedUsageProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<(Message, Usage)>>,
+    }
+
+    impl Provider for ScriptedUsageProvider {
+        type Error = StubError;
+
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> Result<(Message, Usage), StubError> {
+            self.replies.lock().unwrap().pop_front().ok_or(StubError)
+        }
+    }
+
+    /// F-001: `run_tool_loop` must accumulate usage across EVERY
+    /// `Provider::send` round trip it makes for one call, not just report
+    /// the final one -- otherwise every intermediate tool round-trip's
+    /// tokens are silently dropped from cost/usage reporting. Drives a
+    /// two-round-trip exchange (two responses that each trigger a `read`
+    /// tool call, followed by a third, final response with no tool call),
+    /// each of the three responses carrying its own known, distinct
+    /// `Usage`, and asserts (a) `TurnUsage::cumulative` equals the SUM of
+    /// all three responses' usage, and (b) `TurnUsage::final_call` equals
+    /// ONLY the last (third) response's usage -- proving the
+    /// compaction/context-percent path (which must read `final_call`, per
+    /// that field's own doc comment) still sees just that one response's
+    /// figure, not the inflated cumulative total.
+    #[tokio::test]
+    async fn run_tool_loop_reports_cumulative_usage_across_round_trips_and_final_call_usage_separately(
+    ) {
+        let tool_call_reply = |call_id: &str, path: &str| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: call_id.to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({"path": path}),
+                cache_control: None,
+            }],
+        };
+
+        let usage_1 = Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_read_tokens: 1,
+            cache_write_tokens: 2,
+        };
+        let usage_2 = Usage {
+            input_tokens: 200,
+            output_tokens: 20,
+            cache_read_tokens: 3,
+            cache_write_tokens: 4,
+        };
+        let usage_final = Usage {
+            input_tokens: 300,
+            output_tokens: 30,
+            cache_read_tokens: 5,
+            cache_write_tokens: 6,
+        };
+
+        let provider = ScriptedUsageProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                (tool_call_reply("call_1", "/tmp/one.txt"), usage_1),
+                (tool_call_reply("call_2", "/tmp/two.txt"), usage_2),
+                (Message::assistant_text("final answer"), usage_final),
+            ])),
+        };
+
+        let read_tool = FakeReadTool;
+        let tools: [&dyn ExecutableTool; 1] = [&read_tool];
+
+        let mut transcript = vec![Message::user_text("read both files")];
+
+        let (result, turn_usage) = run_tool_loop(
+            &provider,
+            "you are a test agent",
+            None,
+            &mut transcript,
+            &tools,
+            |_request| async { true },
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("loop should succeed across two tool round trips");
+
+        assert_eq!(result.text(), "final answer");
+
+        let expected_cumulative = Usage {
+            input_tokens: usage_1.input_tokens + usage_2.input_tokens + usage_final.input_tokens,
+            output_tokens: usage_1.output_tokens
+                + usage_2.output_tokens
+                + usage_final.output_tokens,
+            cache_read_tokens: usage_1.cache_read_tokens
+                + usage_2.cache_read_tokens
+                + usage_final.cache_read_tokens,
+            cache_write_tokens: usage_1.cache_write_tokens
+                + usage_2.cache_write_tokens
+                + usage_final.cache_write_tokens,
+        };
+        assert_eq!(
+            turn_usage.cumulative, expected_cumulative,
+            "cumulative usage must be the sum of every round trip's usage, not just the last"
+        );
+        assert_eq!(
+            turn_usage.final_call, usage_final,
+            "final_call must be ONLY the last response's usage (the compaction/context-percent \
+             path's input), not the cumulative total"
+        );
+        assert_ne!(
+            turn_usage.final_call, turn_usage.cumulative,
+            "sanity check: with distinct per-response usage, final_call and cumulative must differ"
+        );
+    }
+
+    /// A provider that ALWAYS replies with a `read` tool call and never
+    /// terminates the loop on its own -- the misbehaving-provider shape
+    /// F-005's `max_iterations` cap exists to protect against. Counts calls
+    /// so a test can assert `run_tool_loop` actually stopped calling it once
+    /// the cap was hit, rather than merely returning eventually for some
+    /// other reason.
+    struct AlwaysToolCallProvider {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl Provider for AlwaysToolCallProvider {
+        type Error = StubError;
+
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> Result<(Message, Usage), StubError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_loop".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({"path": "/tmp/whatever.txt"}),
+                        cache_control: None,
+                    }],
+                },
+                Usage::default(),
+            ))
+        }
+    }
+
+    /// F-005: `run_tool_loop` must not loop forever against a provider that
+    /// never stops emitting `ToolUse` blocks -- `max_iterations`, once
+    /// exhausted, must stop the loop with
+    /// `RunToolLoopError::MaxIterationsExceeded` rather than hanging.
+    #[tokio::test]
+    async fn run_tool_loop_stops_with_max_iterations_exceeded_against_looping_provider() {
+        let provider = AlwaysToolCallProvider {
+            calls: std::sync::atomic::AtomicU32::new(0),
+        };
+        let read_tool = FakeReadTool;
+        let tools: [&dyn ExecutableTool; 1] = [&read_tool];
+        let mut transcript = vec![Message::user_text("read forever")];
+
+        let result = run_tool_loop(
+            &provider,
+            "you are a test agent",
+            None,
+            &mut transcript,
+            &tools,
+            |_request| async { true },
+            None,
+            None,
+            Some(3),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(RunToolLoopError::MaxIterationsExceeded)),
+            "expected MaxIterationsExceeded, got {result:?}"
+        );
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the provider should be called exactly max_iterations times, no more"
+        );
     }
 
     /// A fake gated tool (analogous to `bash`, which implements
@@ -1027,6 +1311,7 @@ mod tests {
             &mut transcript,
             &tools,
             |_request| async { false },
+            None,
             None,
             None,
         )
@@ -1121,6 +1406,7 @@ mod tests {
                 async { true }
             },
             Some(&pre_tool_hook),
+            None,
             None,
         )
         .await
@@ -1249,6 +1535,7 @@ mod tests {
             |_request| async { true },
             None,
             Some(&post_tool_hook),
+            None,
         )
         .await
         .expect("loop should succeed");
@@ -1372,6 +1659,7 @@ mod tests {
             &mut transcript,
             &tools,
             |_request| async { false },
+            None,
             None,
             None,
         )

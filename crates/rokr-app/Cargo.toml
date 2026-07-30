@@ -1,0 +1,42 @@
+[package]
+name = "rokr-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rokr-tui = { path = "../rokr-tui" }
+rokr-core = { path = "../rokr-core" }
+rokr-provider = { path = "../rokr-provider" }
+rokr-tools = { path = "../rokr-tools" }
+rokr-config = { path = "../rokr-config" }
+rokr-session = { path = "../rokr-session" }
+rokr-mcp = { path = "../rokr-mcp" }
+rokr-hooks = { path = "../rokr-hooks" }
+clap = { workspace = true }
+clap_complete = "4"
+tokio = { workspace = true }
+# Ticket 55 (headless-output-formats-and-permission-mode): not in that
+# ticket's `files-touched` list, but mechanically required -- `result_schema`
+# (also listed in `files-touched`) cannot derive `Serialize` on the result
+# object without it. Same mechanical-necessity precedent as `crates/rokr/Cargo.toml`'s
+# `rokr-mcp`/`rokr-hooks` additions (see those comments and ADR 0011's
+# Consequences).
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Ticket 67 (self-update-rokr-upgrade): backs the `rokr upgrade` subcommand's
+# non-Homebrew update-check/install path (see `src/upgrade.rs`). Default
+# features (`github_releases`) are sufficient -- no `tokio`/`blocking`
+# feature needed since `AxoUpdater::run()` is a plain `async fn` called from
+# this crate's own tokio runtime.
+axoupdater = "0.10.0"
+
+[dev-dependencies]
+wiremock = { workspace = true }
+# Ticket 63 (custom-command-discovery-and-registry): not in that ticket's
+# `files-touched` list, but mechanically required -- `commands.rs`'s
+# discovery unit tests (also listed in `files-touched`) need a scratch
+# directory to write fixture `commands/*.md` files into. Same
+# mechanical-necessity precedent as the Cargo.toml comments above (ticket 55)
+# and in `crates/rokr/Cargo.toml` (tickets 44/49).
+tempfile = { workspace = true }

@@ -1,200 +1,33 @@
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use rokr_core::{ExecutableTool, Provider};
-
-mod subagent;
-
-const USAGE: &str =
-    "Usage: rokr [--version] [--agent <plan|build>] [--resume <id>] [--continue] [auth login]";
-
-/// Ticket 35 (resume-session): which prior session (if any) this run should
-/// resume into, extracted from the raw CLI args before the existing
-/// `--version`/`auth login`/`parse_agent_tier` matching runs.
-enum ResumeMode {
-    None,
-    Id(String),
-    Continue,
-}
-
-/// Pulls `--resume <id>` / `--continue` (in any position) out of `args`,
-/// returning the resolved `ResumeMode` plus the remaining args untouched --
-/// so the existing `--version` / `auth login` / `parse_agent_tier` matching
-/// keeps working exactly as today, just against the filtered remainder.
-fn extract_resume_mode(args: &[String]) -> (ResumeMode, Vec<String>) {
-    let mut mode = ResumeMode::None;
-    let mut remaining = Vec::new();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--resume" => {
-                if let Some(id) = iter.next() {
-                    mode = ResumeMode::Id(id.clone());
-                }
-            }
-            "--continue" => mode = ResumeMode::Continue,
-            other => remaining.push(other.to_string()),
-        }
-    }
-    (mode, remaining)
-}
-
-/// The agent's tool tier, selected via `--agent` and defaulting to `Plan`
-/// when no flag is given. `Plan` is read-only: read/glob/grep/ls only, so
-/// the agent can explore and reason about a codebase without being able to
-/// change anything. `Build` adds bash/write/edit on top, unlocking actual
-/// mutation. Each tier's tools are all wired through the same
-/// `rokr_core::run_tool_loop`; the tier only changes which tools are handed
-/// in and which system prompt (`{config_dir}/agents/{tier}.md`) is seeded.
-#[derive(Clone, Copy)]
-enum AgentTier {
-    Plan,
-    Build,
-}
-
-impl AgentTier {
-    fn prompt_name(self) -> &'static str {
-        match self {
-            AgentTier::Plan => "plan",
-            AgentTier::Build => "build",
-        }
-    }
-}
-
-/// F-003: the real send path (`run_tool_loop`, `compact_transcript`) AND
-/// `subagent::SubagentTool` (ticket 30, F-004) share this SINGLE
-/// resilience-wrapped provider — previously this was two separate locks (a
-/// resilience-wrapped one for the send path, a bare unwrapped one for
-/// subagents), written and read non-atomically, so a `/model` switch racing
-/// `submit`'s two reads could split the parent and a subagent onto
-/// different backends. `ResilientProvider<AnyProvider>` is `Clone` (see
-/// `resilience.rs`), so a single `Arc<RwLock<..>>` is enough: ticket 29's
-/// read-clone-drop-guard pattern (clone the current provider out from
-/// behind a read lock and drop the guard immediately, so `/model` never
-/// blocks on an in-flight request's `.await`, which can legitimately run as
-/// long as the retry policy's `max_elapsed`) clones the whole
-/// `ResilientProvider<AnyProvider>` value directly rather than an inner
-/// `Arc`.
-type SharedProvider = Arc<tokio::sync::RwLock<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>>;
-
-/// Parses the raw CLI args (already stripped of argv[0]) into an
-/// `AgentTier`. No args at all defaults to `Plan`; `--agent plan` and
-/// `--agent build` select explicitly; anything else is a usage error.
-fn parse_agent_tier(args: &[String]) -> Result<AgentTier, ()> {
-    match args {
-        [] => Ok(AgentTier::Plan),
-        [flag, value] if flag == "--agent" => match value.as_str() {
-            "plan" => Ok(AgentTier::Plan),
-            "build" => Ok(AgentTier::Build),
-            _ => Err(()),
-        },
-        _ => Err(()),
-    }
-}
-
-/// Runs `entry`'s command against `payload`, honoring its `timeout_ms`
-/// override (falling back to `rokr_hooks::DEFAULT_TIMEOUT` when absent).
-/// Ticket 50 (hooks-remaining-events-and-config): shared by every hook call
-/// site below (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`,
-/// `SessionStart`, `Stop`, `SessionEnd`) so the timeout-override lookup
-/// lives in exactly one place.
-async fn run_hook_entry(
-    entry: &rokr_config::HookEntry,
-    payload: &rokr_hooks::HookPayload,
-) -> rokr_hooks::HookResult {
-    let timeout = entry
-        .timeout_ms
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(rokr_hooks::DEFAULT_TIMEOUT);
-    rokr_hooks::execute_hook(&entry.command, payload, timeout).await
-}
-
-/// Every hook entry configured for `event`, matcher-filtered against
-/// `tool_name` when `Some` (`PreToolUse`/`PostToolUse`) or left unfiltered
-/// when `None` -- every lifecycle event (`SessionStart`, `UserPromptSubmit`,
-/// `Stop`, `SessionEnd`) ignores `matcher` entirely, per the PRD's "Matcher
-/// shape" note, simply by always being called with `tool_name: None` at its
-/// call sites below. An entry with no `matcher` set behaves like `"*"`
-/// (matches every tool), same as a missing `matcher` string would via
-/// `rokr_hooks::matches_tool_name`.
-fn matching_hook_entries<'a>(
-    hooks_config: &'a std::collections::HashMap<String, Vec<rokr_config::HookEntry>>,
-    event: &str,
-    tool_name: Option<&str>,
-) -> Vec<&'a rokr_config::HookEntry> {
-    hooks_config
-        .get(event)
-        .into_iter()
-        .flatten()
-        .filter(|entry| match tool_name {
-            Some(tool_name) => entry
-                .matcher
-                .as_deref()
-                .is_none_or(|matcher| rokr_hooks::matches_tool_name(matcher, tool_name)),
-            None => true,
-        })
-        .collect()
-}
-
-/// Logs a one-line notice for a fire-and-observe hook's outcome
-/// (`PostToolUse`, `Stop`, `SessionEnd` -- none of which can veto anything,
-/// architect decision: "Stop/SessionEnd: fire-and-observe, exit codes
-/// logged, non-blocking"), extended here to `PostToolUse` for the identical
-/// reason (it always runs after the tool it's attached to has already
-/// executed, so there's nothing left to veto). A `Success` outcome is the
-/// silent default (nothing to report); `Blocked` (exit 2) is logged as an
-/// IGNORED veto attempt, since these events have no veto to honor;
-/// `NonBlockingFailure` is logged as-is.
-///
-/// Known wart (ticket 51, mcp-hooks-introspection, flagged for Phase 7):
-/// `eprintln!` here (and at the two `PreToolUse` outcome sites in `submit`
-/// just above `run_tool_loop`'s call) writes to stderr while the TUI may
-/// still hold the alt-screen -- fine for the `SessionStart`/`SessionEnd`
-/// call sites (both fire outside `rokr_tui::run`'s active window), but the
-/// `PostToolUse`/`Stop` call sites inside `submit`'s closure fire WHILE the
-/// TUI is rendering. Routing these through the existing `SessionStatus`
-/// notice channel (`status_tx`, already captured in `submit`'s closure)
-/// would need: a `context_percent` value to pair with the notice (no
-/// "current" figure exists mid-turn without adding new state -- unlike the
-/// MCP notice-forwarder task above, which has `last_known_usage` handy),
-/// and splitting this function's signature (or adding a sibling wrapper)
-/// since `SessionStart`/`SessionEnd` must stay `eprintln!`-based. Judged
-/// out of scope for this ticket.
-fn log_observational_hook_outcome(event: &str, result: &rokr_hooks::HookResult) {
-    match result {
-        rokr_hooks::HookResult::Success { .. } => {}
-        rokr_hooks::HookResult::Blocked { stderr } => {
-            eprintln!(
-                "{event} hook exited 2 (a blocking exit code), but {event} is fire-and-observe \
-                 only and cannot veto anything -- ignoring: {stderr}"
-            );
-        }
-        rokr_hooks::HookResult::NonBlockingFailure { message } => {
-            eprintln!("{event} hook failed non-blocking: {message}");
-        }
-    }
-}
+use clap::Parser;
+use rokr_app::cli::{completions_script, AuthAction, Cli, Command, ReportFormat};
+use rokr_app::{
+    append_compaction_record, default_data_dir, log_observational_hook_outcome,
+    matching_hook_entries, model_pricing_to_pricing_entry, now_timestamp, run_hook_entry,
+    select_mode, AgentTier, Mode, ResumeMode, SessionRunner, SharedProvider,
+};
+use rokr_core::ExecutableTool;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // Ticket 35 (resume-session): pulled out BEFORE the existing match so
-    // `--resume <id>` / `--continue` can appear anywhere on the command
-    // line without disturbing the `--version` / `auth login` /
-    // `parse_agent_tier` matching below, which now runs against
-    // `remaining_args` instead of the raw `args`.
-    let (resume_mode, remaining_args) = extract_resume_mode(&args);
+    // Ticket 52 (clap-and-sessionrunner-extraction): argument parsing is now
+    // owned by `clap` (see `rokr_app::cli`). `Cli::parse()` handles
+    // `--version` / `--help` and usage errors itself (printing and exiting),
+    // replacing the hand-rolled `--version` / `auth login` / `parse_agent_tier`
+    // match this function used to open with.
+    let cli = Cli::parse();
 
-    match remaining_args.as_slice() {
-        [flag] if flag == "--version" => {
-            println!("rokr {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
+    match cli.command {
         // Ticket 31 (oauth-pkce-login): runs the PKCE login flow and exits
-        // rather than entering the TUI. Parallel to the `--version` arm
-        // above -- there's no clap/subcommand framework in this binary yet,
-        // so this is a second explicit match arm, same as that one.
-        [a, b] if a == "auth" && b == "login" => {
+        // rather than entering the TUI. Now the `auth login` clap subcommand
+        // rather than a hand-matched `[a, b]` argv pair.
+        Some(Command::Auth {
+            action: AuthAction::Login,
+        }) => {
             let config_dir = rokr_config::default_config_dir();
             let token_store = rokr_provider::auth::default_token_store(&config_dir);
             match rokr_provider::auth::login(token_store.as_ref()).await {
@@ -205,14 +38,110 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        _ => {
-            let agent = match parse_agent_tier(&remaining_args) {
-                Ok(agent) => agent,
-                Err(()) => {
-                    eprintln!("{USAGE}");
-                    return ExitCode::FAILURE;
+        // Ticket 53 (shell-completions-subcommand): prints the requested
+        // shell's completion script to stdout and exits, rather than
+        // entering the TUI -- the same "run and exit" shape as `auth login`
+        // above.
+        Some(Command::Completions { shell }) => {
+            println!("{}", completions_script(shell));
+            ExitCode::SUCCESS
+        }
+        // Ticket 67 (self-update-rokr-upgrade): checks for (and, on a
+        // non-Homebrew install, applies) an update to the running binary,
+        // or -- on a Homebrew-managed install -- declines and directs the
+        // user to `brew upgrade` instead. Same "run and exit, no TUI" shape
+        // as `Completions`/`Auth` above. All the actual logic lives in
+        // `rokr_app::upgrade::run`; this arm is a thin adapter.
+        Some(Command::Upgrade) => rokr_app::upgrade::run().await,
+        // Ticket 58 (eval-case-runner-and-deterministic-assertions): runs
+        // every eval case file in `cases_dir` and exits -- the same
+        // "run and exit, no TUI" shape as `auth login`/`completions` above.
+        // A thin adapter: all the orchestration (fresh fixture dir per
+        // case, fresh headless session, assertion checking) lives in
+        // `rokr_eval::run_eval`; this arm just prints its per-case report
+        // and maps the outcome to an exit code (0 iff every case passed and
+        // the run itself didn't hit a whole-run error, 1 otherwise).
+        //
+        // Ticket 60 (eval-report-json-and-ci-gate): `report`/`pass_threshold`
+        // are new. `report == Some(ReportFormat::Json)` branches to the
+        // aggregate, threshold-gated report instead -- built entirely by
+        // `rokr_eval::report::build_report` (this arm just prints it and
+        // returns its `exit_code()`). `None`/`Some(ReportFormat::Text)`
+        // (the ticket's "unchanged" path) falls through to the exact same
+        // per-case PASS/FAIL printing and any-case-failed exit code as
+        // before this ticket.
+        Some(Command::Eval {
+            cases_dir,
+            dangerously_skip_permissions,
+            report,
+            pass_threshold,
+        }) => match rokr_eval::run_eval(&cases_dir, dangerously_skip_permissions).await {
+            Ok(outcomes) => {
+                if matches!(report, Some(ReportFormat::Json)) {
+                    let report = rokr_eval::report::build_report(&outcomes, pass_threshold);
+                    match serde_json::to_string(&report) {
+                        Ok(json) => println!("{json}"),
+                        Err(err) => eprintln!("failed to serialize report: {err}"),
+                    }
+                    report.exit_code()
+                } else {
+                    let mut any_failed = false;
+                    for outcome in &outcomes {
+                        if outcome.passed {
+                            println!("PASS {}", outcome.name);
+                        } else {
+                            any_failed = true;
+                            println!("FAIL {}", outcome.name);
+                            if let Some(err) = &outcome.run_error {
+                                println!("  run error: {err}");
+                            }
+                            for assertion in &outcome.assertion_outcomes {
+                                if !assertion.passed {
+                                    println!(
+                                        "  assertion failed: {} ({})",
+                                        assertion.description, assertion.detail
+                                    );
+                                }
+                            }
+                            // F-015: a failing case's fixture dir is
+                            // preserved on disk (see
+                            // `rokr_eval::CaseOutcome::fixture_note`'s doc
+                            // comment) -- surfaced here so the report
+                            // itself tells the reader where to look.
+                            if let Some(note) = &outcome.fixture_note {
+                                println!("  {note}");
+                            }
+                        }
+                    }
+                    if any_failed {
+                        ExitCode::FAILURE
+                    } else {
+                        ExitCode::SUCCESS
+                    }
                 }
-            };
+            }
+            Err(err) => {
+                eprintln!("eval failed: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        // No subcommand: launch the TUI. `--agent` defaults to `Plan` when
+        // absent (the old `parse_agent_tier([])` behavior);
+        // `--resume` / `--continue` resolve via `Cli::resume_mode`.
+        None => {
+            // Ticket 54 (headless-print-mode-text-output): `-p`/`--print`
+            // runs a single prompt headless -- no TUI -- and exits, checked
+            // before any of the TUI-specific startup below so a
+            // scripted/piped invocation never waits on a terminal.
+            // `Cli::print`'s value of `-` reads the prompt from stdin
+            // instead of literally being the prompt text (see
+            // `rokr_app::headless::select_mode`).
+            if let Mode::Headless(prompt) = select_mode(cli.print.as_deref(), std::io::stdin()) {
+                return rokr_app::headless::run(&cli, prompt).await;
+            }
+
+            let agent = cli.agent.unwrap_or(AgentTier::Plan);
+            let resume_mode = cli.resume_mode();
 
             let config = match rokr_config::load_or_init_default() {
                 Ok(config) => config,
@@ -229,16 +158,14 @@ async fn main() -> ExitCode {
             // already makes for the top-level agent tier's prompt.
             let config_dir = rokr_config::default_config_dir();
 
-            let mut system_prompt = match rokr_config::read_agent_prompt(
-                &config_dir,
-                agent.prompt_name(),
-            ) {
-                Ok(prompt) => prompt,
-                Err(err) => {
-                    eprintln!("failed to read agent prompt: {err}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            let mut system_prompt =
+                match rokr_config::read_agent_prompt(&config_dir, agent.prompt_name()) {
+                    Ok(prompt) => prompt,
+                    Err(err) => {
+                        eprintln!("failed to read agent prompt: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
 
             // Resolved once at startup and reused for both the project-
             // context load below and repo-map (re)generation (F-001 fix):
@@ -247,17 +174,27 @@ async fn main() -> ExitCode {
             // treated the same as no project context / no repo map.
             let cwd: Option<std::path::PathBuf> = std::env::current_dir().ok();
 
-            // One-time, unconditional, side-effect-free read of project-level
-            // context (AGENTS.md, falling back to CLAUDE.md) from the
-            // current working directory, folded into the system prompt
-            // alongside the active agent tier's prompt. Not a tool, not
-            // permission-gated — this is how the system prompt is built, not
-            // a model-invoked action.
-            if let Some(cwd) = cwd.as_deref() {
-                if let Some(project_context) = rokr_config::load_project_context(cwd) {
-                    system_prompt.push_str("\n\n");
-                    system_prompt.push_str(&project_context);
-                }
+            // Ticket 61 (memory-file-loading-user-and-project-scope):
+            // one-time, unconditional, side-effect-free read of memory for
+            // both scopes rokr supports today -- user-scope AGENTS.md
+            // (under `config_dir`, always loaded when present) and
+            // project-scope AGENTS.md/CLAUDE.md (under the current working
+            // directory, `load_project_context`'s existing fallback) --
+            // folded into the system prompt as separate labeled segments,
+            // user-then-project order, alongside the active agent tier's
+            // prompt. Not a tool, not permission-gated — this is how the
+            // system prompt is built, not a model-invoked action.
+            //
+            // F-011 (pre-ship review): called unconditionally, not gated
+            // behind `cwd.is_some()` -- a failed `current_dir()` above only
+            // means project-scope memory can't be found; user-scope memory
+            // (from `config_dir`) has nothing to do with cwd and must still
+            // load. `load_memory` itself skips the cwd-dependent
+            // project-scope segment when `cwd` is `None`.
+            for segment in rokr_config::load_memory(&config_dir, cwd.as_deref()) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&format!("# {}\n", segment.label));
+                system_prompt.push_str(&segment.content);
             }
 
             // Ticket 50 (hooks-remaining-events-and-config): loaded once
@@ -281,6 +218,14 @@ async fn main() -> ExitCode {
             // `/hooks` can list every configured hook without disturbing
             // either of the two clones above.
             let command_hooks_config = hooks_config.clone();
+            // Ticket 57 (cost-command-and-headless-reporting): `config.model_pricing`
+            // wasn't threaded into `command`'s closure before this ticket --
+            // `/cost`/`/cost --all` need it to resolve a session's model
+            // string into a dollar rate, mirroring `hooks_config`'s own
+            // load-once-and-`Arc`-clone pattern immediately above.
+            let model_pricing: Arc<std::collections::HashMap<String, rokr_config::ModelPricing>> =
+                Arc::new(config.model_pricing.clone());
+            let command_model_pricing = model_pricing.clone();
 
             // `SessionStart` (PRD "Hooks"; architect decision: "SessionStart
             // at startup"): fires once, here, before the TUI ever renders.
@@ -371,29 +316,32 @@ async fn main() -> ExitCode {
             // comment on why), so it must be read off `built.selected`
             // (the plain `AnyProvider` `BuiltProvider` also returns) right
             // here.
-            let (provider, provider_name, model_name): (Result<SharedProvider, String>, String, String) =
-                match built {
-                    Ok(built) => {
-                        let (provider_name, model_name) = match &built.selected {
-                            rokr_provider::AnyProvider::OpenAi(_) => (
-                                "openai".to_string(),
-                                std::env::var(rokr_provider::openai::ENV_MODEL)
-                                    .unwrap_or_else(|_| "unknown".to_string()),
-                            ),
-                            rokr_provider::AnyProvider::Anthropic(_) => (
-                                "anthropic".to_string(),
-                                std::env::var(rokr_provider::anthropic::ENV_MODEL)
-                                    .unwrap_or_else(|_| "unknown".to_string()),
-                            ),
-                        };
-                        (
-                            Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
-                            provider_name,
-                            model_name,
-                        )
-                    }
-                    Err(err) => (Err(err), "unknown".to_string(), "unknown".to_string()),
-                };
+            let (provider, provider_name, model_name): (
+                Result<SharedProvider, String>,
+                String,
+                String,
+            ) = match built {
+                Ok(built) => {
+                    let (provider_name, model_name) = match &built.selected {
+                        rokr_provider::AnyProvider::OpenAi(_) => (
+                            "openai".to_string(),
+                            std::env::var(rokr_provider::openai::ENV_MODEL)
+                                .unwrap_or_else(|_| "unknown".to_string()),
+                        ),
+                        rokr_provider::AnyProvider::Anthropic(_) => (
+                            "anthropic".to_string(),
+                            std::env::var(rokr_provider::anthropic::ENV_MODEL)
+                                .unwrap_or_else(|_| "unknown".to_string()),
+                        ),
+                    };
+                    (
+                        Ok(Arc::new(tokio::sync::RwLock::new(built.resilient))),
+                        provider_name,
+                        model_name,
+                    )
+                }
+                Err(err) => (Err(err), "unknown".to_string(), "unknown".to_string()),
+            };
 
             // Ticket 34 (persist-new-sessions) / ticket 35 (resume-session):
             // constructed once at startup, central storage (not
@@ -587,6 +535,47 @@ async fn main() -> ExitCode {
             // takes ownership of the original binding, same reasoning as
             // `command_provider` above.
             let command_config_dir = config_dir.clone();
+            // Ticket 63 (custom-command-discovery-and-registry): discovered
+            // once here, before `config_dir` is moved wholesale into the
+            // `SessionRunner` struct literal below (same reasoning as the
+            // `command_config_dir`/`memory_command_config_dir` clones around
+            // it) -- `CommandRegistry::discover_user_scope` only needs a
+            // borrow, not ownership, so no `.clone()` is required. Consulted
+            // via the `resolve_custom_command` closure built below, right
+            // before the `rokr_tui::run` call.
+            //
+            // Ticket 64 (custom-command-project-scope-and-trust-boundary):
+            // project-scope commands (`<cwd>/.rokr/commands/*.md`) are
+            // discovered from the same already-resolved `cwd` used above for
+            // memory loading, then merged OVER the user-scope registry so a
+            // project's own command shadows a same-named personal one (ADR
+            // 0014, decision 3). A `cwd` that couldn't be resolved simply
+            // skips project-scope discovery, same as it already does for
+            // memory loading above -- not an error.
+            let mut command_registry = rokr_app::CommandRegistry::discover_user_scope(&config_dir);
+            if let Some(cwd) = cwd.as_deref() {
+                command_registry
+                    .merge_overriding(rokr_app::CommandRegistry::discover_project_scope(cwd));
+            }
+            // F-007 (PRD story 10, pre-ship review): `submit`'s closure
+            // (built below) needs its own clone of `command_registry` so it
+            // can resolve `@skill:<name>` mentions in a PLAIN prompt too
+            // (one the user typed directly, no leading `/`, so it never
+            // goes through `CommandRegistry::expand`'s own skill
+            // resolution) -- cloned here, before the original gets moved
+            // wholesale into the `resolve_custom_command` closure further
+            // below, same reasoning as the other `command_*`/`memory_*`
+            // clones around it.
+            let submit_command_registry = command_registry.clone();
+            // Ticket 62 (memory-slash-command-opens-editor): `/memory`'s
+            // path-resolver closure (built below, after `submit`/`command`)
+            // needs its own clones of `cwd` and `config_dir` -- cloned here,
+            // before `submit`'s `move` closure and the `runner` struct
+            // literal below take ownership of the originals (`config_dir`
+            // in particular is moved wholesale into `SessionRunner`), same
+            // reasoning as `command_config_dir`/`command_provider` above.
+            let memory_command_cwd = cwd.clone();
+            let memory_command_config_dir = config_dir.clone();
             // Ticket 40 (prompt-history): `on_history_append`'s closure
             // (built below, after `submit`/`command`) needs its own clone
             // of `data_dir`, cloned here before `submit`'s `move` closure
@@ -739,624 +728,50 @@ async fn main() -> ExitCode {
             // that turn, in deterministic sorted order.
             let submit_mcp_notice_tx = mcp_notice_tx.clone();
 
+            let runner = SessionRunner {
+                provider,
+                transcript,
+                system_prompt,
+                repo_map,
+                last_known_usage,
+                last_turn_usage: Arc::new(std::sync::Mutex::new(None)),
+                config_dir,
+                session_handle,
+                turn_index,
+                data_dir,
+                status_tx,
+                mcp_server_handles,
+                mcp_notice_tx: submit_mcp_notice_tx,
+                mcp_http_origins,
+                hooks_config: hooks_config_for_submit,
+                agent,
+                context_window_size,
+                auto_compact_threshold,
+                // F-005: unbounded for the TUI -- a human at the keyboard
+                // can always interrupt, unlike headless/eval's unattended
+                // runs (see `crate::headless::HEADLESS_MAX_ITERATIONS`).
+                max_iterations: None,
+            };
+
+            // Ticket 52 (clap-and-sessionrunner-extraction): the submit-and-run
+            // orchestration that used to be inlined in this closure now lives in
+            // `rokr_app::SessionRunner::run_submission`. This closure is a thin
+            // adapter -- `rokr_tui::run` hands it each Enter-press's prompt text
+            // and a fresh `PermissionHandle`, which it forwards straight into the
+            // runner (identical behavior; a pure move).
+            // F-007 (PRD story 10, pre-ship review): `@skill:<name>`
+            // mentions are resolved here, unconditionally, for every prompt
+            // that reaches `run_submission` -- both a plain user-typed
+            // prompt (`InputRoute::Submit` in rokr-tui, which never goes
+            // near `CommandRegistry::expand`) and an already-expanded
+            // custom-command template (which DID already go through
+            // `expand`'s own skill resolution -- re-running it here is a
+            // harmless no-op, since no `@skill:` markers survive a
+            // successful first pass). See `CommandRegistry::resolve_skills`'s
+            // doc comment.
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
-                let provider = provider.clone();
-                let transcript = transcript.clone();
-                let system_prompt = system_prompt.clone();
-                let repo_map = repo_map.clone();
-                let last_known_usage = last_known_usage.clone();
-                let config_dir = config_dir.clone();
-                let session_handle = session_handle.clone();
-                let turn_index = turn_index.clone();
-                let data_dir = data_dir.clone();
-                let status_tx = status_tx.clone();
-                let mcp_server_handles = mcp_server_handles.clone();
-                let mcp_notice_tx = submit_mcp_notice_tx.clone();
-                let mcp_http_origins = mcp_http_origins.clone();
-                let hooks_config = hooks_config_for_submit.clone();
-                async move {
-                    let provider = provider?;
-                    // F-003: ONE read lock, ONE clone of the current
-                    // resilience-wrapped provider snapshot, shared by both
-                    // the send path below and `SubagentTool` (F-004) --
-                    // guard dropped immediately, never held across an
-                    // `.await`, so `/model` never blocks on an in-flight
-                    // request's `.await` (which can legitimately run as
-                    // long as the retry policy's `max_elapsed`).
-                    let provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider> =
-                        provider.read().await.clone();
-
-                    // All eight tools are constructed unconditionally
-                    // (they're cheap zero-sized unit structs); which ones
-                    // actually land in `tools` depends on the agent tier.
-                    // read/glob/grep/ls auto-approve (ADR 0005: none are
-                    // `PreviewableTool`s); bash, write, edit, and webfetch
-                    // are gated and round-trip through the permission
-                    // callback below, and only exist in the tool set for
-                    // the `Build` tier.
-                    let read = rokr_tools::read::ReadTool;
-                    let glob = rokr_tools::glob::GlobTool;
-                    let grep = rokr_tools::grep::GrepTool;
-                    let ls = rokr_tools::ls::LsTool;
-                    let bash = rokr_tools::bash::BashTool;
-                    let write = rokr_tools::write::WriteTool;
-                    let edit = rokr_tools::edit::EditTool;
-                    let webfetch = rokr_tools::webfetch::WebfetchTool;
-
-                    // Ticket 28 (websearch-tool): `websearch` needs an
-                    // actual `rokr_tools::websearch::NativeSearchCapability`
-                    // object to delegate to — `provider.native_search_capable()`
-                    // alone is just a thin bool signal (see that method's
-                    // doc comment on why `rokr-core` can't hand back more
-                    // than that). No adapter in this codebase constructs a
-                    // real capability object yet (`rokr-provider` doesn't
-                    // depend on `rokr-tools`, and bridging a real
-                    // Anthropic-backed capability through here is out of
-                    // scope for this ticket), so `native_search_capability`
-                    // is provably `None` today. The `native_search_capable()`
-                    // query below is still real, not hardcoded, so a
-                    // follow-up ticket that supplies a genuine capability
-                    // object lights `websearch` up without touching this
-                    // gating logic again.
-                    let native_search_capability: Option<
-                        Arc<dyn rokr_tools::websearch::NativeSearchCapability>,
-                    > = None;
-                    let websearch = if provider.native_search_capable() {
-                        rokr_tools::websearch::for_capability(native_search_capability)
-                    } else {
-                        None
-                    };
-
-                    // Ticket 30 (subagent-tool): cloned before
-                    // `request_permission` below moves `permission` into
-                    // its own closure -- the subagent tool's callback needs
-                    // its own clone of the SAME handle so a subagent's
-                    // gated tool calls round-trip through the identical
-                    // channel the parent's own gated tool calls do.
-                    let subagent_permission = permission.clone();
-
-                    // Ticket 38 (checkpoint-pre-images): both
-                    // `request_permission` below and the mirrored
-                    // `subagent_request_permission` need their OWN owned
-                    // clones of `session_handle`/`turn_index`/`data_dir` to
-                    // `move` into themselves, since `session_handle` and
-                    // `turn_index` are still read again later in this same
-                    // `submit` body (append_turn / the increment above's
-                    // sibling call site) -- cloning here, not moving the
-                    // originals, mirrors `subagent_permission`'s existing
-                    // pattern immediately above.
-                    let request_permission_session_handle = session_handle.clone();
-                    let request_permission_turn_index = turn_index.clone();
-                    let request_permission_data_dir = data_dir.clone();
-                    let request_permission_mcp_http_origins = mcp_http_origins.clone();
-                    let subagent_request_permission_session_handle = session_handle.clone();
-                    let subagent_request_permission_turn_index = turn_index.clone();
-                    let subagent_request_permission_data_dir = data_dir.clone();
-                    let subagent_request_permission_mcp_http_origins = mcp_http_origins.clone();
-
-                    // Bridges rokr-core's `PermissionRequest` (tool name +
-                    // `PermissionPayload`) to rokr-tui's primitive
-                    // `PermissionRequest` (tool name + a display string),
-                    // round-tripping through the TUI's render loop via
-                    // `permission`. This is the seam rokr-tui's `run` doc
-                    // comment calls out: rokr-tui stays decoupled from
-                    // rokr-core's specific types, so main.rs bridges them.
-                    // Ticket 38 (checkpoint-pre-images): on GRANT, also
-                    // captures a pre-image snapshot for a `Diff` payload
-                    // (write/edit) and appends a correlating `Checkpoint`
-                    // record -- see `capture_checkpoint_if_granted_diff`'s
-                    // doc comment. `PermissionPayload::Command` (bash)
-                    // snapshots nothing, falling out structurally from the
-                    // match below rather than a runtime special-case.
-                    let request_permission = move |request: rokr_core::PermissionRequest| {
-                        let permission = permission.clone();
-                        let session_handle = request_permission_session_handle.clone();
-                        let turn_index = request_permission_turn_index.clone();
-                        let data_dir = request_permission_data_dir.clone();
-                        let mcp_http_origins = request_permission_mcp_http_origins.clone();
-                        async move {
-                            let (detail, diff_path_and_old) = match request.payload {
-                                rokr_core::PermissionPayload::Command(command) => {
-                                    (rokr_tui::PermissionDetail::Text(command), None)
-                                }
-                                rokr_core::PermissionPayload::Diff { path, old, new } => (
-                                    rokr_tui::PermissionDetail::Diff {
-                                        old: old.clone(),
-                                        new,
-                                    },
-                                    Some((path, old)),
-                                ),
-                                rokr_core::PermissionPayload::ToolCall {
-                                    server,
-                                    tool,
-                                    input_pretty,
-                                } => {
-                                    let origin = mcp_http_origins.get(&server).map(String::as_str);
-                                    (
-                                        rokr_tui::PermissionDetail::Text(
-                                            format_tool_call_permission_text(
-                                                &server,
-                                                &tool,
-                                                &input_pretty,
-                                                origin,
-                                            ),
-                                        ),
-                                        None,
-                                    )
-                                }
-                            };
-                            let granted = permission
-                                .request(rokr_tui::PermissionRequest {
-                                    tool_name: request.tool_name,
-                                    detail,
-                                })
-                                .await;
-                            if granted {
-                                capture_checkpoint_if_granted_diff(
-                                    diff_path_and_old,
-                                    &data_dir,
-                                    &session_handle,
-                                    &turn_index,
-                                )
-                                .await;
-                            }
-                            granted
-                        }
-                    };
-
-                    // Ticket 30 (subagent-tool): bridges rokr-core's
-                    // PermissionRequest to the SAME rokr_tui::PermissionHandle
-                    // the parent's own request_permission above uses (PRD
-                    // Phase 4 "Subagents": "Permission inheritance").
-                    // Tagging with the subagent's name happens inside
-                    // `subagent::run_subagent`, not here -- this closure
-                    // only forwards the (already-tagged) request. Ticket 38
-                    // (checkpoint-pre-images): wired the SAME way as
-                    // `request_permission` above -- a subagent's gated tool
-                    // calls happen within the same parent turn, so they
-                    // share the SAME `turn_index` (not a subagent-local
-                    // counter).
-                    let subagent_request_permission: subagent::PermissionCallback =
-                        Box::new(move |request: rokr_core::PermissionRequest| {
-                            let permission = subagent_permission.clone();
-                            let session_handle = subagent_request_permission_session_handle.clone();
-                            let turn_index = subagent_request_permission_turn_index.clone();
-                            let data_dir = subagent_request_permission_data_dir.clone();
-                            let mcp_http_origins =
-                                subagent_request_permission_mcp_http_origins.clone();
-                            Box::pin(async move {
-                                let (detail, diff_path_and_old) = match request.payload {
-                                    rokr_core::PermissionPayload::Command(command) => {
-                                        (rokr_tui::PermissionDetail::Text(command), None)
-                                    }
-                                    rokr_core::PermissionPayload::Diff { path, old, new } => (
-                                        rokr_tui::PermissionDetail::Diff {
-                                            old: old.clone(),
-                                            new,
-                                        },
-                                        Some((path, old)),
-                                    ),
-                                    rokr_core::PermissionPayload::ToolCall {
-                                        server,
-                                        tool,
-                                        input_pretty,
-                                    } => {
-                                        let origin =
-                                            mcp_http_origins.get(&server).map(String::as_str);
-                                        (
-                                            rokr_tui::PermissionDetail::Text(
-                                                format_tool_call_permission_text(
-                                                    &server,
-                                                    &tool,
-                                                    &input_pretty,
-                                                    origin,
-                                                ),
-                                            ),
-                                            None,
-                                        )
-                                    }
-                                };
-                                let granted = permission
-                                    .request(rokr_tui::PermissionRequest {
-                                        tool_name: request.tool_name,
-                                        detail,
-                                    })
-                                    .await;
-                                if granted {
-                                    capture_checkpoint_if_granted_diff(
-                                        diff_path_and_old,
-                                        &data_dir,
-                                        &session_handle,
-                                        &turn_index,
-                                    )
-                                    .await;
-                                }
-                                granted
-                            })
-                        });
-                    // F-003/F-004: the SAME single provider snapshot the
-                    // send path below uses, resilience-wrapped -- no longer
-                    // a separately-tracked bare `AnyProvider`.
-                    let subagent_tool = subagent::SubagentTool::new(
-                        provider.clone(),
-                        config_dir.clone(),
-                        subagent_request_permission,
-                    );
-
-                    // PC-1 ruling (supersedes ticket 46's whole-session
-                    // `OnceLock` freeze): the session's MCP tool-set
-                    // snapshot -- sorted deterministically by (server,
-                    // tool) via `rokr_mcp::snapshot_tools` -- is now
-                    // recomputed fresh every Build-tier `submit`, but each
-                    // individual server's contribution within it is
-                    // ALREADY frozen (`McpServerHandle::joined`, written at
-                    // most once per server: that server's own first
-                    // `Ready`, or again on a later explicit `/mcp
-                    // reconnect` success -- never on an automatic
-                    // Ready-after-Fail flap). So a server that's still
-                    // `Starting` on turn 1 and reaches `Ready` before turn
-                    // 2 DOES appear starting turn 2 (this is the intended,
-                    // one-time auto-join, not "mutation"); a server that
-                    // was already joined on turn 1 contributes the EXACT
-                    // SAME tools on turn 2 even if its live tool list
-                    // somehow changed, since this reads each server's
-                    // frozen `joined` snapshot, never its live one.
-                    // Declared here, as owned `Arc<McpTool>`s, BEFORE
-                    // `tools` below so the `&dyn ExecutableTool` references
-                    // pushed into `tools` borrow from something that
-                    // outlives the `run_tool_loop` call.
-                    let mcp_tools_snapshot: Vec<Arc<rokr_mcp::McpTool>> =
-                        if matches!(agent, AgentTier::Build) {
-                            rokr_mcp::snapshot_tools(&mcp_server_handles, &mcp_notice_tx)
-                        } else {
-                            Vec::new()
-                        };
-
-                    let mut tools: Vec<&dyn rokr_core::ExecutableTool> = match agent {
-                        AgentTier::Plan => vec![&read, &glob, &grep, &ls],
-                        AgentTier::Build => {
-                            vec![
-                                &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
-                                &subagent_tool,
-                            ]
-                        }
-                    };
-                    if let (AgentTier::Build, Some(websearch)) = (agent, &websearch) {
-                        tools.push(websearch);
-                    }
-                    // MCP tools are gated (`McpTool::preview` always returns
-                    // `Some(...)`), so -- like bash/write/edit/webfetch
-                    // above -- they only join the tool set for the `Build`
-                    // tier, never `Plan` (ticket 44's original gating
-                    // behavior, preserved here).
-                    for tool in &mcp_tools_snapshot {
-                        tools.push(tool.as_ref() as &dyn rokr_core::ExecutableTool);
-                    }
-
-                    // Expand any `@path` mentions in the raw input BEFORE it
-                    // joins the transcript, so resolved file contents (or a
-                    // not-found note) land in the same user-role message
-                    // rather than as a separate synthetic message — at
-                    // least one supported provider rejects an orphan
-                    // tool-role message on the wire, so this deliberately
-                    // reuses the plain user-text path rather than a
-                    // ToolResult block. The resolver is real filesystem IO
-                    // (the only IO `rokr-core`'s pure `mentions` module
-                    // doesn't perform itself), matching `rokr-tools`'
-                    // `read` tool's own io-error-to-failure behavior: any
-                    // read error (missing file, permissions, non-UTF-8,
-                    // ...) is treated as `NotFound`.
-                    let mut expanded_input =
-                        rokr_core::mentions::expand_mentions(&input, |path| {
-                            match std::fs::read_to_string(path) {
-                                Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
-                                Err(_) => rokr_core::mentions::MentionResolution::NotFound,
-                            }
-                        });
-
-                    // `UserPromptSubmit` (PRD "Hooks"; architect decision:
-                    // "UserPromptSubmit before each prompt is sent"): runs
-                    // BEFORE this turn's user message joins the transcript
-                    // at all, so a blocking deny (exit 2, unless the entry
-                    // opts out via `blocking: false`) can short-circuit the
-                    // whole submission with an early `Err` -- same "denied
-                    // before anything is recorded" shape `PreToolUse`'s
-                    // ordering rule gives tool calls, just one level up.
-                    // Every matching hook's exit-0 stdout is concatenated
-                    // and appended to `expanded_input`, injecting fresh
-                    // context into THIS turn's own user message (reusing
-                    // the plain user-text path, same reasoning as the
-                    // `@path`-mention expansion above: at least one
-                    // supported provider rejects an orphan tool-role
-                    // message on the wire).
-                    let mut injected_user_prompt_context = String::new();
-                    for entry in matching_hook_entries(&hooks_config, "UserPromptSubmit", None) {
-                        let payload = rokr_hooks::HookPayload::UserPromptSubmit {
-                            prompt: expanded_input.clone(),
-                        };
-                        match run_hook_entry(entry, &payload).await {
-                            rokr_hooks::HookResult::Success { stdout } => {
-                                if !stdout.trim().is_empty() {
-                                    if !injected_user_prompt_context.is_empty() {
-                                        injected_user_prompt_context.push_str("\n\n");
-                                    }
-                                    injected_user_prompt_context.push_str(stdout.trim());
-                                }
-                            }
-                            rokr_hooks::HookResult::Blocked { stderr } => {
-                                if entry.blocking.unwrap_or(true) {
-                                    return Err(stderr);
-                                }
-                                eprintln!(
-                                    "UserPromptSubmit hook exited 2 but its config entry sets \
-                                     blocking: false, allowing the prompt through: {stderr}"
-                                );
-                            }
-                            rokr_hooks::HookResult::NonBlockingFailure { message } => {
-                                eprintln!(
-                                    "UserPromptSubmit hook failed non-blocking, continuing \
-                                     without its injected context: {message}"
-                                );
-                            }
-                        }
-                    }
-                    if !injected_user_prompt_context.is_empty() {
-                        expanded_input =
-                            format!("{expanded_input}\n\n{injected_user_prompt_context}");
-                    }
-
-                    let mut transcript = transcript.lock().await;
-                    // Schema v2 (architect ruling, phase-5): capture the
-                    // transcript length BEFORE this turn's user message and
-                    // its whole exchange are appended, so the `Turn` record
-                    // below can persist EXACTLY the slice this submit
-                    // produced -- the user prompt plus every
-                    // assistant/tool-use/tool-result/final message
-                    // `run_tool_loop` appends in place.
-                    let start = transcript.len();
-                    accumulate_user_turn(&mut transcript, expanded_input);
-
-                    let repo_map_snapshot: Option<String> = repo_map.lock().unwrap().clone();
-
-                    // `PreToolUse` (ticket 49, hooks-tracer-bullet; replaced
-                    // here by ticket 50, hooks-remaining-events-and-config,
-                    // with the real `hooks` config schema -- the interim
-                    // `ROKR_PRETOOLUSE_HOOK` env var this superseded is
-                    // gone, mirroring how ticket 45's `mcp` config schema
-                    // superseded ticket 44's `ROKR_MCP_SERVER` env var):
-                    // runs every configured `PreToolUse` hook whose
-                    // `matcher` glob matches the tool name about to be
-                    // called (`matching_hook_entries`), in order, stopping
-                    // at the first that denies. A hook that exits 2 vetoes
-                    // UNLESS its own config entry sets `blocking: false`,
-                    // in which case the veto is downgraded to a logged
-                    // non-blocking notice -- see `HookEntry::blocking`'s doc
-                    // comment in `rokr-config` for why that escape hatch
-                    // exists. Any other outcome (success, non-blocking
-                    // failure, or a downgraded block) falls through to
-                    // `Allow`, matching `execute_hook`'s own
-                    // non-blocking-failure contract
-                    // (`docs/adr/0012-hooks-execution-trust-model.md`).
-                    let pre_tool_hook: &rokr_core::PreToolHookCallback<'_> =
-                        &|request: rokr_core::PreToolHookRequest| {
-                            let hooks_config = hooks_config.clone();
-                            Box::pin(async move {
-                                let entries = matching_hook_entries(
-                                    &hooks_config,
-                                    "PreToolUse",
-                                    Some(&request.tool_name),
-                                );
-                                for entry in entries {
-                                    let payload = rokr_hooks::HookPayload::PreToolUse {
-                                        tool_name: request.tool_name.clone(),
-                                        tool_input: request.tool_input.clone(),
-                                    };
-                                    match run_hook_entry(entry, &payload).await {
-                                        rokr_hooks::HookResult::Success { .. } => {}
-                                        rokr_hooks::HookResult::Blocked { stderr } => {
-                                            if entry.blocking.unwrap_or(true) {
-                                                return rokr_core::PreToolHookOutcome::Deny(
-                                                    stderr,
-                                                );
-                                            }
-                                            eprintln!(
-                                                "PreToolUse hook exited 2 but its config entry \
-                                                 sets blocking: false, allowing the tool call \
-                                                 through: {stderr}"
-                                            );
-                                        }
-                                        rokr_hooks::HookResult::NonBlockingFailure { message } => {
-                                            eprintln!(
-                                                "PreToolUse hook failed non-blocking, allowing \
-                                                 the tool call through: {message}"
-                                            );
-                                        }
-                                    }
-                                }
-                                rokr_core::PreToolHookOutcome::Allow
-                            })
-                        };
-
-                    // `PostToolUse` (ticket 50, hooks-remaining-events-and-config;
-                    // PRD "Hooks", architect decision: "mirrors PreToolUse's
-                    // callback shape, non-blocking observational"): runs
-                    // every configured `PostToolUse` hook whose `matcher`
-                    // matches the tool that just ran, AFTER its result is
-                    // already decided. `PostToolHookCallback` returns `()`
-                    // (see that type's doc comment) -- nothing this closure
-                    // does can change the `ToolResult` already produced;
-                    // every outcome (including a stray exit 2) is just
-                    // logged via `log_observational_hook_outcome`.
-                    let post_tool_hook: &rokr_core::PostToolHookCallback<'_> =
-                        &|request: rokr_core::PostToolHookRequest| {
-                            let hooks_config = hooks_config.clone();
-                            Box::pin(async move {
-                                let entries = matching_hook_entries(
-                                    &hooks_config,
-                                    "PostToolUse",
-                                    Some(&request.tool_name),
-                                );
-                                for entry in entries {
-                                    let payload = rokr_hooks::HookPayload::PostToolUse {
-                                        tool_name: request.tool_name.clone(),
-                                        tool_input: request.tool_input.clone(),
-                                        tool_output: request.tool_output.clone(),
-                                        is_error: request.is_error,
-                                    };
-                                    let result = run_hook_entry(entry, &payload).await;
-                                    log_observational_hook_outcome("PostToolUse", &result);
-                                }
-                            })
-                        };
-
-                    let (reply, usage) = rokr_core::run_tool_loop(
-                        &provider,
-                        &system_prompt,
-                        repo_map_snapshot.as_deref(),
-                        &mut transcript,
-                        &tools,
-                        request_permission,
-                        Some(pre_tool_hook),
-                        Some(post_tool_hook),
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?;
-
-                    // `Stop` (ticket 50, hooks-remaining-events-and-config;
-                    // PRD "Hooks", architect decision: "Stop when agent
-                    // finishes a turn"): fires here, once `run_tool_loop`
-                    // has produced this turn's final reply, fire-and-observe
-                    // like `PostToolUse` above (no veto semantics -- the
-                    // turn has already finished).
-                    for entry in matching_hook_entries(&hooks_config, "Stop", None) {
-                        let result = run_hook_entry(entry, &rokr_hooks::HookPayload::Stop).await;
-                        log_observational_hook_outcome("Stop", &result);
-                    }
-
-                    // Schema v2 (architect ruling, phase-5): exactly ONE
-                    // `Turn` record per submit, appended after
-                    // `run_tool_loop` returns and BEFORE the auto-compaction
-                    // check below, carrying the FULL exchange
-                    // (`transcript[start..]`) -- the @path-mention-EXPANDED
-                    // user message (what actually went out on the wire) plus
-                    // every assistant/tool-use/tool-result/final message the
-                    // loop appended. Atomic: the whole exchange or nothing (a
-                    // crash mid-loop drops the in-flight turn), intentionally
-                    // not split into an early user append and a later
-                    // assistant append. Note this supersedes ticket 34's
-                    // earlier behavior of persisting the raw pre-expansion
-                    // `input`.
-                    {
-                        let session_handle_guard = session_handle.read().await;
-                        if let Some(session_handle) = session_handle_guard.as_ref() {
-                            session_handle.append_turn(
-                                transcript[start..].to_vec(),
-                                rokr_session::UsageRecord::from(usage),
-                                now_timestamp(),
-                            );
-                        }
-                    }
-
-                    // Ticket 38 (checkpoint-pre-images): incremented AFTER
-                    // this turn's own `Turn` record has been appended above
-                    // (or would have been, if persistence is degraded) --
-                    // every gated tool call's snapshot taken during THIS
-                    // turn's `run_tool_loop` call above used the
-                    // pre-increment value, which is exactly the index this
-                    // turn's own `Turn` record occupies once appended (see
-                    // `turn_index`'s own doc comment, and `fold`'s
-                    // `next_turn_index` semantics in rokr-session).
-                    *turn_index.lock().unwrap() += 1;
-
-                    // Auto-compaction (ticket 20): checked once per
-                    // submitted turn using that turn's own final usage
-                    // figure. Runs inside this same async submit future —
-                    // no new thread, nothing here blocks the render loop.
-                    // On failure the transcript is left untouched and a
-                    // notice is prepended to this turn's reply instead of
-                    // losing history.
-                    let (prior_usage, effective_usage_for_percent) = {
-                        let mut guard = last_known_usage.lock().unwrap();
-                        let prior = *guard;
-                        let effective = if usage.input_tokens != 0 || usage.output_tokens != 0 {
-                            *guard = Some(usage);
-                            usage
-                        } else {
-                            // F-011 (argus review): some OpenAI-compatible
-                            // proxies intermittently omit real usage for a
-                            // turn (an all-zero figure) -- treating that as
-                            // "this turn used zero tokens" would visibly
-                            // drop the status line's percentage to 0%. Fall
-                            // back to whatever was last known (or the same
-                            // all-zero `usage` if nothing real has ever
-                            // been reported this session, matching today's
-                            // very first-turn behavior).
-                            guard.unwrap_or(usage)
-                        };
-                        (prior, effective)
-                    };
-
-                    // Ticket 43 (mouse-scroll-status-line): sent after every
-                    // turn's usage is known, regardless of whether it was
-                    // just folded into `last_known_usage` above (even an
-                    // all-zero usage figure is still worth reflecting in the
-                    // status line rather than leaving the previous turn's
-                    // percentage stale). `context_window_size` is the same
-                    // `u32` already captured by this closure for
-                    // `should_compact` below. F-011: uses
-                    // `effective_usage_for_percent` (falls back to the last
-                    // known real usage on an all-zero report) rather than
-                    // the raw `usage` -- scoped ONLY to this status-line
-                    // percentage; `should_compact` below still sees the raw
-                    // `usage`/`prior_usage` unchanged.
-                    let context_percent = (effective_usage_for_percent.input_tokens
-                        + effective_usage_for_percent.output_tokens)
-                        as f64
-                        / context_window_size as f64;
-                    let _ = status_tx.send(rokr_tui::SessionStatus {
-                        context_percent,
-                        notice: None,
-                    });
-
-                    let notice = if rokr_core::should_compact(
-                        usage,
-                        prior_usage,
-                        &transcript,
-                        context_window_size,
-                        auto_compact_threshold,
-                    ) {
-                        match rokr_core::compact_transcript(&provider, &transcript).await {
-                            Ok(rokr_core::CompactionOutcome::Compacted(compacted)) => {
-                                // RULING 2: persist a Compaction record. At
-                                // this point `turn_index` has already been
-                                // incremented for THIS turn (see above), so
-                                // its value is the raw turn count; the retained
-                                // tail turn is `raw_turn_count - 1` and the
-                                // summary replaces through `raw_turn_count - 2`.
-                                let raw_turn_count = *turn_index.lock().unwrap();
-                                append_compaction_record(
-                                    &session_handle,
-                                    &compacted,
-                                    raw_turn_count,
-                                )
-                                .await;
-                                *transcript = compacted;
-                                None
-                            }
-                            Ok(rokr_core::CompactionOutcome::NothingToCompact) => None,
-                            Err(err) => Some(format!(
-                                "[auto-compaction failed, continuing with full history: {err}]"
-                            )),
-                        }
-                    } else {
-                        None
-                    };
-
-                    Ok(match notice {
-                        Some(notice) => format!("{notice}\n{}", reply.text()),
-                        None => reply.text(),
-                    })
-                }
+                let input = submit_command_registry.resolve_skills(&input);
+                runner.run_submission(input, permission)
             };
 
             // Ticket 36 (session-index-list-jump): `/sessions` is added to
@@ -1395,6 +810,7 @@ async fn main() -> ExitCode {
                 let mcp_server_handles = command_mcp_server_handles.clone();
                 let mcp_configs = command_mcp_configs.clone();
                 let hooks_config = command_hooks_config.clone();
+                let model_pricing = command_model_pricing.clone();
                 async move {
                     if let Some(name) = input.strip_prefix("/model ") {
                         let name = name.trim();
@@ -1576,6 +992,40 @@ async fn main() -> ExitCode {
                         }
                         "/mcp" => format_mcp_listing(&mcp_configs, &mcp_server_handles),
                         "/hooks" => format_hooks_listing(&hooks_config),
+                        // Ticket 57: `/cost` folds the CURRENT session's own
+                        // `UsageRecord`s (a fresh raw read off disk, not the
+                        // in-memory `last_known_usage`, which only carries
+                        // the LAST turn's figure -- see
+                        // `fold_session_usage_and_model`'s doc comment) into
+                        // a token-by-type breakdown, cache-hit rate, and
+                        // dollar estimate against its own model's pricing.
+                        "/cost" => {
+                            match session_handle.read().await.as_ref().map(|handle| {
+                                handle.session_id().to_string()
+                            }) {
+                                Some(session_id) => {
+                                    let records = store.read_records(&session_id);
+                                    let (usage, model) = fold_session_usage_and_model(&records);
+                                    let pricing_entry = model_pricing
+                                        .get(&model)
+                                        .map(model_pricing_to_pricing_entry);
+                                    let cost_usd = rokr_core::pricing::calculate_cost(
+                                        usage,
+                                        pricing_entry.as_ref(),
+                                    );
+                                    format_cost_breakdown(usage, cost_usd)
+                                }
+                                None => "No active session.".to_string(),
+                            }
+                        }
+                        // Ticket 57: `/cost --all` extends the same fold
+                        // across every session `SessionStore::list_sessions`
+                        // knows about, pricing each session against its OWN
+                        // model before summing dollar totals (see
+                        // `format_cost_all_summary`'s doc comment for why).
+                        "/cost --all" => {
+                            format_cost_all_summary(&store, &model_pricing).await
+                        }
                         _ => format!("unknown command: {input}"),
                     }
                 }
@@ -1589,8 +1039,63 @@ async fn main() -> ExitCode {
                 }
             };
 
-            let run_result =
-                rokr_tui::run(submit, command, prompt_history, on_history_append, status_rx).await;
+            // Ticket 62 (memory-slash-command-opens-editor): path
+            // resolution/creation is main.rs's job (`resolve_memory_path`
+            // above) so rokr-tui's `event_loop` stays decoupled from
+            // cwd/AGENTS.md specifics -- it just calls this synchronous
+            // closure right before suspending the terminal. Assumption: if
+            // `cwd` couldn't be resolved at startup (see its own doc
+            // comment), falls back to a user-scope `config_dir/AGENTS.md`
+            // rather than failing `/memory` outright -- a reasonable
+            // default for that rare case, not a scope rokr-config's
+            // existing read-only memory loading otherwise defines.
+            let resolve_memory_path_for_tui = move || -> io::Result<PathBuf> {
+                let dir = memory_command_cwd
+                    .as_deref()
+                    .unwrap_or(&memory_command_config_dir);
+                resolve_memory_path(dir)
+            };
+
+            // Ticket 63 (custom-command-discovery-and-registry): a plain
+            // sync lookup+expand into the registry discovered above.
+            //
+            // F-004 (pre-ship review): filters by command NAME, not just
+            // call order, before ever consulting the registry -- see
+            // `is_builtin_command`'s doc comment for why call order alone
+            // (the original ticket 63/64 design, relying on `command`'s own
+            // dispatch falling through to its "unknown command: ..." arm)
+            // isn't sufficient: `command`'s match arms key off the FULL
+            // input string, so a builtin invoked with unrecognized args
+            // (e.g. `/cost --today`) falls through to that same "unknown
+            // command" arm even though its NAME ("cost") is unambiguously a
+            // builtin. Filtering here means a discovered command can now
+            // ONLY ever be reached for a name `command` doesn't claim at
+            // all, closing that gap without teaching `CommandRegistry`
+            // itself any built-in-name awareness (ADR 0014, decision 3: the
+            // registry stays name-agnostic).
+            let resolve_custom_command = move |input: &str| {
+                let name = input
+                    .strip_prefix('/')
+                    .unwrap_or(input)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if is_builtin_command(name) {
+                    return None;
+                }
+                command_registry.expand(input)
+            };
+
+            let run_result = rokr_tui::run(
+                submit,
+                command,
+                prompt_history,
+                on_history_append,
+                status_rx,
+                resolve_memory_path_for_tui,
+                resolve_custom_command,
+            )
+            .await;
 
             // `SessionEnd` (ticket 50, hooks-remaining-events-and-config;
             // PRD "Hooks", architect decision: "SessionEnd at exit"): fires
@@ -1627,41 +1132,21 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Appends a new user-turn message onto the running conversation transcript.
-/// `run_tool_loop` appends the corresponding assistant/tool-call/tool-result
-/// messages as it executes; this is the seam where a fresh prompt joins that
-/// running history.
-fn accumulate_user_turn(transcript: &mut Vec<rokr_core::Message>, input: String) {
-    transcript.push(rokr_core::Message::user_text(input));
-}
-
-/// Ticket 47 (mcp-permission-polish): formats a `PermissionPayload::ToolCall`
-/// into the `rokr_tui::PermissionDetail::Text` shown in the permission
-/// prompt -- one `label: value` line per field, server then tool then the
-/// pretty-printed input. Kept as discrete lines (rather than one
-/// interpolated blob) so ticket 48 (Streamable HTTP) can append an
-/// `origin: ...` line for a remote server's permission prompt without
-/// reshaping this format. Shared by both `request_permission` and
-/// `subagent_request_permission` below, which build identical prompt text
-/// for a `ToolCall` payload.
-///
-/// Ticket 48 (mcp-http-transport), PRD "MCP permissions": `origin` is
-/// `Some(url)` when `server` is an HTTP-transport MCP server (looked up by
-/// the caller from config, NOT carried on `PermissionPayload::ToolCall`
-/// itself -- see `mcp_http_origins`'s doc comment above for why), `None`
-/// for a stdio server. An HTTP server's origin is a data-exfiltration
-/// signal, so it's appended as its own line when present.
-fn format_tool_call_permission_text(
-    server: &str,
-    tool: &str,
-    input_pretty: &str,
-    origin: Option<&str>,
-) -> String {
-    let mut text = format!("server: {server}\ntool: {tool}\ninput: {input_pretty}");
-    if let Some(origin) = origin {
-        text.push_str(&format!("\norigin: {origin}"));
+/// Ticket 62 (memory-slash-command-opens-editor): resolves `/memory`'s edit
+/// target -- project-scope only (`cwd.join("AGENTS.md")`), deliberately with
+/// no fallback to `CLAUDE.md`. That fallback (see
+/// `rokr_config::load_project_context`) is a *read* convenience for
+/// assembling the system prompt when no `AGENTS.md` exists yet; `/memory`
+/// should never silently start editing a differently-named file the user
+/// didn't ask for. Creates an empty file if none exists yet (the ticket's
+/// "creating it if absent" requirement) but never truncates/overwrites an
+/// already-existing file.
+fn resolve_memory_path(cwd: &Path) -> io::Result<PathBuf> {
+    let path = cwd.join("AGENTS.md");
+    if !path.exists() {
+        std::fs::write(&path, "")?;
     }
-    text
+    Ok(path)
 }
 
 /// F-002: gates `/mcp reconnect <server>` to `Degraded` servers only --
@@ -1679,6 +1164,70 @@ fn mcp_reconnect_gate(status: &rokr_mcp::McpServerStatus) -> Result<(), &'static
         rokr_mcp::McpServerStatus::Degraded { .. } => Ok(()),
         rokr_mcp::McpServerStatus::Starting => Err("starting"),
         rokr_mcp::McpServerStatus::Ready => Err("connected"),
+    }
+}
+
+/// F-004 (pre-ship review): the set of command NAMES (the token
+/// immediately after the leading `/`, before any arguments) that the
+/// `command` closure's match arms above claim, kept as a single explicit
+/// list right next to that match so the two are easy to keep in sync by
+/// eye. `CommandRegistry` gains no built-in-name awareness of its own (ADR
+/// 0014, decision 3) -- this list lives entirely here, on the caller side,
+/// and is consulted by `resolve_custom_command` (built alongside
+/// `rokr_tui::run`'s call site) before it ever looks a name up in the
+/// registry, so a discovered custom command can never win a same-named
+/// collision with a builtin regardless of what arguments follow the name.
+///
+/// `memory` is included even though bare `/memory` is actually intercepted
+/// earlier, directly in rokr-tui's `event_loop`, before `resolve_custom_command`
+/// is ever consulted -- listed here anyway so a non-bare invocation like
+/// `/memory foo` (which DOES reach `resolve_custom_command`, since it isn't
+/// the exact bare string the `event_loop` intercept matches) is still
+/// treated as a reserved name rather than falling through to a same-named
+/// discovered command.
+fn is_builtin_command(name: &str) -> bool {
+    matches!(
+        name,
+        "model"
+            | "resume"
+            | "rollback"
+            | "search"
+            | "mcp"
+            | "hooks"
+            | "cost"
+            | "sessions"
+            | "compact"
+            | "memory"
+    )
+}
+
+#[cfg(test)]
+mod is_builtin_command_tests {
+    use super::*;
+
+    /// F-004 done-when (core of the fix): a name `command`'s match arms
+    /// claim -- like "cost" -- must be recognized as a builtin regardless
+    /// of what arguments a real invocation carries, since this check only
+    /// ever sees the bare NAME, never the full input string.
+    #[test]
+    fn recognizes_every_builtin_command_name() {
+        for name in [
+            "model", "resume", "rollback", "search", "mcp", "hooks", "cost", "sessions",
+            "compact", "memory",
+        ] {
+            assert!(
+                is_builtin_command(name),
+                "expected {name:?} to be recognized as a builtin command name"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_name_no_builtin_claims() {
+        assert!(
+            !is_builtin_command("my-command"),
+            "expected an arbitrary discovered-command name to NOT be treated as a builtin"
+        );
     }
 }
 
@@ -1825,7 +1374,11 @@ fn format_hooks_listing(
     let mut lines = Vec::new();
     for event in events {
         let active = SUPPORTED_HOOK_EVENTS.contains(&event.as_str());
-        let state = if active { "state=active" } else { "state=inactive" };
+        let state = if active {
+            "state=active"
+        } else {
+            "state=inactive"
+        };
         for entry in &hooks_config[event] {
             let matcher = entry.matcher.as_deref().unwrap_or("*");
             let timeout_ms = entry
@@ -1843,139 +1396,6 @@ fn format_hooks_listing(
         }
     }
     lines.join("\n")
-}
-
-/// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management
-/// decision 4: on a GRANTED write/edit permission decision, captures the
-/// file's pre-image under `sessions/<id>/snapshots/` (reusing the `old`
-/// content already computed for the permission-preview diff -- no new file
-/// read) and appends a correlating `Checkpoint` record. Called from BOTH
-/// `submit`'s own `request_permission` closure and the mirrored
-/// `subagent_request_permission` closure in `crates/rokr/src/main.rs`,
-/// after `permission.request(...)`'s decision comes back `true` -- a DENY
-/// must produce no snapshot and no `Checkpoint` record, which this
-/// signature enforces structurally: callers only invoke it once already
-/// inside their own `if granted` branch.
-///
-/// `diff_path_and_old` is `Some((path, old))` for a `PermissionPayload::Diff`
-/// (write/edit) and `None` for `PermissionPayload::Command` (bash) --
-/// bash-driven mutations are explicitly out of scope for checkpointing
-/// (documented gap, not oversight), so this is a no-op for that case,
-/// falling out of the match in the caller rather than a runtime
-/// special-case here.
-///
-/// No-ops (logging a warning, never panicking) if no session is currently
-/// active (persistence degraded at startup) -- checkpointing is best-effort
-/// alongside session persistence, not a separate hard requirement.
-///
-/// First-write-wins de-duplication (ticket 38 scope-amendment, F-001 per
-/// argus review): a turn's tool loop can mutate the SAME path more than
-/// once (e.g. `write` then `edit`) -- `CheckpointStore::snapshot`'s
-/// `newly_written` return only reports `true` for the first capture of a
-/// given `(turn_index, path)` key, and a `Checkpoint` record is appended
-/// ONLY when it's `true`. This avoids appending a second `Checkpoint`
-/// record with a duplicate `snapshot_id` for a later mutation whose `old`
-/// is already post-first-mutation content, not the real turn-start
-/// pre-image.
-///
-/// Known limitation (see this ticket's `## Scope Amendment`):
-/// `PermissionPayload::Diff`'s `old: String` field collapses "file did not
-/// exist" and "file existed but was empty" into the same empty string, with
-/// no separate boolean carried through (the architect's ruling fixed
-/// `Preview::Diff`/`PermissionPayload::Diff`'s shape to exactly `{ path,
-/// old, new }`, and adding a second field for this was judged out of scope
-/// for this ticket). So an empty `old` is treated here as "absent"
-/// (`None`), which is lossy for the rare case of a genuinely-empty
-/// pre-existing file -- `CheckpointStore::snapshot` itself DOES support the
-/// real distinction (`Option<&str>`), this call site just cannot supply it
-/// today.
-async fn capture_checkpoint_if_granted_diff(
-    diff_path_and_old: Option<(String, String)>,
-    data_dir: &std::path::Path,
-    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
-    turn_index: &std::sync::Mutex<usize>,
-) {
-    let Some((path, old)) = diff_path_and_old else {
-        return;
-    };
-
-    let session_handle_guard = session_handle.read().await;
-    let Some(session_handle) = session_handle_guard.as_ref() else {
-        // F-002 (argus review): matches this fn's own doc comment ("no-ops,
-        // logging a warning") -- persistence being degraded at startup is
-        // the same class of condition `create_session`'s own failure path
-        // (near the top of `main`) already logs via `eprintln!` rather than
-        // silently swallowing.
-        eprintln!(
-            "skipping pre-image checkpoint snapshot for {path}: no session is currently active"
-        );
-        return;
-    };
-
-    let current_turn_index = *turn_index.lock().unwrap();
-    let checkpoint_store = rokr_session::CheckpointStore::open(data_dir, session_handle.session_id());
-    let old_content: Option<&str> = if old.is_empty() { None } else { Some(old.as_str()) };
-
-    match checkpoint_store.snapshot(current_turn_index, &path, old_content) {
-        Ok((snapshot_id, newly_written)) => {
-            if newly_written {
-                session_handle.append_checkpoint(current_turn_index, snapshot_id);
-            }
-        }
-        Err(err) => {
-            eprintln!("failed to capture pre-image checkpoint snapshot for {path}: {err}");
-        }
-    }
-}
-
-/// The exact wrapper `rokr_core::compact_transcript` prepends to a fresh
-/// summary (and `rokr_session::fold` re-applies on resume). RULING 2 strips
-/// it back off before persisting a `Compaction` record's `summary` so the
-/// stored text is RAW -- storing the already-wrapped text would double-wrap
-/// it on the next resume.
-const COMPACTION_SUMMARY_WRAPPER_PREFIX: &str =
-    "[Earlier conversation summary — compacted to save context]\n\n";
-
-/// RULING 2 (architect ruling, phase-5): appends a `Compaction` record for a
-/// just-completed compaction, shared by BOTH the auto-compaction branch in
-/// `submit` and the manual `/compact` handler in `command`.
-///
-/// `compacted` is `compact_transcript`'s output: `compacted[0]` is the
-/// summary message with the wrapper prefix already baked in, and
-/// `compacted[1..]` is the untouched tail turn. This strips the wrapper back
-/// off `compacted[0]`'s text (falling back to the raw text if the prefix
-/// somehow isn't present) to recover the RAW summary to store, because
-/// `fold` re-applies that same wrapper on resume.
-///
-/// `raw_turn_count` is `*turn_index` at the compaction decision point (AFTER
-/// the per-turn increment in `submit`; the plain current value in
-/// `/compact`, which never increments). Compaction always retains exactly the
-/// tail turn (raw index `raw_turn_count - 1`), so the summary replaces
-/// through `(raw_turn_count - 1) - 1 == raw_turn_count - 2`. If that
-/// underflows (fewer than 2 raw turns -- `compact_transcript` should never
-/// return `Compacted` then, but guard defensively), NO record is appended.
-///
-/// No-ops if no session is currently active (persistence degraded at
-/// startup), matching `capture_checkpoint_if_granted_diff`'s handling.
-async fn append_compaction_record(
-    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
-    compacted: &[rokr_core::Message],
-    raw_turn_count: usize,
-) {
-    let Some(replaced_through) = raw_turn_count.checked_sub(2) else {
-        return;
-    };
-
-    let wrapped = compacted.first().map(|m| m.text()).unwrap_or_default();
-    let raw_summary = wrapped
-        .strip_prefix(COMPACTION_SUMMARY_WRAPPER_PREFIX)
-        .unwrap_or(&wrapped)
-        .to_string();
-
-    let guard = session_handle.read().await;
-    if let Some(handle) = guard.as_ref() {
-        handle.append_compaction(raw_summary, replaced_through);
-    }
 }
 
 /// Ticket 35 (resume-session): resolves a concrete `session_id` (already
@@ -2085,7 +1505,9 @@ async fn handle_resume_command(
     };
 
     let indexed_entry = match store.list_sessions() {
-        Ok(entries) => entries.into_iter().find(|entry| entry.session_id == target_id),
+        Ok(entries) => entries
+            .into_iter()
+            .find(|entry| entry.session_id == target_id),
         Err(err) => return format!("failed to look up session {target_id}: {err}"),
     };
 
@@ -2228,9 +1650,7 @@ async fn handle_rollback_command(
     };
 
     if target >= current_turn_index {
-        return format!(
-            "turn {target} is out of range (only turns 0..{current_turn_index} exist)"
-        );
+        return format!("turn {target} is out of range (only turns 0..{current_turn_index} exist)");
     }
 
     let session_handle_guard = session_handle.read().await;
@@ -2294,38 +1714,6 @@ async fn handle_rollback_command(
     )
 }
 
-/// Resolves the central data directory for session persistence:
-/// `$XDG_DATA_HOME/rokr` if `XDG_DATA_HOME` is set and non-empty,
-/// otherwise `$HOME/.local/share/rokr`. Mirrors
-/// `rokr_config::default_config_dir`'s exact resolution pattern (ticket 34:
-/// persist-new-sessions — PRD decision "Central storage, not per-project":
-/// all session data lives under `$XDG_DATA_HOME/rokr/`, not inside the
-/// project being worked on).
-fn default_data_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from(".local/share"));
-    base.join("rokr")
-}
-
-/// Returns the current time as a plain Unix-epoch-seconds string. There is
-/// no date/time-formatting crate in this workspace today (see
-/// `rokr-provider::auth`'s own `expires_at` field, which is a plain `u64`
-/// seconds-since-epoch for the same reason) — `SessionRecord`'s
-/// `created_at`/`timestamp` fields are typed `String` with no enforced
-/// format, so epoch seconds serialized as a string satisfies that type
-/// without pulling in a new dependency for this ticket.
-fn now_timestamp() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
-
 /// Resolves `name` to a concrete backend and writes it into the shared
 /// active-provider state under a single write lock (ticket 29: `/model`;
 /// F-003: one lock, one write, no second lock to keep in sync -- see
@@ -2342,7 +1730,9 @@ fn now_timestamp() -> String {
 /// before the switch) instead of resetting to `RetryPolicy::default()` on
 /// every switch.
 async fn set_active_provider(
-    active_provider: &tokio::sync::RwLock<rokr_provider::ResilientProvider<rokr_provider::AnyProvider>>,
+    active_provider: &tokio::sync::RwLock<
+        rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
+    >,
     config_dir: &std::path::Path,
     name: &str,
 ) -> Result<(), String> {
@@ -2367,9 +1757,111 @@ async fn set_active_provider(
     Ok(())
 }
 
+/// Ticket 57 (cost-command-and-headless-reporting): sums every `Turn`
+/// record's `UsageRecord` across `records` into one `rokr_core::Usage`,
+/// plus the model string off the `Header` record (empty if none is
+/// present). Deliberately NOT `rokr_session::fold` -- that function only
+/// keeps the LAST known usage per session (overwriting on every `Turn`, see
+/// its own doc comment), which is exactly wrong for `/cost`'s
+/// token-by-type breakdown, which needs the SUM across the whole session's
+/// history. A session's model can't change mid-session in today's schema
+/// (no per-`Turn` model field, same limitation `SessionIndexEntry::last_model`
+/// already documents), so a single `Header`-derived string is enough.
+fn fold_session_usage_and_model(records: &[rokr_session::SessionRecord]) -> (rokr_core::Usage, String) {
+    let mut usage = rokr_core::Usage::default();
+    let mut model = String::new();
+    for record in records {
+        match record {
+            rokr_session::SessionRecord::Header {
+                model: header_model, ..
+            } => {
+                model = header_model.clone();
+            }
+            rokr_session::SessionRecord::Turn {
+                usage: turn_usage, ..
+            } => {
+                let turn_usage: rokr_core::Usage = (*turn_usage).into();
+                usage.input_tokens += turn_usage.input_tokens;
+                usage.output_tokens += turn_usage.output_tokens;
+                usage.cache_read_tokens += turn_usage.cache_read_tokens;
+                usage.cache_write_tokens += turn_usage.cache_write_tokens;
+            }
+            rokr_session::SessionRecord::Compaction { .. }
+            | rokr_session::SessionRecord::Rollback { .. }
+            | rokr_session::SessionRecord::Checkpoint { .. } => {}
+        }
+    }
+    (usage, model)
+}
+
+/// Formats `/cost`'s token-by-type breakdown, cache-hit rate, and estimated
+/// dollar cost for one already-folded `usage` total. Cache-hit-rate formula
+/// mirrors `rokr-provider/src/anthropic.rs`'s own per-call calculation
+/// exactly (fraction of total prompt tokens -- input + cache-read +
+/// cache-write -- served from cache).
+fn format_cost_breakdown(usage: rokr_core::Usage, cost_usd: f64) -> String {
+    let total_prompt_tokens =
+        usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens;
+    let cache_hit_rate = if total_prompt_tokens > 0 {
+        usage.cache_read_tokens as f64 / total_prompt_tokens as f64
+    } else {
+        0.0
+    };
+    format!(
+        "Input tokens: {}\nOutput tokens: {}\nCache-read tokens: {}\nCache-write tokens: {}\nCache hit rate: {:.1}%\nEstimated cost: ${:.4}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+        cache_hit_rate * 100.0,
+        cost_usd
+    )
+}
+
+/// `/cost --all`: extends the same fold across EVERY session on disk
+/// (`store.list_sessions()`, PRD decision 2's index rather than a directory
+/// scan). Token counts are summed freely across sessions, but each
+/// session's dollar cost is computed against ITS OWN model's pricing before
+/// summing the dollar totals -- sessions can have different models/prices,
+/// so applying one session's rate to another's tokens would misprice it.
+async fn format_cost_all_summary(
+    store: &rokr_session::SessionStore,
+    model_pricing: &std::collections::HashMap<String, rokr_config::ModelPricing>,
+) -> String {
+    let entries = match store.list_sessions() {
+        Ok(entries) => entries,
+        Err(err) => return format!("failed to list sessions: {err}"),
+    };
+    if entries.is_empty() {
+        return "No sessions found.".to_string();
+    }
+
+    let mut total_usage = rokr_core::Usage::default();
+    let mut total_cost_usd = 0.0;
+    for entry in &entries {
+        let records = store.read_records(&entry.session_id);
+        let (usage, model) = fold_session_usage_and_model(&records);
+        let pricing_entry = model_pricing.get(&model).map(model_pricing_to_pricing_entry);
+        total_cost_usd += rokr_core::pricing::calculate_cost(usage, pricing_entry.as_ref());
+        total_usage.input_tokens += usage.input_tokens;
+        total_usage.output_tokens += usage.output_tokens;
+        total_usage.cache_read_tokens += usage.cache_read_tokens;
+        total_usage.cache_write_tokens += usage.cache_write_tokens;
+    }
+
+    format!(
+        "Sessions: {}\n{}",
+        entries.len(),
+        format_cost_breakdown(total_usage, total_cost_usd)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rokr_app::{
+        accumulate_user_turn, capture_checkpoint_if_granted_diff, COMPACTION_SUMMARY_WRAPPER_PREFIX,
+    };
     use rokr_core::{Message, Provider, Role};
     use rokr_session::UsageRecord;
 
@@ -2392,6 +1884,122 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Ticket 57 (cost-command-and-headless-reporting): `/cost`'s token
+    /// totals must be a SUM across every `Turn` record's `UsageRecord`, not
+    /// the last-known figure `rokr_session::fold` keeps (that function
+    /// overwrites `last_known_usage` on every `Turn`, see its own doc
+    /// comment) -- this proves the new, standalone summing fold actually
+    /// adds three turns' worth of each of the four token fields together,
+    /// and separately resolves the model string off the `Header` record.
+    #[test]
+    fn cost_command_folds_current_session_usage_records_into_token_and_dollar_summary() {
+        let records = vec![
+            rokr_session::SessionRecord::Header {
+                schema_version: 2,
+                session_id: "sess-1".to_string(),
+                created_at: "0".to_string(),
+                project_path: "/tmp/project".to_string(),
+                agent_tier: "plan".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+            },
+            rokr_session::SessionRecord::Turn {
+                messages: vec![],
+                usage: UsageRecord {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_tokens: 10,
+                    cache_write_tokens: 5,
+                },
+                timestamp: "1".to_string(),
+            },
+            rokr_session::SessionRecord::Turn {
+                messages: vec![],
+                usage: UsageRecord {
+                    input_tokens: 200,
+                    output_tokens: 75,
+                    cache_read_tokens: 20,
+                    cache_write_tokens: 0,
+                },
+                timestamp: "2".to_string(),
+            },
+            rokr_session::SessionRecord::Turn {
+                messages: vec![],
+                usage: UsageRecord {
+                    input_tokens: 300,
+                    output_tokens: 125,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 15,
+                },
+                timestamp: "3".to_string(),
+            },
+        ];
+
+        let (usage, model) = fold_session_usage_and_model(&records);
+
+        assert_eq!(usage.input_tokens, 600, "input tokens must be summed across all turns");
+        assert_eq!(usage.output_tokens, 250, "output tokens must be summed across all turns");
+        assert_eq!(
+            usage.cache_read_tokens, 30,
+            "cache-read tokens must be summed across all turns"
+        );
+        assert_eq!(
+            usage.cache_write_tokens, 20,
+            "cache-write tokens must be summed across all turns"
+        );
+        assert_eq!(model, "gpt-4o-mini", "model must be resolved off the Header record");
+    }
+
+    /// F-014: an empty record slice (e.g. a brand-new session with nothing
+    /// appended yet) must fold to a zero/default `Usage` and an empty model
+    /// string, not panic or produce garbage.
+    #[test]
+    fn fold_session_usage_and_model_returns_default_for_empty_records() {
+        let (usage, model) = fold_session_usage_and_model(&[]);
+
+        assert_eq!(usage, rokr_core::Usage::default());
+        assert_eq!(model, "", "no Header record means no model to resolve");
+    }
+
+    /// F-014: a session log containing only its `Header` record (no `Turn`s
+    /// appended yet, e.g. right after session creation and before the first
+    /// exchange) must fold to zero usage without panicking -- there's simply
+    /// nothing to sum.
+    #[test]
+    fn fold_session_usage_and_model_handles_header_only_records() {
+        let records = vec![rokr_session::SessionRecord::Header {
+            schema_version: 2,
+            session_id: "sess-header-only".to_string(),
+            created_at: "0".to_string(),
+            project_path: "/tmp/project".to_string(),
+            agent_tier: "plan".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+        }];
+
+        let (usage, model) = fold_session_usage_and_model(&records);
+
+        assert_eq!(usage, rokr_core::Usage::default(), "no Turn records means no usage to sum");
+        assert_eq!(model, "claude-test", "model must still resolve off the Header record");
+    }
+
+    /// F-014: an all-zero `Usage` (e.g. a session/header-only case with
+    /// nothing spent yet) must render a "0.0%" cache-hit rate, not a NaN or
+    /// divide-by-zero artifact, and must not panic.
+    #[test]
+    fn format_cost_breakdown_renders_zero_percent_cache_rate_for_default_usage() {
+        let breakdown = format_cost_breakdown(rokr_core::Usage::default(), 0.0);
+
+        assert!(
+            breakdown.contains("0.0%"),
+            "expected a clean 0.0% cache hit rate for all-zero usage, got: {breakdown}"
+        );
+        assert!(
+            !breakdown.contains("NaN"),
+            "cache hit rate must not be NaN when total prompt tokens is zero, got: {breakdown}"
+        );
     }
 
     #[test]
@@ -2440,20 +2048,25 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_test",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
             .mount(&mock_server)
             .await;
 
         let config_dir = unique_temp_dir("model-switch-env");
         std::env::set_var(rokr_provider::auth::ENV_FORCE_FILE_STORE, "1");
         std::env::set_var(rokr_provider::anthropic::ENV_BASE_URL, mock_server.uri());
-        std::env::set_var(rokr_provider::anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        std::env::set_var(
+            rokr_provider::anthropic::ENV_MODEL,
+            "claude-3-5-sonnet-20241022",
+        );
         std::env::set_var(rokr_provider::anthropic::ENV_API_KEY, "test-key");
 
         let initial = rokr_provider::AnyProvider::OpenAi(rokr_provider::OpenAiProvider::new(
@@ -2495,20 +2108,25 @@ mod tests {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_test",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
             .mount(&mock_server)
             .await;
 
         let config_dir = unique_temp_dir("model-switch-oauth");
         std::env::set_var(rokr_provider::auth::ENV_FORCE_FILE_STORE, "1");
         std::env::set_var(rokr_provider::anthropic::ENV_BASE_URL, mock_server.uri());
-        std::env::set_var(rokr_provider::anthropic::ENV_MODEL, "claude-3-5-sonnet-20241022");
+        std::env::set_var(
+            rokr_provider::anthropic::ENV_MODEL,
+            "claude-3-5-sonnet-20241022",
+        );
         // Deliberately absent -- this is the whole point of the test.
         std::env::remove_var(rokr_provider::anthropic::ENV_API_KEY);
 
@@ -2605,7 +2223,10 @@ mod tests {
             &current_session_id,
         )
         .await;
-        assert_eq!(already_on_reply, format!("already on session {current_session_id}"));
+        assert_eq!(
+            already_on_reply,
+            format!("already on session {current_session_id}")
+        );
         assert_eq!(
             transcript.lock().await.as_slice(),
             &[Message::user_text("existing turn")],
@@ -2778,7 +2399,11 @@ mod tests {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
-                .open(dir.join("sessions").join(&target_session_id).join("session.jsonl"))
+                .open(
+                    dir.join("sessions")
+                        .join(&target_session_id)
+                        .join("session.jsonl"),
+                )
                 .expect("target session.jsonl should be appendable");
             let line = serde_json::to_string(&rokr_session::SessionRecord::Compaction {
                 summary: "target session compacted summary".to_string(),
@@ -2817,7 +2442,10 @@ mod tests {
             &format!("{target_session_id} --yes"),
         )
         .await;
-        assert_eq!(reply, format!("Resumed {target_session_id}; continuing from its context"));
+        assert_eq!(
+            reply,
+            format!("Resumed {target_session_id}; continuing from its context")
+        );
         assert_eq!(
             *turn_index.lock().unwrap(),
             3,
@@ -2831,7 +2459,10 @@ mod tests {
                 .expect("resume_session should succeed for assembling the expected fixture");
             (messages, resume_state.last_known_usage)
         };
-        assert_eq!(transcript.lock().await.as_slice(), expected_messages.as_slice());
+        assert_eq!(
+            transcript.lock().await.as_slice(),
+            expected_messages.as_slice()
+        );
         assert!(
             transcript
                 .lock()
@@ -2854,7 +2485,9 @@ mod tests {
         // session.jsonl, not the origin's.
         {
             let guard = session_handle.read().await;
-            let handle = guard.as_ref().expect("session_handle should be repointed to target");
+            let handle = guard
+                .as_ref()
+                .expect("session_handle should be repointed to target");
             handle.append_turn(
                 vec![Message::user_text("post-jump new turn")],
                 UsageRecord {
@@ -2869,7 +2502,9 @@ mod tests {
         }
 
         let target_contents = std::fs::read_to_string(
-            dir.join("sessions").join(&target_session_id).join("session.jsonl"),
+            dir.join("sessions")
+                .join(&target_session_id)
+                .join("session.jsonl"),
         )
         .expect("target session.jsonl should exist");
         assert!(
@@ -2878,7 +2513,9 @@ mod tests {
         );
 
         let origin_contents = std::fs::read_to_string(
-            dir.join("sessions").join(&current_session_id).join("session.jsonl"),
+            dir.join("sessions")
+                .join(&current_session_id)
+                .join("session.jsonl"),
         )
         .expect("origin session.jsonl should still exist");
         assert!(
@@ -2936,7 +2573,10 @@ mod tests {
         // whose "old" is already the post-write content -- must be a no-op,
         // not a second Checkpoint record.
         capture_checkpoint_if_granted_diff(
-            Some((target_path.clone(), "intermediate-post-write-content".to_string())),
+            Some((
+                target_path.clone(),
+                "intermediate-post-write-content".to_string(),
+            )),
             &dir,
             &session_handle,
             &turn_index,
@@ -2982,7 +2622,9 @@ mod tests {
     async fn append_compaction_record_derives_replaced_through_and_stores_raw_summary() {
         let dir = unique_temp_dir("append-compaction-derivation");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -3018,7 +2660,11 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
             .filter(|record| matches!(record, rokr_session::SessionRecord::Compaction { .. }))
             .collect();
-        assert_eq!(compaction_records.len(), 1, "expected exactly one Compaction record");
+        assert_eq!(
+            compaction_records.len(),
+            1,
+            "expected exactly one Compaction record"
+        );
         match &compaction_records[0] {
             rokr_session::SessionRecord::Compaction {
                 summary,
@@ -3045,7 +2691,9 @@ mod tests {
     async fn append_compaction_record_skips_when_fewer_than_two_turns() {
         let dir = unique_temp_dir("append-compaction-guard");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -3092,7 +2740,9 @@ mod tests {
     async fn rollback_command_refuses_target_at_or_before_last_compaction_without_mutating() {
         let dir = unique_temp_dir("rollback-compaction-guard");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -3156,7 +2806,11 @@ mod tests {
             &[Message::user_text("live transcript")],
             "a refused rollback must not mutate the transcript"
         );
-        assert_eq!(*turn_index.lock().unwrap(), 3, "turn_index must be untouched");
+        assert_eq!(
+            *turn_index.lock().unwrap(),
+            3,
+            "turn_index must be untouched"
+        );
         session_handle.read().await.as_ref().unwrap().flush().await;
         let log_after =
             std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
@@ -3185,7 +2839,9 @@ mod tests {
     async fn rollback_command_refuses_when_compaction_enqueued_but_not_yet_flushed() {
         let dir = unique_temp_dir("rollback-compaction-unflushed");
         let store = rokr_session::SessionStore::open(&dir);
-        let handle = store.create_session().expect("create_session should succeed");
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
         let session_id = handle.session_id().to_string();
         handle.append_header(
             2,
@@ -3253,7 +2909,11 @@ mod tests {
             &[Message::user_text("live transcript")],
             "a refused rollback must not mutate the transcript"
         );
-        assert_eq!(*turn_index.lock().unwrap(), 3, "turn_index must be untouched");
+        assert_eq!(
+            *turn_index.lock().unwrap(),
+            3,
+            "turn_index must be untouched"
+        );
         session_handle.read().await.as_ref().unwrap().flush().await;
         let log_after =
             std::fs::read_to_string(dir.join("sessions").join(&session_id).join("session.jsonl"))
@@ -3435,8 +3095,8 @@ mod tests {
     /// here depends on there being no other OS thread that could race the
     /// writer task independently of this test's own explicit yield points.
     #[tokio::test]
-    async fn jump_flushes_origin_session_before_swapping_so_a_later_rejump_sees_the_pending_append(
-    ) {
+    async fn jump_flushes_origin_session_before_swapping_so_a_later_rejump_sees_the_pending_append()
+    {
         let dir = unique_temp_dir("resume-command-flush-before-jump");
         let store = rokr_session::SessionStore::open(&dir);
 
@@ -3526,6 +3186,44 @@ mod tests {
             "expected the pending unflushed turn appended to session A before the first jump \
              to have been flushed to session A's session.jsonl by handle_resume_command's \
              F-007 origin-flush, and therefore visible after re-jumping back to A"
+        );
+    }
+
+    /// Ticket 62 (memory-slash-command-opens-editor): `resolve_memory_path`
+    /// is project-scope only (`cwd.join("AGENTS.md")`, no CLAUDE.md
+    /// fallback -- that fallback belongs to `load_project_context`'s
+    /// system-prompt *read* convenience, not to `/memory`'s edit target).
+    /// Covers both halves of "creating it if absent": when no file exists
+    /// yet, the path is resolved AND an empty file is created there; when a
+    /// file already exists with content, the same path is resolved but the
+    /// existing content is left untouched (not clobbered/truncated) --
+    /// without this second assertion, an implementation that unconditionally
+    /// `fs::write`s an empty string would pass just as easily as the correct
+    /// create-if-absent one.
+    #[test]
+    fn memory_command_resolves_project_scope_file_path_creating_it_if_absent() {
+        let cwd = unique_temp_dir("memory-command-resolve");
+
+        let resolved = resolve_memory_path(&cwd).expect("should resolve/create the memory path");
+        let expected = cwd.join("AGENTS.md");
+        assert_eq!(resolved, expected, "should resolve to <cwd>/AGENTS.md");
+        assert!(expected.exists(), "AGENTS.md should have been created");
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            "",
+            "a freshly created AGENTS.md should be empty"
+        );
+
+        let existing_content = "pre-existing project memory content, must not be clobbered";
+        std::fs::write(&expected, existing_content).unwrap();
+
+        let resolved_again =
+            resolve_memory_path(&cwd).expect("should resolve the already-existing memory path");
+        assert_eq!(resolved_again, expected, "should still resolve to <cwd>/AGENTS.md");
+        assert_eq!(
+            std::fs::read_to_string(&expected).unwrap(),
+            existing_content,
+            "resolving an already-existing AGENTS.md must not truncate/clobber its contents"
         );
     }
 }

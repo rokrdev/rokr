@@ -431,3 +431,120 @@ async fn startup_uses_factory_constructed_provider_for_submit() {
          rokr_provider::factory::build_provider"
     );
 }
+
+
+/// Ticket 52 (clap-and-sessionrunner-extraction) acceptance test: the
+/// clap-generated `--help` must enumerate the same surface today's
+/// hand-rolled `USAGE` string documents -- `--agent`, `--resume`,
+/// `--continue`, and the `auth` (login) subcommand -- printed to stdout and
+/// exiting 0. RED before this ticket: the pre-clap binary had no `--help`
+/// handling at all; `--help` fell through the `--version`/`auth login`
+/// match to `parse_agent_tier`, which rejected it, printed `USAGE` to
+/// STDERR, and exited nonzero -- so `.assert().success()` fails today and
+/// only passes once clap owns argument parsing.
+#[test]
+fn rokr_help_lists_agent_resume_continue_and_auth_login_flags() {
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd.arg("--help").assert().success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in ["--agent", "--resume", "--continue", "auth"] {
+        assert!(
+            stdout.contains(needle),
+            "expected clap-generated `rokr --help` stdout to enumerate {needle:?} \
+             (matching today's USAGE string), got: {stdout}"
+        );
+    }
+}
+
+/// Ticket 53 (shell-completions-subcommand) acceptance test: `rokr
+/// completions zsh` must print a valid zsh completion script to stdout and
+/// exit 0. RED before this ticket: `completions` isn't a recognized
+/// subcommand yet, so clap rejects it as unknown and exits nonzero.
+#[test]
+fn rokr_completions_zsh_prints_valid_completion_script_to_stdout() {
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd.arg("completions").arg("zsh").assert().success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#compdef"),
+        "expected `rokr completions zsh` stdout to look like a zsh completion script \
+         (contain '#compdef'), got: {stdout}"
+    );
+    for needle in ["auth", "completions"] {
+        assert!(
+            stdout.contains(needle),
+            "expected `rokr completions zsh` stdout to mention the {needle:?} subcommand, \
+             got: {stdout}"
+        );
+    }
+}
+
+/// Ticket 67 (self-update-rokr-upgrade) acceptance test: `rokr upgrade`
+/// against a Homebrew-managed install (its own binary path resolving under
+/// a Homebrew Cellar prefix -- forced here via the test-only
+/// ROKR_UPGRADE_EXE_PATH_OVERRIDE env var, since the actual compiled test
+/// binary never really lives under /Cellar/) prints guidance directing the
+/// user to `brew upgrade` and exits 0, performing no axoupdater update
+/// check at all -- proven by never setting ROKR_UPGRADE_MOCK_CHECK_OUTCOME:
+/// if the Homebrew branch didn't short-circuit before constructing a
+/// checker, there would be nothing configured for it to fall back to and
+/// the run would fail or hang instead of cleanly succeeding. RED before
+/// this ticket: `upgrade` isn't a recognized subcommand yet, so clap
+/// rejects it as unknown and exits nonzero.
+#[test]
+fn rokr_upgrade_declines_and_prints_brew_upgrade_guidance_for_homebrew_managed_install() {
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("upgrade")
+        .env(
+            "ROKR_UPGRADE_EXE_PATH_OVERRIDE",
+            "/opt/homebrew/Cellar/rokr/1.2.3/bin/rokr",
+        )
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("brew upgrade"),
+        "expected stdout to direct the user to `brew upgrade`, got: {stdout:?}"
+    );
+}
+
+/// Ticket 67 (self-update-rokr-upgrade) acceptance test: `rokr upgrade`
+/// against a non-Homebrew install invokes the axoupdater-backed update
+/// check -- proven here via the test-only ROKR_UPGRADE_MOCK_CHECK_OUTCOME
+/// seam (no real network call is made in tests; see upgrade.rs's
+/// UpdateChecker trait), which stands in for the real AxoUpdateChecker.
+/// Forcing a specific "update available" outcome and asserting the printed
+/// version string flows straight through to stdout proves the non-Homebrew
+/// branch actually calls into the checker and acts on its result, rather
+/// than e.g. always taking the Homebrew short-circuit or silently no-op'ing.
+/// RED before this ticket: `upgrade` isn't a recognized subcommand at all
+/// yet; even once it is (see the Homebrew-managed test above), this stays
+/// RED until the mock-outcome env var is actually read and acted on.
+#[test]
+fn rokr_upgrade_invokes_axoupdater_check_for_non_homebrew_install() {
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("upgrade")
+        .env(
+            "ROKR_UPGRADE_EXE_PATH_OVERRIDE",
+            "/Users/bharat/.cargo/bin/rokr",
+        )
+        .env("ROKR_UPGRADE_MOCK_CHECK_OUTCOME", "update-available:9.9.9")
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("9.9.9"),
+        "expected stdout to report the mocked new version 9.9.9 (proving the non-Homebrew \
+         branch invoked and acted on the update checker), got: {stdout:?}"
+    );
+}

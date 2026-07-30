@@ -51,6 +51,28 @@ pub struct Config {
     /// test is the forward regression guard for once one exists (Phase 7).
     #[serde(default)]
     pub hooks: std::collections::HashMap<String, Vec<HookEntry>>,
+    /// Per-model USD pricing for cost calculation (ticket 56,
+    /// cost-pricing-math; ADR 0010 additive-optional field). Unlike
+    /// `mcp`/`hooks` above, an absent field does NOT default to an empty
+    /// map -- there IS a sane built-in default (a small table of known
+    /// models' published per-token rates), so a config file missing this
+    /// key still gets useful pricing out of the box. A user-supplied
+    /// `model_pricing` block in the file is MERGED, per-model, with these
+    /// built-in defaults (team-lead correction to ticket 56 -- see
+    /// `load_or_init`, which re-inserts every built-in default entry whose
+    /// key isn't already present after parsing): a named model key's
+    /// user-supplied rate wins over the built-in default for that key, but
+    /// any built-in default model the user's file doesn't mention still
+    /// resolves rather than disappearing. This is NOT the same
+    /// last-value-wins semantics `serde`'s field-level default gives every
+    /// other field here -- it's a deeper, key-level merge. `rokr-core`'s
+    /// `calculate_cost` (which this table feeds) is a separate, same-shaped
+    /// `PricingEntry` type in that crate -- `rokr-config` and `rokr-core`
+    /// have no dependency edge on each other, matching how `mcp`/`hooks`
+    /// above already define their own crate-local types rather than reusing
+    /// another crate's.
+    #[serde(default = "default_model_pricing")]
+    pub model_pricing: std::collections::HashMap<String, ModelPricing>,
 }
 
 /// One configured hook entry (PRD "Config schema"). `matcher` is a glob
@@ -78,12 +100,59 @@ pub struct HookEntry {
     pub blocking: Option<bool>,
 }
 
+/// Per-token USD pricing for one model (PRD "Cost accounting"). One rate
+/// per token type `rokr_core::Usage` tracks: input, output, cache-read,
+/// cache-write. A separate, same-shaped type from `rokr-core`'s
+/// `PricingEntry` -- see `Config::model_pricing`'s doc comment for why.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelPricing {
+    pub input_price_per_token: f64,
+    pub output_price_per_token: f64,
+    pub cache_read_price_per_token: f64,
+    pub cache_write_price_per_token: f64,
+}
+
 fn default_context_window_size() -> u32 {
     200_000
 }
 
 fn default_auto_compact_threshold() -> f64 {
     0.7
+}
+
+/// Built-in per-model pricing defaults (ticket 56, cost-pricing-math), used
+/// when `Config::model_pricing` is absent from the file. Approximate,
+/// published per-token USD rates (converted from the commonly quoted
+/// per-million-token prices) for a couple of models already referenced
+/// elsewhere in this codebase (`crates/rokr/src/main.rs`,
+/// `crates/rokr-session`). Not exhaustive -- an unlisted model simply has no
+/// entry, which `rokr-core::calculate_cost` treats as "unpriced" and falls
+/// back to `$0.00` rather than guessing.
+fn default_model_pricing() -> std::collections::HashMap<String, ModelPricing> {
+    let mut table = std::collections::HashMap::new();
+    table.insert(
+        "claude-3-5-sonnet-20241022".to_string(),
+        ModelPricing {
+            input_price_per_token: 0.000_003,
+            output_price_per_token: 0.000_015,
+            cache_read_price_per_token: 0.000_000_3,
+            cache_write_price_per_token: 0.000_003_75,
+        },
+    );
+    table.insert(
+        "gpt-4o-mini".to_string(),
+        ModelPricing {
+            input_price_per_token: 0.000_000_15,
+            output_price_per_token: 0.000_000_6,
+            cache_read_price_per_token: 0.000_000_075,
+            // OpenAI's prompt caching has no separate publicly quoted
+            // write-side rate at time of writing -- approximated here as
+            // equal to the input rate rather than left at 0.0, so a
+            // cache-write-heavy session isn't silently under-costed.
+            cache_write_price_per_token: 0.000_000_15,
+        },
+    );
+    table
 }
 
 /// Argus F-005: an MCP server block with no explicit `enabled` key defaults
@@ -264,6 +333,62 @@ pub fn load_project_context(cwd: &Path) -> Option<String> {
     }
 }
 
+/// One labeled memory segment, as returned by [`load_memory`]. Kept
+/// separate (rather than concatenated into one `String`, the way
+/// `load_project_context` folds AGENTS.md/CLAUDE.md today) so a future
+/// change can put each segment behind its own cache-control breakpoint
+/// without re-splitting a blob back apart.
+#[derive(Debug, Clone)]
+pub struct MemorySegment {
+    pub label: &'static str,
+    pub content: String,
+}
+
+/// Loads memory for both scopes rokr currently supports, in a fixed order:
+/// user-scope first, project-scope last.
+///
+/// - User scope: `AGENTS.md` directly under `config_dir` (typically
+///   [`default_config_dir`]'s result) -- always loaded when present,
+///   regardless of `cwd`. Unlike project scope, there is no CLAUDE.md
+///   fallback for user scope.
+/// - Project scope: unchanged existing behavior, delegating to
+///   [`load_project_context`] (AGENTS.md under `cwd`, falling back to
+///   CLAUDE.md) rather than duplicating its fallback logic. Skipped
+///   entirely when `cwd` is `None` -- see below.
+///
+/// `cwd` is `Option` (F-011 pre-ship review fix) because project-scope
+/// memory is inherently cwd-dependent but user-scope memory is not: a
+/// caller whose `std::env::current_dir()` failed (deleted cwd, some
+/// sandboxed/CI environments) has no sensible directory to walk for
+/// project-scope memory, but that failure has nothing to do with
+/// user-scope memory and must not suppress it too. Callers should convert
+/// a `current_dir()` error to `None` and still call this function
+/// unconditionally, rather than skipping the call (and losing user-scope
+/// memory) when cwd resolution fails.
+///
+/// Either, both, or neither may be present; the returned `Vec` contains
+/// only the segments that were actually found, still in user-then-project
+/// order.
+pub fn load_memory(config_dir: &Path, cwd: Option<&Path>) -> Vec<MemorySegment> {
+    let mut segments = Vec::new();
+
+    if let Ok(user_content) = std::fs::read_to_string(config_dir.join("AGENTS.md")) {
+        segments.push(MemorySegment {
+            label: "User memory",
+            content: user_content,
+        });
+    }
+
+    if let Some(project_content) = cwd.and_then(load_project_context) {
+        segments.push(MemorySegment {
+            label: "Project memory",
+            content: project_content,
+        });
+    }
+
+    segments
+}
+
 /// Load config from `config_dir/rokr.json`, creating it with `"version": 1`
 /// if it does not already exist. Never overwrites an existing file; an
 /// existing file is parsed and returned as-is.
@@ -295,8 +420,13 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
                 supported: 1,
             });
         }
+        let mut model_pricing = config.model_pricing;
+        for (model, entry) in default_model_pricing() {
+            model_pricing.entry(model).or_insert(entry);
+        }
         let config = Config {
             auto_compact_threshold: sanitized_auto_compact_threshold(config.auto_compact_threshold),
+            model_pricing,
             ..config
         };
         scaffold_agent_prompts(config_dir)?;
@@ -309,6 +439,7 @@ pub fn load_or_init(config_dir: &Path) -> Result<Config, ConfigError> {
         auto_compact_threshold: default_auto_compact_threshold(),
         mcp: std::collections::HashMap::new(),
         hooks: std::collections::HashMap::new(),
+        model_pricing: default_model_pricing(),
     };
     let json = serde_json::to_string_pretty(&config).expect("Config serialization is infallible");
     std::fs::write(&file_path, json)?;
@@ -830,6 +961,88 @@ mod tests {
         );
     }
 
+    /// Ticket 61 (memory-file-loading-user-and-project-scope): with both a
+    /// user-scope AGENTS.md (under the config dir) and a project-scope
+    /// AGENTS.md present, `load_memory` must return exactly two segments,
+    /// user-scope first and project-scope last, each carrying its own
+    /// distinct content untouched -- proving the fixed load order the
+    /// ticket specifies, not just "both present somewhere".
+    #[test]
+    fn load_memory_returns_user_then_project_segments_in_order_when_both_present() {
+        let temp_cwd = tempfile::tempdir().unwrap();
+        let temp_config = tempfile::tempdir().unwrap();
+        let user_content = "# User AGENTS.md\nDistinctiveUserMemoryContent.";
+        let project_content = "# Project AGENTS.md\nDistinctiveProjectMemoryContent.";
+        std::fs::write(temp_config.path().join("AGENTS.md"), user_content).unwrap();
+        std::fs::write(temp_cwd.path().join("AGENTS.md"), project_content).unwrap();
+
+        let segments = load_memory(temp_config.path(), Some(temp_cwd.path()));
+
+        assert_eq!(segments.len(), 2, "expected two segments when both scopes present, got: {segments:?}");
+        assert_eq!(segments[0].content, user_content, "user segment must come first");
+        assert_eq!(segments[1].content, project_content, "project segment must come last");
+        assert_ne!(segments[0].label, segments[1].label, "segments must carry distinct labels");
+    }
+
+    /// Ticket 61 (memory-file-loading-user-and-project-scope): the
+    /// neither/one-only combinations `load_memory_returns_user_then_project_
+    /// segments_in_order_when_both_present` doesn't cover -- neither scope
+    /// present yields an empty `Vec` (not an error, not a placeholder
+    /// segment), and either scope present alone yields exactly one segment
+    /// carrying that scope's own content.
+    #[test]
+    fn load_memory_returns_single_segment_when_only_one_scope_present_and_empty_when_neither() {
+        let temp_cwd_neither = tempfile::tempdir().unwrap();
+        let temp_config_neither = tempfile::tempdir().unwrap();
+        let segments = load_memory(temp_config_neither.path(), Some(temp_cwd_neither.path()));
+        assert!(
+            segments.is_empty(),
+            "expected empty segments when neither scope has a memory file, got: {segments:?}"
+        );
+
+        let temp_cwd_user_only = tempfile::tempdir().unwrap();
+        let temp_config_user_only = tempfile::tempdir().unwrap();
+        let user_content = "# User AGENTS.md\nUser-only memory content.";
+        std::fs::write(temp_config_user_only.path().join("AGENTS.md"), user_content).unwrap();
+        let segments = load_memory(temp_config_user_only.path(), Some(temp_cwd_user_only.path()));
+        assert_eq!(
+            segments.len(), 1,
+            "expected exactly one segment when only user scope present, got: {segments:?}"
+        );
+        assert_eq!(segments[0].content, user_content);
+
+        let temp_cwd_project_only = tempfile::tempdir().unwrap();
+        let temp_config_project_only = tempfile::tempdir().unwrap();
+        let project_content = "# Project AGENTS.md\nProject-only memory content.";
+        std::fs::write(temp_cwd_project_only.path().join("AGENTS.md"), project_content).unwrap();
+        let segments = load_memory(temp_config_project_only.path(), Some(temp_cwd_project_only.path()));
+        assert_eq!(
+            segments.len(), 1,
+            "expected exactly one segment when only project scope present, got: {segments:?}"
+        );
+        assert_eq!(segments[0].content, project_content);
+    }
+
+    /// F-011 (pre-ship review): user-scope memory has nothing to do with
+    /// cwd, so it must still load when `cwd` is `None` (the caller's
+    /// `std::env::current_dir()` failed) -- only the cwd-dependent
+    /// project-scope segment is skipped, gracefully, not as an error.
+    #[test]
+    fn load_memory_still_returns_user_segment_when_cwd_is_none() {
+        let temp_config = tempfile::tempdir().unwrap();
+        let user_content = "# User AGENTS.md\nUserMemorySurvivesMissingCwd.";
+        std::fs::write(temp_config.path().join("AGENTS.md"), user_content).unwrap();
+
+        let segments = load_memory(temp_config.path(), None);
+
+        assert_eq!(
+            segments.len(), 1,
+            "expected exactly the user-scope segment when cwd is None, got: {segments:?}"
+        );
+        assert_eq!(segments[0].label, "User memory");
+        assert_eq!(segments[0].content, user_content);
+    }
+
     /// Ticket 51 (mcp-hooks-introspection), docs/adr/0012-hooks-execution-trust-model.md
     /// decision 2 ("User-scope-only trust boundary"), PRD "Config schema":
     /// `mcp`/`hooks` must be loaded from user-scope config ONLY -- a
@@ -900,6 +1113,94 @@ mod tests {
         assert!(
             !config.mcp.contains_key("project-injected-server"),
             "project-local mcp block leaked into the loaded config"
+        );
+    }
+
+    /// Ticket 56 (cost-pricing-math), ADR 0010 additive-optional field: an
+    /// existing `rokr.json` with no `model_pricing` key must load with the
+    /// built-in per-model pricing defaults intact (not an empty map --
+    /// unlike `mcp`/`hooks`, which default to empty since there's no sane
+    /// built-in value for those), and the file must be byte-identical after
+    /// the load, exactly like every other additive-optional field above.
+    #[test]
+    fn config_missing_model_pricing_field_loads_with_built_in_defaults_and_is_never_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        let existing = r#"{"version": 1}"#;
+        std::fs::write(&file_path, existing).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        assert_eq!(
+            config.model_pricing,
+            default_model_pricing(),
+            "expected the built-in model_pricing defaults when the field is absent, got: {:?}",
+            config.model_pricing
+        );
+        assert!(
+            !config.model_pricing.is_empty(),
+            "expected non-empty built-in defaults, not an empty map like mcp/hooks default to"
+        );
+
+        let contents_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            contents_after, existing,
+            "existing config file lacking model_pricing must not be rewritten"
+        );
+    }
+
+    /// Team-lead correction to ticket 56 (cost-pricing-math): the PRD's
+    /// settled decision is a PER-MODEL merge, not wholesale replacement --
+    /// a user's `model_pricing` entry overrides ONLY that model key; any
+    /// built-in default model the user's file doesn't mention must still
+    /// resolve. Proven here with a file naming just one of the two built-in
+    /// models with clearly-distinct custom rates: the named model's custom
+    /// rate must win, and the OTHER built-in model (unmentioned by the
+    /// user) must still be present with its built-in default rate --
+    /// wholesale replacement would silently drop it.
+    #[test]
+    fn config_model_pricing_user_entry_overrides_only_its_own_model_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("rokr.json");
+        let existing = r#"{
+            "version": 1,
+            "model_pricing": {
+                "claude-3-5-sonnet-20241022": {
+                    "input_price_per_token": 0.000009,
+                    "output_price_per_token": 0.000045,
+                    "cache_read_price_per_token": 0.0000009,
+                    "cache_write_price_per_token": 0.00001125
+                }
+            }
+        }"#;
+        std::fs::write(&file_path, existing).unwrap();
+
+        let config = load_or_init(temp.path()).unwrap();
+
+        let custom = config
+            .model_pricing
+            .get("claude-3-5-sonnet-20241022")
+            .expect("expected the user's custom entry for claude-3-5-sonnet-20241022");
+        assert_eq!(
+            custom.input_price_per_token, 0.000009,
+            "the user's custom rate for the model they named must win"
+        );
+
+        let expected_default_gpt = default_model_pricing()
+            .get("gpt-4o-mini")
+            .copied()
+            .expect("expected gpt-4o-mini in the built-in defaults");
+        assert_eq!(
+            config.model_pricing.get("gpt-4o-mini"),
+            Some(&expected_default_gpt),
+            "a built-in default model the user's file didn't mention must still resolve, got: {:?}",
+            config.model_pricing.get("gpt-4o-mini")
+        );
+
+        let contents_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            contents_after, existing,
+            "a partial model_pricing override must not cause the file to be rewritten"
         );
     }
 }

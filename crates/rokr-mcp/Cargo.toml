@@ -70,3 +70,16 @@ wiremock = { workspace = true }
 [[bin]]
 name = "fake_mcp_server"
 path = "tests/fixtures/fake_mcp_server.rs"
+
+# Ticket 66 (cargo-dist-release-spine): `dist = false` tells `cargo dist`
+# not to treat this test-fixture binary as a release "app". Not in that
+# ticket's files-touched list, but mechanically required -- cargo-dist's
+# package discovery (via `cargo metadata`) sweeps in every `[[bin]]`
+# target across the whole Cargo workspace as a distributable app, and
+# there is no dist-workspace.toml-level override for excluding a specific
+# sub-package's binary; the opt-out only exists as per-package metadata in
+# that package's own Cargo.toml. Flagged in ticket 66's report as a
+# deviation, analogous to ticket 44/49's pre-authorized mechanical
+# dependency-edge additions to crates/rokr/Cargo.toml.
+[package.metadata.dist]
+dist = false
