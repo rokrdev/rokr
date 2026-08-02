@@ -48,6 +48,23 @@ pub trait PermissionRequester: Clone + Send + Sync + 'static {
         &self,
         request: rokr_tui::PermissionRequest,
     ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send;
+
+    /// R-002 (post-round-1 re-critique, major): called when
+    /// `permission_policy::PermissionPolicy::resolve` has ALREADY resolved
+    /// `Resolution::Deny` for a gated tool call -- an explicit permission-mode
+    /// denial, decided upstream of any human interaction. ADR 0016 Decision 1
+    /// is unambiguous: "only `Resolution::Prompt` is meant to ever reach ...
+    /// `request_permission`." Routing `Deny` through the same callback as
+    /// `Prompt` (round-1's fix) violated that -- a latent hazard, since any
+    /// future interactive driver honoring a permission mode could let a
+    /// single accidental keypress at the prompt override an explicit
+    /// deny-mode denial. Default no-op: only `HeadlessPermissionRequester`
+    /// needs to record anything here (for its `denied` bookkeeping, used for
+    /// `subtype: error_permission`); the interactive TUI's `PermissionHandle`
+    /// never has an ambient `permission_mode` (always `None`), so
+    /// `Resolution::Deny` is structurally unreachable for it and it never
+    /// needs to override this.
+    fn note_denied_without_prompt(&self) {}
 }
 
 impl PermissionRequester for rokr_tui::PermissionHandle {
@@ -136,6 +153,20 @@ pub struct SessionRunner {
     /// `Arc<std::sync::Mutex<..>>` shape exactly -- a plain sync mutex is
     /// fine here since the lock is never held across an `.await`.
     pub session_grants: Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
+    /// Pre-ship review F-005 (major): the headless-equivalent permission
+    /// mode this runner resolves gated calls against, threaded into BOTH
+    /// `crate::permission_policy::PermissionPolicy::resolve` call sites
+    /// this runner drives (the parent's own closure below, and --
+    /// forwarded through `subagent::SubagentTool` -- `run_subagent`'s).
+    /// `None` for the interactive TUI path (it has no ambient permission
+    /// mode at all, see `PermissionPolicy::resolve`'s doc comment);
+    /// `Some(mode)` for the headless path. Before this fix, headless
+    /// resolved permission modes through its own parallel code path
+    /// (`HeadlessPermissionRequester::request` independently re-deriving
+    /// the same mode dispatch) instead of ever calling
+    /// `PermissionPolicy::resolve` -- exactly the dual-resolver
+    /// architecture the PRD forbade.
+    pub permission_mode: Option<crate::cli::PermissionMode>,
 }
 
 impl SessionRunner {
@@ -170,6 +201,7 @@ impl SessionRunner {
         let auto_compact_threshold = self.auto_compact_threshold;
         let max_iterations = self.max_iterations;
         let session_grants = self.session_grants.clone();
+        let permission_mode = self.permission_mode;
         async move {
             let provider = provider?;
             // F-003: ONE read lock, ONE clone of the current
@@ -235,6 +267,13 @@ impl SessionRunner {
             // gated tool calls round-trip through the identical
             // channel the parent's own gated tool calls do.
             let subagent_permission = permission.clone();
+            // R-002 (post-round-1 re-critique, major): a SEPARATE clone,
+            // moved into its own tiny side-effect-only closure below
+            // (`subagent_note_denied`) -- `subagent_permission` above is
+            // itself moved into the `subagent_request_permission` closure
+            // further down, so this needs its own independent clone taken
+            // before that move happens.
+            let subagent_note_denied_permission = subagent_permission.clone();
 
             // Ticket 38 (checkpoint-pre-images): both
             // `request_permission` below and the mirrored
@@ -317,15 +356,16 @@ impl SessionRunner {
                     };
                     // Ticket 72 (`tui-session-allowlist-grant`): resolved
                     // BEFORE ever reaching the interactive prompt below.
-                    // `mode: None` -- the interactive TUI has no ambient
-                    // permission mode (`--permission-mode` stays
-                    // headless-only, see `permission_policy::resolve`'s doc
-                    // comment). The lock is dropped immediately (not held
-                    // across the `.await` in the `Prompt` arm below).
+                    // Pre-ship review F-005: `permission_mode` (threaded
+                    // from `SessionRunner`, `None` for the TUI / `Some(mode)`
+                    // for headless) replaces a hardcoded `None` here -- see
+                    // `SessionRunner::permission_mode`'s doc comment. The
+                    // lock is dropped immediately (not held across the
+                    // `.await` in the match arm below).
                     let resolution = {
                         let grants = session_grants.lock().unwrap();
                         crate::permission_policy::PermissionPolicy::resolve(
-                            None,
+                            permission_mode,
                             &request.tool_name,
                             None,
                             &grants,
@@ -335,11 +375,24 @@ impl SessionRunner {
                         // A prior "remember for this session" grant already
                         // covers this tool -- skip the prompt entirely.
                         crate::permission_policy::Resolution::Allow => true,
-                        // Structurally unreachable with `mode: None` today
-                        // (`None` only ever yields `Allow` or `Prompt`, see
-                        // `permission_policy::resolve`) -- kept so the match
-                        // stays exhaustive against `Resolution`'s full shape.
-                        crate::permission_policy::Resolution::Deny => false,
+                        // R-002 (post-round-1 re-critique, major): an
+                        // explicit permission-mode denial must NEVER reach
+                        // the human-facing prompt callback -- ADR 0016
+                        // Decision 1 ("only Prompt reaches the callback").
+                        // Round-1's fix (F-005) merged this arm with
+                        // `Prompt` below, which was itself the bug this
+                        // fixes: `note_denied_without_prompt` is the
+                        // side-effect-only leaf that lets
+                        // `HeadlessPermissionRequester` still record the
+                        // denial (for `subtype: error_permission`) without
+                        // ever invoking `permission.request`.
+                        crate::permission_policy::Resolution::Deny => {
+                            permission.note_denied_without_prompt();
+                            false
+                        }
+                        // Only `Resolution::Prompt` ever reaches
+                        // `permission.request` -- the real, human-facing
+                        // permission round trip.
                         crate::permission_policy::Resolution::Prompt => {
                             let decision = permission
                                 .request(rokr_tui::PermissionRequest {
@@ -433,17 +486,19 @@ impl SessionRunner {
                         // up, in `subagent::run_subagent`, on the call's
                         // ORIGINAL (untagged) tool name -- BEFORE this
                         // closure is ever invoked at all when a session-wide
-                        // grant already covers it. This closure only runs
-                        // for the `Resolution::Prompt` case (or when
-                        // `run_subagent`'s own consultation isn't reachable,
-                        // which doesn't happen in practice): it still does
-                        // NOT re-consult `PermissionPolicy` itself, nor
-                        // record new grants from a subagent's own
-                        // `AllowAndRemember` choice (that would require
-                        // widening this closure's `bool`-only return type to
-                        // carry the full `PermissionDecision`, which this
-                        // ticket's acceptance criteria don't require -- see
-                        // ticket 74's report for the full rationale).
+                        // grant already covers it. R-002 (post-round-1
+                        // re-critique, major): `run_subagent` now also
+                        // intercepts `Resolution::Deny` itself (via its own
+                        // `note_denied_without_prompt` callback), so this
+                        // closure is invoked ONLY for `Resolution::Prompt` --
+                        // never for a `Deny`-mode denial. It still does NOT
+                        // re-consult `PermissionPolicy` itself, nor record
+                        // new grants from a subagent's own `AllowAndRemember`
+                        // choice (that would require widening this closure's
+                        // `bool`-only return type to carry the full
+                        // `PermissionDecision`, which this ticket's
+                        // acceptance criteria don't require -- see ticket
+                        // 74's report for the full rationale).
                         let decision = permission
                             .request(rokr_tui::PermissionRequest {
                                 tool_name: request.tool_name,
@@ -467,6 +522,15 @@ impl SessionRunner {
                         granted
                     })
                 });
+            // R-002 (post-round-1 re-critique, major): the side-effect-only
+            // counterpart to `subagent_request_permission` above --
+            // `run_subagent` calls this instead of `subagent_request_permission`
+            // when `PermissionPolicy::resolve` already decided
+            // `Resolution::Deny`, so a permission-mode denial never reaches
+            // the human-facing callback. See `subagent::NoteDeniedCallback`'s
+            // doc comment.
+            let subagent_note_denied: subagent::NoteDeniedCallback =
+                Box::new(move || subagent_note_denied_permission.note_denied_without_prompt());
             // F-003/F-004: the SAME single provider snapshot the
             // send path below uses, resilience-wrapped -- no longer
             // a separately-tracked bare `AnyProvider`.
@@ -474,7 +538,12 @@ impl SessionRunner {
                 provider.clone(),
                 config_dir.clone(),
                 subagent_request_permission,
+                subagent_note_denied,
                 session_grants.clone(),
+                // Pre-ship review F-005: the SAME `permission_mode` the
+                // parent's own closure resolves against, forwarded into
+                // `run_subagent`'s `PermissionPolicy::resolve` call.
+                permission_mode,
             );
 
             // PC-1 ruling (supersedes ticket 46's whole-session
@@ -1186,6 +1255,47 @@ mod tests {
         dir
     }
 
+    /// Pre-ship review F-013 (nit): RAII guard for a test-only scratch
+    /// directory -- best-effort removes it on `Drop`, so it doesn't leak on
+    /// disk if the test panics/fails before reaching the end of the
+    /// function (the pre-fix pattern was a manual `std::fs::remove_dir_all`
+    /// call at the very end of the test body, which a panicking assertion
+    /// anywhere above it would skip entirely). Derefs to `PathBuf` so
+    /// existing `.clone()` / `.join(...)` call sites need no other changes.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        /// Creates and wraps a fresh scratch directory named via
+        /// `unique_temp_dir`.
+        fn new(label: &str) -> Self {
+            Self(unique_temp_dir(label))
+        }
+
+        /// Wraps (creating if needed) a scratch directory at an explicit
+        /// `path` -- for scratch dirs that must live somewhere other than
+        /// the system temp dir (e.g. under the sandboxed `bash` tool's
+        /// confined cwd, which must be a workspace-local directory, not an
+        /// arbitrary system temp path).
+        fn at(path: std::path::PathBuf) -> Self {
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = std::path::PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// `SessionRunner` must reproduce the pre-extraction `submit` closure's
     /// orchestration: a single Plan-tier submission, driven against a mocked
     /// provider, assembles the tool set, runs `rokr_core::run_tool_loop`,
@@ -1236,8 +1346,8 @@ mod tests {
         let (status_tx, _status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
         let (mcp_notice_tx, _mcp_notice_rx) = std::sync::mpsc::channel::<String>();
 
-        let config_dir = unique_temp_dir("runner-config");
-        let data_dir = unique_temp_dir("runner-data");
+        let config_dir = ScratchDir::new("runner-config");
+        let data_dir = ScratchDir::new("runner-data");
 
         let runner = SessionRunner {
             provider,
@@ -1260,6 +1370,7 @@ mod tests {
             auto_compact_threshold: 0.7,
             max_iterations: None,
             session_grants: Arc::new(Mutex::new(crate::permission_policy::SessionGrants::new())),
+            permission_mode: None,
         };
 
         let reply = runner
@@ -1281,8 +1392,8 @@ mod tests {
         // the same post-`append_turn` increment the old closure did.
         assert_eq!(*runner.turn_index.lock().unwrap(), 1);
 
-        let _ = std::fs::remove_dir_all(&config_dir);
-        let _ = std::fs::remove_dir_all(&data_dir);
+        // `config_dir`/`data_dir` are `ScratchDir`s -- cleaned up via their
+        // own `Drop` impl (F-013), including on an early panic above.
     }
 
     /// Ticket 72 (`tui-session-allowlist-grant`): a permission surface
@@ -1330,17 +1441,14 @@ mod tests {
         // calls below (config_dir/data_dir, never touched by the sandboxed
         // subprocess), the bash-writable target dir must live UNDER the
         // test process's actual current directory.
-        let target_dir = std::env::current_dir()
-            .unwrap()
-            .join(format!(
-                "rokr-runner-remember-target-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        std::fs::create_dir_all(&target_dir).unwrap();
+        let target_dir = ScratchDir::at(std::env::current_dir().unwrap().join(format!(
+            "rokr-runner-remember-target-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
         let marker_one = target_dir.join("remember-marker-one");
         let marker_two = target_dir.join("remember-marker-two");
         let command_one = format!("touch {}", marker_one.to_string_lossy());
@@ -1465,8 +1573,8 @@ mod tests {
         let (status_tx, _status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
         let (mcp_notice_tx, _mcp_notice_rx) = std::sync::mpsc::channel::<String>();
 
-        let config_dir = unique_temp_dir("runner-remember-config");
-        let data_dir = unique_temp_dir("runner-remember-data");
+        let config_dir = ScratchDir::new("runner-remember-config");
+        let data_dir = ScratchDir::new("runner-remember-data");
 
         let runner = SessionRunner {
             provider,
@@ -1492,6 +1600,7 @@ mod tests {
             auto_compact_threshold: 0.7,
             max_iterations: None,
             session_grants: Arc::new(Mutex::new(crate::permission_policy::SessionGrants::new())),
+            permission_mode: None,
         };
 
         let requester = RememberOnceRequester {
@@ -1542,8 +1651,170 @@ mod tests {
              short-circuited to Allow using the grant recorded from the first call"
         );
 
-        let _ = std::fs::remove_dir_all(&config_dir);
-        let _ = std::fs::remove_dir_all(&data_dir);
-        let _ = std::fs::remove_dir_all(&target_dir);
+        // `config_dir`/`data_dir`/`target_dir` are `ScratchDir`s -- cleaned
+        // up via their own `Drop` impl (F-013), including on an early
+        // panic above.
+    }
+
+    /// R-002 (post-round-1 re-critique, major): a permission surface whose
+    /// `request` panics if ever invoked, and whose
+    /// `note_denied_without_prompt` records that it fired. Proves ADR 0016
+    /// Decision 1 ("only Prompt reaches the callback") end to end through
+    /// `SessionRunner::run_submission`'s real `request_permission` closure --
+    /// not just `PermissionPolicy::resolve` in isolation, which was already
+    /// correct pre-fix (`permission_policy.rs`'s own tests never touched the
+    /// closure that merged Deny back into the prompt path).
+    #[derive(Clone)]
+    struct PanicsOnRequestRequester {
+        denied_without_prompt_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PermissionRequester for PanicsOnRequestRequester {
+        fn request(
+            &self,
+            _request: rokr_tui::PermissionRequest,
+        ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send {
+            async {
+                panic!(
+                    "request() must never be invoked for a Deny-mode denial (R-002) -- only \
+                     Resolution::Prompt may reach the human-facing permission callback"
+                );
+            }
+        }
+
+        fn note_denied_without_prompt(&self) {
+            self.denied_without_prompt_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// R-002: a `bash` call under `--permission-mode deny` must be denied
+    /// via `note_denied_without_prompt` alone, WITHOUT ever invoking
+    /// `permission.request` -- against round-1's merged Deny|Prompt arm,
+    /// this test would panic inside `PanicsOnRequestRequester::request`
+    /// instead of completing.
+    #[tokio::test]
+    async fn deny_mode_bash_call_never_reaches_request_only_note_denied_without_prompt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-deny-mode-bash-1",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": serde_json::json!({ "command": "echo should-not-run" }).to_string()
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }
+                ]
+            })))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-deny-mode-bash-1-final",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "DeniedReply" },
+                        "finish_reason": "stop"
+                    }
+                ]
+            })))
+            .mount(&mock)
+            .await;
+
+        let any = rokr_provider::AnyProvider::OpenAi(rokr_provider::OpenAiProvider::new(
+            mock.uri(),
+            "gpt-4o-mini",
+            "test-key",
+        ));
+        let policy = rokr_provider::RetryPolicy {
+            max_attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            max_elapsed: std::time::Duration::from_secs(5),
+        };
+        let resilient = rokr_provider::ResilientProvider::with_policy(any, policy);
+        let provider: Result<SharedProvider, String> =
+            Ok(Arc::new(tokio::sync::RwLock::new(resilient)));
+
+        let (status_tx, _status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
+        let (mcp_notice_tx, _mcp_notice_rx) = std::sync::mpsc::channel::<String>();
+
+        let config_dir = ScratchDir::new("runner-deny-mode-config");
+        let data_dir = ScratchDir::new("runner-deny-mode-data");
+
+        let runner = SessionRunner {
+            provider,
+            transcript: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            system_prompt: "you are a test agent".to_string(),
+            repo_map: Arc::new(Mutex::new(None)),
+            last_known_usage: Arc::new(Mutex::new(None)),
+            last_turn_usage: Arc::new(Mutex::new(None)),
+            config_dir: config_dir.clone(),
+            session_handle: Arc::new(tokio::sync::RwLock::new(None)),
+            turn_index: Arc::new(Mutex::new(0)),
+            data_dir: data_dir.clone(),
+            status_tx,
+            mcp_server_handles: Arc::new(Vec::new()),
+            mcp_notice_tx,
+            mcp_http_origins: Arc::new(HashMap::new()),
+            hooks_config: Arc::new(HashMap::new()),
+            // Build tier: `bash` must be in the tool set for this gated
+            // call to happen at all.
+            agent: AgentTier::Build,
+            context_window_size: 200_000,
+            auto_compact_threshold: 0.7,
+            max_iterations: None,
+            session_grants: Arc::new(Mutex::new(crate::permission_policy::SessionGrants::new())),
+            permission_mode: Some(crate::cli::PermissionMode::Deny),
+        };
+
+        let requester = PanicsOnRequestRequester {
+            denied_without_prompt_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let reply = runner
+            .run_submission("please run a bash command".to_string(), requester.clone())
+            .await
+            .expect("run_submission should reach a terminal Ok state even though the gated call was denied");
+
+        assert!(
+            reply.contains("DeniedReply"),
+            "expected the final reply to contain the provider's text, got: {reply}"
+        );
+        assert_eq!(
+            requester
+                .denied_without_prompt_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "note_denied_without_prompt should have been called exactly once for the denied \
+             bash call"
+        );
+
+        // `config_dir`/`data_dir` are `ScratchDir`s -- cleaned up via their
+        // own `Drop` impl (F-013), including on an early panic above.
     }
 }

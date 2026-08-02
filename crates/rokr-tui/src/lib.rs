@@ -203,6 +203,37 @@ impl TuiError {
     }
 }
 
+/// Whether `tool_name` is a subagent-tagged permission request, i.e.
+/// formatted by `rokr-app`'s `subagent::tag_permission_request` as
+/// `"{tool} (subagent: {name})"`. Pre-ship review F-011 (minor): used to
+/// suppress the `[r]` remember affordance for subagent-tagged requests --
+/// see [`permission_hint_line`].
+fn is_subagent_tagged_tool_name(tool_name: &str) -> bool {
+    tool_name.contains("(subagent:")
+}
+
+/// The `[y]/[n]/[r]` hint line shown under a permission prompt.
+///
+/// Pre-ship review F-010 (minor): the old `[r] remember` hint hid that
+/// pressing `r` grants TOOL-WIDE, SESSION-SCOPED access, not a one-off --
+/// this names the tool and says "this session" explicitly.
+///
+/// Pre-ship review F-011 (minor): the `[r]` affordance is suppressed
+/// entirely for a subagent-tagged request. A subagent's `AllowAndRemember`
+/// choice is silently downgraded to a one-shot allow (see `rokr-app`'s
+/// `subagent.rs`, `tagged_request_permission`'s `PermissionCallback`, which
+/// only returns `bool` -- no way to signal "remember"), so offering an
+/// affordance that silently does nothing useful would be actively
+/// misleading. Widening `PermissionCallback`'s signature to support
+/// remember for subagents for real is deferred as follow-up work.
+fn permission_hint_line(tool_name: &str) -> String {
+    if is_subagent_tagged_tool_name(tool_name) {
+        "[y] allow once  [n] deny".to_string()
+    } else {
+        format!("[y] allow once  [n] deny  [r] always allow \"{tool_name}\" this session")
+    }
+}
+
 /// Render `state` into `frame`, split top-to-bottom into Header (fixed
 /// height), View (flexible), and Prompt (fixed height) sections. Pure
 /// function — no I/O — so it is unit-testable against any ratatui backend,
@@ -236,7 +267,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
                 view_lines.extend(truncate_diff(diff_lines(old, new)));
             }
         }
-        view_lines.push("[y] allow  [n] deny  [r] remember".to_string());
+        view_lines.push(permission_hint_line(&request.tool_name));
     } else if state.pending {
         view_lines.push("...".to_string());
     }
@@ -824,6 +855,35 @@ where
     )
 }
 
+/// Drains AT MOST one pending permission request from `perm_rx` into
+/// `state`/`pending_permission_responder`, returning `true` if it did
+/// (caller should mark itself dirty). Pre-ship review F-004 (major): only
+/// polls `perm_rx` when NO request is already pending a keypress -- the
+/// pre-fix bug ran `perm_rx.try_recv()` unconditionally on every loop
+/// iteration, so a second request arriving while the first was still
+/// awaiting a decision would overwrite `pending_permission_responder`,
+/// silently dropping the first request's oneshot sender (which
+/// `PermissionHandle::request` then treats as an auto-deny via
+/// `unwrap_or`). `mpsc::Receiver` already buffers, so a queued second
+/// request simply waits until the NEXT call, once the first has been
+/// answered and `pending_permission_responder` cleared.
+fn poll_next_permission_request(
+    perm_rx: &mpsc::Receiver<(PermissionRequest, oneshot::Sender<PermissionDecision>)>,
+    state: &mut AppState,
+    pending_permission_responder: &mut Option<oneshot::Sender<PermissionDecision>>,
+) -> bool {
+    if pending_permission_responder.is_some() {
+        return false;
+    }
+    if let Ok((request, responder)) = perm_rx.try_recv() {
+        state.permission_request = Some(request);
+        *pending_permission_responder = Some(responder);
+        true
+    } else {
+        false
+    }
+}
+
 fn event_loop<F, Fut, C, Fut2, M, M2>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
@@ -885,9 +945,7 @@ where
             dirty = false;
         }
 
-        if let Ok((request, responder)) = perm_rx.try_recv() {
-            state.permission_request = Some(request);
-            pending_permission_responder = Some(responder);
+        if poll_next_permission_request(&perm_rx, state, &mut pending_permission_responder) {
             dirty = true;
         }
 
@@ -1509,6 +1567,81 @@ mod tests {
         );
     }
 
+    /// Pre-ship review F-010 (minor): the old `[r] remember` hint hid that
+    /// pressing `r` grants TOOL-WIDE, SESSION-SCOPED access, not a one-off
+    /// -- the new hint must name the actual tool and say "this session"
+    /// explicitly.
+    #[test]
+    fn permission_prompt_hint_names_tool_and_session_scope_for_remember() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            permission_request: Some(PermissionRequest {
+                tool_name: "bash".to_string(),
+                detail: PermissionDetail::Text("some command".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rendered = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("allow once") && rendered.contains("deny"),
+            "expected the one-off allow/deny hints to still be present: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("always allow \"bash\" this session"),
+            "expected the hint to name the tool (\"bash\") and say \"this session\" \
+             explicitly, not just '[r] remember': {rendered:?}"
+        );
+    }
+
+    /// Pre-ship review F-011 (minor): a subagent's `AllowAndRemember`
+    /// choice is silently downgraded to a one-shot allow (see
+    /// `subagent.rs`'s `tagged_request_permission`), so the `[r]`
+    /// affordance must be suppressed entirely for a subagent-tagged
+    /// request -- offering it would be actively misleading (it looks like
+    /// it should remember, but silently doesn't). A non-subagent-tagged
+    /// request must still show it (contrast case).
+    #[test]
+    fn permission_prompt_hint_suppresses_remember_for_subagent_tagged_request() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            permission_request: Some(PermissionRequest {
+                tool_name: "bash (subagent: reviewer)".to_string(),
+                detail: PermissionDetail::Text("some command".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rendered = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("allow once") && rendered.contains("deny"),
+            "expected the one-off allow/deny hints to still be present: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("[r]"),
+            "expected the [r] remember affordance to be ABSENT for a subagent-tagged \
+             request (it silently does nothing useful for subagents): {rendered:?}"
+        );
+    }
+
     #[test]
     fn truncate_diff_leaves_short_diffs_untouched() {
         let lines: Vec<String> = (0..5).map(|i| format!("-{i}")).collect();
@@ -1581,6 +1714,92 @@ mod tests {
         assert_eq!(
             handle_permission_key(KeyCode::Char('x'), KeyModifiers::NONE),
             PermissionKeyAction::Ignore
+        );
+    }
+
+    /// Pre-ship review F-004 (major): two `PermissionRequest`s queued on
+    /// `perm_rx` before either is answered must NOT collide -- the second
+    /// must not overwrite `pending_permission_responder` (silently dropping
+    /// the first request's oneshot sender, which `PermissionHandle::request`
+    /// treats as an auto-deny via `unwrap_or`) while the first is still
+    /// awaiting a keypress. `mpsc::Receiver` already buffers, so the second
+    /// request should simply wait in the channel until `poll_next_permission_
+    /// request` is called again AFTER the first has been answered and
+    /// `pending_permission_responder` cleared. Also asserts the FIRST
+    /// request is the one actually rendered/prompted first (`state
+    /// .permission_request` holds it, not the second).
+    #[test]
+    fn second_permission_request_does_not_overwrite_first_pending_responder() {
+        let (perm_tx, perm_rx) =
+            mpsc::channel::<(PermissionRequest, oneshot::Sender<PermissionDecision>)>();
+        let (resp1_tx, mut resp1_rx) = oneshot::channel();
+        let (resp2_tx, mut resp2_rx) = oneshot::channel();
+
+        let request_one = PermissionRequest {
+            tool_name: "bash".to_string(),
+            detail: PermissionDetail::Text("first command".to_string()),
+        };
+        let request_two = PermissionRequest {
+            tool_name: "write".to_string(),
+            detail: PermissionDetail::Text("second command".to_string()),
+        };
+
+        // Both requests queued BEFORE any keypress -- mpsc buffers them.
+        perm_tx.send((request_one.clone(), resp1_tx)).unwrap();
+        perm_tx.send((request_two.clone(), resp2_tx)).unwrap();
+
+        let mut state = AppState::default();
+        let mut pending_permission_responder: Option<oneshot::Sender<PermissionDecision>> = None;
+
+        // First poll picks up request_one and renders/prompts it first.
+        assert!(poll_next_permission_request(
+            &perm_rx,
+            &mut state,
+            &mut pending_permission_responder
+        ));
+        assert_eq!(state.permission_request, Some(request_one.clone()));
+        assert!(pending_permission_responder.is_some());
+
+        // A SECOND poll (simulating the next loop iteration, before any
+        // keypress answers the first) must be a no-op: request_two must NOT
+        // overwrite state.permission_request or the pending responder.
+        assert!(!poll_next_permission_request(
+            &perm_rx,
+            &mut state,
+            &mut pending_permission_responder
+        ));
+        assert_eq!(
+            state.permission_request,
+            Some(request_one),
+            "the second request must not have overwritten the first, still-pending one"
+        );
+
+        // Answer the first request -- its OWN oneshot must resolve to its
+        // OWN decision, not a dropped-sender fallback to Deny.
+        pending_permission_responder
+            .take()
+            .unwrap()
+            .send(PermissionDecision::Allow)
+            .unwrap();
+        assert_eq!(resp1_rx.try_recv(), Ok(PermissionDecision::Allow));
+
+        // NOW polling picks up the second request, previously buffered.
+        assert!(poll_next_permission_request(
+            &perm_rx,
+            &mut state,
+            &mut pending_permission_responder
+        ));
+        assert_eq!(state.permission_request, Some(request_two));
+        pending_permission_responder
+            .take()
+            .unwrap()
+            .send(PermissionDecision::Deny)
+            .unwrap();
+        assert_eq!(
+            resp2_rx.try_recv(),
+            Ok(PermissionDecision::Deny),
+            "the second request's OWN oneshot must resolve to its OWN decision, not a \
+             dropped-sender fallback"
         );
     }
 

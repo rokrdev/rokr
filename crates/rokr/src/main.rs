@@ -764,6 +764,10 @@ async fn main() -> ExitCode {
                 // runs (see `crate::headless::HEADLESS_MAX_ITERATIONS`).
                 max_iterations: None,
                 session_grants,
+                // The interactive TUI has no ambient permission mode at
+                // all (`--permission-mode` stays headless-only) -- see
+                // `PermissionPolicy::resolve`'s doc comment.
+                permission_mode: None,
             };
 
             // Ticket 52 (clap-and-sessionrunner-extraction): the submit-and-run

@@ -14161,6 +14161,12 @@ async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populat
             resp_rx.await.unwrap_or(false)
         })
     });
+    // R-002 (post-round-1 re-critique, major): this acceptance test never
+    // exercises a `Deny`-mode denial (both phases use `permission_mode:
+    // None`), so a no-op is correct here -- `note_denied_without_prompt` is
+    // exercised by `subagent::tests::subagent_deny_mode_never_reaches_
+    // request_permission_callback` instead.
+    let note_denied: rokr_app::subagent::NoteDeniedCallback = Box::new(|| {});
 
     // Phase A: no grant established yet.
     let ungranted_session_grants = std::sync::Arc::new(std::sync::Mutex::new(
@@ -14188,7 +14194,9 @@ async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populat
             &tools,
             "phase-a-one",
             &request_permission,
+            &note_denied,
             &ungranted_session_grants,
+            None,
         ),
         rokr_app::subagent::run_subagent(
             &provider_a2,
@@ -14197,7 +14205,9 @@ async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populat
             &tools,
             "phase-a-two",
             &request_permission,
+            &note_denied,
             &ungranted_session_grants,
+            None,
         ),
     );
 
@@ -14248,7 +14258,9 @@ async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populat
             &tools,
             "phase-b-one",
             &request_permission,
+            &note_denied,
             &granted_session_grants,
+            None,
         ),
         rokr_app::subagent::run_subagent(
             &provider_b2,
@@ -14257,7 +14269,9 @@ async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populat
             &tools,
             "phase-b-two",
             &request_permission,
+            &note_denied,
             &granted_session_grants,
+            None,
         ),
     );
 

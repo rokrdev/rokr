@@ -81,11 +81,10 @@ impl PermissionPolicy {
     /// ticket's acceptance criterion fixes this shape ahead of a follow-on
     /// ticket that may add path-keyed grants without another signature
     /// change.
-    #[allow(unused_variables)]
     pub fn resolve(
         mode: Option<PermissionMode>,
         tool_name: &str,
-        path: Option<&Path>,
+        _path: Option<&Path>,
         grants: &SessionGrants,
     ) -> Resolution {
         if grants.is_granted(tool_name) {

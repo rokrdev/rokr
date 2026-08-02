@@ -63,16 +63,33 @@ impl Tool for WriteTool {
     async fn execute(&self, input: serde_json::Value) -> Result<String, ToolError> {
         let input: WriteInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        if !sandbox::path_is_within_workspace(
+        // F-001: write to the RESOLVED path, not the raw `input.path` --
+        // see `sandbox::resolve_within_workspace`'s doc comment on why
+        // using the raw path after only checking it would reopen a
+        // symlink-swap TOCTOU window.
+        let resolved = sandbox::resolve_within_workspace(
             std::path::Path::new(&input.path),
             &self.workspace_root,
-        ) {
+        )
+        .ok_or_else(|| {
+            ToolError::ExecutionFailed(format!("path outside workspace root: {}", input.path))
+        })?;
+        // R-001 (post-round-1 re-critique, blocker): belt-and-suspenders,
+        // independent of `sandbox::resolve_within_workspace`'s own fix --
+        // if `resolved` is ITSELF a symlink at the moment of the write
+        // (e.g. a TOCTOU race between the confinement check above and this
+        // write), refuse rather than let `std::fs::write` follow it
+        // wherever it points.
+        if resolved
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
             return Err(ToolError::ExecutionFailed(format!(
-                "path outside workspace root: {}",
-                input.path
+                "refusing to write through a symlink: {}",
+                resolved.display()
             )));
         }
-        std::fs::write(&input.path, &input.content)?;
+        std::fs::write(&resolved, &input.content)?;
         Ok(format!(
             "wrote {} bytes to {}",
             input.content.len(),
@@ -181,6 +198,86 @@ mod tests {
             !target.exists(),
             "the out-of-workspace file must not have been created: {}",
             target.display()
+        );
+    }
+
+    /// F-001 (pre-ship review, blocker): a REAL symlink inside the
+    /// workspace pointing outside it, combined with a trailing `..`, must
+    /// be rejected -- see `sandbox::path_is_within_workspace`'s own
+    /// symlink-escape test for the full lexical-vs-real-resolution
+    /// explanation. `execute` must reject BEFORE writing anywhere, and
+    /// must never fall back to writing the raw (unresolved) input path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_execute_rejects_symlink_then_dotdot_escape() {
+        let workspace_root = tempfile::tempdir().unwrap();
+        let canonical_root = workspace_root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canonical_outside = outside.path().canonicalize().unwrap();
+
+        let link = canonical_root.join("link");
+        std::os::unix::fs::symlink(&canonical_outside, &link).unwrap();
+        let target = link.join("..").join("evil.txt");
+
+        let tool = WriteTool::new(workspace_root.path().to_path_buf());
+        let result = tool
+            .execute(json!({
+                "path": target.to_string_lossy(),
+                "content": "pwned"
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::ExecutionFailed(_))),
+            "expected Err(ToolError::ExecutionFailed(_)) for a symlink-then-.. escape, got {result:?}"
+        );
+        assert!(
+            !target.exists(),
+            "no file must have been created outside the workspace via the symlink escape: {}",
+            target.display()
+        );
+    }
+
+    /// R-001 (post-round-1 re-critique, blocker): a DANGLING symlink inside
+    /// the workspace (target doesn't exist, and would live outside the
+    /// workspace root) must be rejected -- see
+    /// `sandbox::path_is_within_workspace_false_for_dangling_symlink` for
+    /// the full explanation of why `Path::exists()` wrongly reported this
+    /// as "missing" pre-fix, letting `std::fs::write` follow the symlink
+    /// and create the file outside the workspace.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_execute_rejects_dangling_symlink_escape() {
+        let workspace_root = tempfile::tempdir().unwrap();
+        let canonical_root = workspace_root.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canonical_outside = outside.path().canonicalize().unwrap();
+
+        let dangling_target = canonical_outside.join("newfile.txt");
+        assert!(
+            !dangling_target.exists(),
+            "precondition: the symlink target must not exist"
+        );
+        let dangling_link = canonical_root.join("dangling");
+        std::os::unix::fs::symlink(&dangling_target, &dangling_link).unwrap();
+
+        let tool = WriteTool::new(workspace_root.path().to_path_buf());
+        let result = tool
+            .execute(json!({
+                "path": dangling_link.to_string_lossy(),
+                "content": "pwned"
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::ExecutionFailed(_))),
+            "expected Err(ToolError::ExecutionFailed(_)) for a write through a dangling \
+             symlink, got {result:?}"
+        );
+        assert!(
+            !dangling_target.exists(),
+            "no file must have been created outside the workspace via the dangling symlink: {}",
+            dangling_target.display()
         );
     }
 }

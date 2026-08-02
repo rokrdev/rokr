@@ -204,12 +204,91 @@ change nobody asked for). `None` names the TUI's actual situation
 directly: no ambient mode, so (absent a grant) always `Prompt` --
 identical to today's un-widened TUI behavior for a call the user hasn't
 granted yet. `Some(mode)` preserves the original 3-mode behavior
-(`Bypass`/`Deny`/`AcceptEdits`) completely unchanged; headless continues
-to pass `Some(mode)` and is unaffected end to end (verified by this
-ticket's regression run of `accept_edits_permission_mode_grants_file_
+(`Bypass`/`Deny`/`AcceptEdits`) completely unchanged.
+
+**Correction (pre-ship review F-005):** the paragraph above originally
+claimed "headless continues to pass `Some(mode)` and is unaffected end to
+end," verified only by `accept_edits_permission_mode_grants_file_
 writes_but_denies_bash_execution` and `bypass_permission_mode_without_
-dangerously_skip_permissions_exits_two_with_stderr_error`, both
-unchanged).
+dangerously_skip_permissions_exits_two_with_stderr_error` staying green.
+That claim was **false** at the time it was written: those two tests
+staying green only proved headless's OBSERVABLE behavior was unchanged,
+not that headless actually called `PermissionPolicy::resolve` with
+`Some(mode)` at all. In fact `crate::headless::HeadlessPermissionRequester
+::request` never called `resolve` -- it independently re-derived the exact
+same `Deny`/`Bypass`/`AcceptEdits` dispatch inline, entirely bypassing this
+policy layer. That was exactly the dual-resolver architecture this ADR's
+own Decision section (and the PRD) exists to forbid; it went undetected
+pre-ship because the two regression tests above only assert on
+externally-observable outcomes, which happened to match by construction
+(the duplicated logic was a faithful copy at the time).
+
+The actual fix (pre-ship review F-005) threads a new
+`permission_mode: Option<PermissionMode>` field through
+`crate::runner::SessionRunner` -- `None` for the interactive TUI
+(`crates/rokr/src/main.rs`'s `SessionRunner` construction), `Some(mode)`
+for headless (`crate::headless::run_result_object`'s `SessionRunner`
+construction, the field's ONE non-test `Some(_)` call site). That field is
+now the value BOTH of `run_submission`'s `PermissionPolicy::resolve` call
+sites use (the parent's own permission closure in `runner.rs`, and --
+forwarded through `subagent::SubagentTool` -- the one `subagent::
+run_subagent`'s `tagged_request_permission` closure uses), replacing what
+were previously two independent hardcoded `None`s.
+`HeadlessPermissionRequester` no longer stores or dispatches on `mode` at
+all: its `request` method is now reduced to handling whatever
+`PermissionPolicy::resolve` did NOT already decide unconditionally. The two
+regression tests named above (plus `default_permission_mode_denies_gated_
+tool_call_without_flag`, headless's `Deny`-mode case) all still pass
+unchanged against this real wiring.
+
+**Correction (post-round-1 re-critique, R-002):** the paragraph above
+originally went on to describe `runner.rs`'s and `subagent.rs`'s permission
+closures routing BOTH `Resolution::Deny` and `Resolution::Prompt` through
+the SAME arm, both invoking `permission.request`/`request_permission` --
+with `HeadlessPermissionRequester::request` (always deny-and-record) as the
+one leaf both resolutions funneled into. That was a **violation** of this
+ADR's own Decision 1 ("only `Resolution::Prompt` is meant to ever reach
+`rokr_core::run_tool_loop`'s `request_permission` callback"), not a faithful
+implementation of it: routing `Deny` through the human-facing prompt
+callback at all is a latent hazard, since any future interactive driver that
+respects a permission mode could let a single accidental keypress at the
+prompt override an explicit deny-mode denial. It went undetected at the time
+because headless's `request` always answers `Deny` regardless of which
+`Resolution` sent it there, so the OBSERVABLE outcome (a denied call, `subtype:
+error_permission`) was identical whether `Deny` was intercepted upstream or
+routed through the callback -- exactly the kind of "tests match by
+construction, not by the code actually satisfying the invariant" gap the
+F-005 correction above already flagged once for this same ADR, this time one
+layer downstream of it.
+
+The actual fix (R-002) adds `PermissionRequester::note_denied_without_prompt(&self)`
+(default no-op) to the trait in `runner.rs`, and the mirrored
+`subagent::NoteDeniedCallback` type (a boxed, side-effect-only
+`Box<dyn Fn() + Send + Sync>`) for `subagent::run_subagent`, which cannot
+hold a typed `H: PermissionRequester` directly (that generic is erased at
+`SubagentTool`'s boundary, per ADR 0009). Both `runner.rs`'s
+`request_permission` closure and `subagent.rs`'s `tagged_request_permission`
+now split `Resolution::Deny` and `Resolution::Prompt` into separate match
+arms: `Deny` calls `note_denied_without_prompt()`/`(note_denied_without_prompt)()`
+and returns `false` directly, WITHOUT ever calling `request`/`request_permission`;
+`Prompt` is the only resolution that reaches the human-facing callback.
+`HeadlessPermissionRequester::note_denied_without_prompt` overrides the
+trait's default no-op to do exactly what its old merged-arm `request` path
+used to do for a `Deny` (`self.denied.store(true, SeqCst)`), so
+`subtype: error_permission` reporting is unaffected -- headless still denies
+and records a `Deny`-mode call the same way observably, just without ever
+routing it through the prompt callback to get there. The interactive TUI
+(`permission_mode: None`) never hits `Resolution::Deny` in the first place
+(`PermissionPolicy::resolve`'s `None` arm only ever yields `Allow` or
+`Prompt`), so its default no-op `note_denied_without_prompt` is never
+actually invoked in production -- `PermissionHandle` doesn't need to
+override it. All headless permission-mode tests (including the two named
+above) still pass unchanged; `crates/rokr-app/src/runner.rs`'s and
+`subagent.rs`'s own test suites gained dedicated regression tests
+(`deny_mode_bash_call_never_reaches_request_only_note_denied_without_prompt`
+and `subagent_deny_mode_never_reaches_request_permission_callback`) that
+fail with a panic inside a `request`/`request_permission` stub if a future
+change ever re-merges the two arms.
 
 ### Rejected: add a 4th `PermissionMode` variant (e.g. `Interactive` or
 `NoAmbientMode`)

@@ -51,20 +51,29 @@ pub fn select_mode(print: Option<&str>, mut stdin: impl std::io::Read) -> Mode {
 }
 
 /// The permission surface headless drives `SessionRunner::run_submission`
-/// with, dispatching per-request on the `--permission-mode` this run was
-/// built with (see [`build_permission_requester`]). `denied` is shared
-/// (`Arc<AtomicBool>`) rather than owned per-clone: `SessionRunner`
-/// internally clones the permission requester at least twice (once for the
-/// parent's own gated calls, once for `subagent::SubagentTool`, see
-/// `runner.rs`'s `subagent_permission` clone), and every clone must report
-/// into the SAME flag so `crate::headless::run` can observe "did ANY gated
-/// call get denied during this run" after `run_submission` returns --
-/// `run_tool_loop` does not abort on a denial (it appends an error
-/// `ToolResult` and loops again, see that function's own doc comment), so
-/// this flag is the only way headless can tell a denial happened at all.
+/// with. `denied` is shared (`Arc<AtomicBool>`) rather than owned per-clone:
+/// `SessionRunner` internally clones the permission requester at least
+/// twice (once for the parent's own gated calls, once for
+/// `subagent::SubagentTool`, see `runner.rs`'s `subagent_permission`
+/// clone), and every clone must report into the SAME flag so
+/// `crate::headless::run` can observe "did ANY gated call get denied during
+/// this run" after `run_submission` returns -- `run_tool_loop` does not
+/// abort on a denial (it appends an error `ToolResult` and loops again, see
+/// that function's own doc comment), so this flag is the only way headless
+/// can tell a denial happened at all.
+///
+/// Pre-ship review F-005 (major): no longer stores or dispatches on
+/// `--permission-mode` itself -- that dual-resolver architecture (this type
+/// independently re-deriving the same Deny/Bypass/AcceptEdits decision
+/// `crate::permission_policy::PermissionPolicy::resolve` ALSO makes) is
+/// exactly what the PRD forbade. `SessionRunner::permission_mode` now
+/// threads `Some(mode)` into `PermissionPolicy::resolve` at both of
+/// `run_submission`'s call sites (the parent's own closure and the one
+/// `run_subagent` uses), and `resolve` already reproduces this type's old
+/// `Deny`/`Bypass`/`AcceptEdits` dispatch exactly (see its own doc
+/// comment). See [`build_permission_requester`].
 #[derive(Clone)]
 pub struct HeadlessPermissionRequester {
-    mode: crate::cli::PermissionMode,
     denied: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -78,46 +87,39 @@ impl HeadlessPermissionRequester {
 }
 
 impl crate::runner::PermissionRequester for HeadlessPermissionRequester {
+    /// R-002 (post-round-1 re-critique, major) correction: by the time this
+    /// is ever called, `PermissionPolicy::resolve` has decided the call
+    /// needs asking a human via `Resolution::Prompt` specifically --
+    /// `Resolution::Deny` is now intercepted upstream (`runner.rs`'s
+    /// `request_permission` closure and `subagent.rs`'s
+    /// `tagged_request_permission` both call [`Self::note_denied_without_prompt`]
+    /// for `Deny` instead, per ADR 0016 Decision 1: "only Prompt reaches the
+    /// callback"). Headless has no interactive human to ask either way, so
+    /// there is exactly one correct answer here too: deny, and record it.
+    /// This only fires for an `AcceptEdits`-mode `Prompt` (a non-write/edit
+    /// tool) today -- `Bypass`/`AcceptEdits`-for-write-or-edit are both
+    /// `Resolution::Allow` and never reach this method at all.
     fn request(
         &self,
-        request: rokr_tui::PermissionRequest,
+        _request: rokr_tui::PermissionRequest,
     ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send {
-        let mode = self.mode;
         let denied = self.denied.clone();
         async move {
-            // Assumption (not stated explicitly in the ticket, see this
-            // ticket's report): `AcceptEdits` grants only a write/edit
-            // (`Diff`) call -- there's no human present in headless to
-            // approve a `bash` command or an MCP tool call interactively,
-            // so both stay denied under `AcceptEdits` exactly as under
-            // `Deny`. `rokr_tui::PermissionDetail` collapses
-            // `PermissionPayload::Command` and `PermissionPayload::ToolCall`
-            // into the same `Text` variant (see that type's doc comment),
-            // so this can only distinguish "a diff" from "everything else",
-            // which is exactly the distinction this policy needs.
-            let granted = match mode {
-                crate::cli::PermissionMode::Deny => false,
-                crate::cli::PermissionMode::Bypass => true,
-                crate::cli::PermissionMode::AcceptEdits => {
-                    matches!(request.detail, rokr_tui::PermissionDetail::Diff { .. })
-                }
-            };
-            if !granted {
-                denied.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            // Ticket 72 (`tui-session-allowlist-grant`): headless has no
-            // "remember for this session" affordance (no interactive user
-            // to press `r`) -- this is a MECHANICAL adaptation to
-            // `PermissionRequester::request`'s new `PermissionDecision`
-            // return type only, not a behavior change. `PermissionPolicy`
-            // is never consulted here; headless's own `mode`-driven
-            // decision above is unchanged.
-            if granted {
-                rokr_tui::PermissionDecision::Allow
-            } else {
-                rokr_tui::PermissionDecision::Deny
-            }
+            denied.store(true, std::sync::atomic::Ordering::SeqCst);
+            rokr_tui::PermissionDecision::Deny
         }
+    }
+
+    /// R-002: called instead of `request` when `PermissionPolicy::resolve`
+    /// already decided `Resolution::Deny` -- e.g. `--permission-mode deny`
+    /// (the default). Headless still has no interactive human either way,
+    /// so the observable outcome is identical to `request`'s (deny, and
+    /// flip `denied` for `crate::headless::run`'s `subtype: error_permission`
+    /// reporting) -- the only difference from pre-fix is that this denial no
+    /// longer round-trips through the human-facing prompt callback to get
+    /// there.
+    fn note_denied_without_prompt(&self) {
+        self.denied.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -566,14 +568,21 @@ pub async fn run_result_object(
         // driver (see its own doc comment), so this cap applies to eval
         // runs too without `rokr-eval` needing its own copy.
         max_iterations: Some(HEADLESS_MAX_ITERATIONS),
-        // Ticket 72: structurally required field, mechanical only -- a
-        // fresh, empty grant set every headless run. Headless's own
-        // `HeadlessPermissionRequester` above never consults
-        // `PermissionPolicy`/`SessionGrants` at all, so this has no
-        // behavioral effect on headless mode.
+        // Ticket 72: structurally required field. Pre-ship review F-005:
+        // this is NOW actually consulted -- `permission_mode` below feeds
+        // `PermissionPolicy::resolve`, which checks this grant set (and
+        // `AllowAndRemember` never reaches headless in the first place, see
+        // `HeadlessPermissionRequester::request`'s doc comment), so it
+        // stays a fresh, empty set every headless run.
         session_grants: std::sync::Arc::new(std::sync::Mutex::new(
             crate::permission_policy::SessionGrants::new(),
         )),
+        // Pre-ship review F-005 (major): headless resolves permission
+        // modes through the SAME `PermissionPolicy::resolve` the TUI does,
+        // not a second, parallel mode-dispatch -- this is the ONE
+        // non-test call site that proves it. See `HeadlessPermissionRequester
+        // ::request`'s doc comment for the other half of this fix.
+        permission_mode: Some(permission_mode),
     };
 
     let run_result = runner.run_submission(prompt, permission.clone()).await;
@@ -666,7 +675,6 @@ pub fn build_permission_requester(
         );
     }
     Ok(HeadlessPermissionRequester {
-        mode,
         denied: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }

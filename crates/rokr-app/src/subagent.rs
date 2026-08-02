@@ -38,6 +38,22 @@ pub type PermissionCallback = Box<
         + Sync,
 >;
 
+/// R-002 (post-round-1 re-critique, major): a boxed, side-effect-only
+/// callback `run_subagent` invokes when `PermissionPolicy::resolve` has
+/// ALREADY resolved `Resolution::Deny` for a subagent's gated tool call --
+/// ADR 0016 Decision 1 requires that ONLY `Resolution::Prompt` ever reaches
+/// the human-facing `PermissionCallback` above; `Deny` must never invoke it.
+/// This exists purely so the caller (headless's `HeadlessPermissionRequester`,
+/// via `SessionRunner::run_submission`'s typed `H: PermissionRequester`) can
+/// still record that a denial happened (its `denied` bookkeeping, used for
+/// `subtype: error_permission`) without `run_subagent` needing direct access
+/// to that concrete, type-erased `H` -- which is erased at `SubagentTool`'s
+/// boundary in the first place (see this module's own doc comment on why
+/// ADR 0009 requires that). The interactive TUI passes a no-op here: its
+/// `permission_mode` is always `None`, so `Resolution::Deny` never occurs on
+/// that path.
+pub type NoteDeniedCallback = Box<dyn Fn() + Send + Sync>;
+
 /// The `subagent` tool: invoking it by name runs a fresh, synchronous
 /// `rokr_core::run_tool_loop` to completion against the named subagent's
 /// own prompt and a read-only tool subset, returning only its final
@@ -74,7 +90,16 @@ pub struct SubagentTool {
     provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
     config_dir: PathBuf,
     request_permission: PermissionCallback,
+    /// R-002: see [`NoteDeniedCallback`]'s doc comment.
+    note_denied_without_prompt: NoteDeniedCallback,
     session_grants: Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
+    /// F-005 (pre-ship review, major): threaded straight through to
+    /// `run_subagent`'s own `PermissionPolicy::resolve` call, replacing a
+    /// hardcoded `None` -- see `SessionRunner::permission_mode`'s doc
+    /// comment for why this must be the SAME value the parent's own
+    /// permission closure resolves against, not a second, independently
+    /// re-derived one.
+    permission_mode: Option<crate::cli::PermissionMode>,
 }
 
 impl SubagentTool {
@@ -82,13 +107,17 @@ impl SubagentTool {
         provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
         config_dir: PathBuf,
         request_permission: PermissionCallback,
+        note_denied_without_prompt: NoteDeniedCallback,
         session_grants: Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
+        permission_mode: Option<crate::cli::PermissionMode>,
     ) -> Self {
         Self {
             provider,
             config_dir,
             request_permission,
+            note_denied_without_prompt,
             session_grants,
+            permission_mode,
         }
     }
 }
@@ -188,7 +217,9 @@ impl rokr_core::ExecutableTool for SubagentTool {
                 &tools,
                 &name,
                 &self.request_permission,
+                &self.note_denied_without_prompt,
                 &self.session_grants,
+                self.permission_mode,
             )
             .await
         })
@@ -233,6 +264,11 @@ fn tag_permission_request(
 /// behavior change than it asks for), so the acceptance test instead calls
 /// `run_subagent` directly with an injected gated test tool, mirroring the
 /// exact pattern this module's own `FakeGatedTool` unit tests already use.
+///
+/// Pre-ship review F-012 (nit): `#[doc(hidden)]` -- `pub` ONLY for the
+/// cross-crate acceptance test described above, not a real public API this
+/// crate intends external callers to use.
+#[doc(hidden)]
 pub async fn run_subagent<P: rokr_core::Provider>(
     provider: &P,
     subagent_prompt: &str,
@@ -240,7 +276,17 @@ pub async fn run_subagent<P: rokr_core::Provider>(
     tools: &[&dyn rokr_core::ExecutableTool],
     subagent_name: &str,
     request_permission: &PermissionCallback,
+    // R-002 (post-round-1 re-critique, major): see `NoteDeniedCallback`'s
+    // doc comment.
+    note_denied_without_prompt: &NoteDeniedCallback,
     session_grants: &Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
+    // Pre-ship review F-005 (major): threaded from `SessionRunner`
+    // (`None` for the interactive TUI path, `Some(mode)` for headless) into
+    // `PermissionPolicy::resolve` below, replacing a hardcoded `None` --
+    // this is exactly the dual-resolver seam the PRD forbade: headless
+    // execution must resolve permission modes through the SAME policy
+    // layer the TUI does, not a second, independently re-derived one.
+    permission_mode: Option<crate::cli::PermissionMode>,
 ) -> Result<String, rokr_tools::ToolError> {
     let mut transcript = vec![rokr_core::Message::user_text(task)];
 
@@ -248,23 +294,33 @@ pub async fn run_subagent<P: rokr_core::Provider>(
     // parent's own `request_permission` closure in `runner.rs` consults
     // (see that closure's doc comment), on the call's ORIGINAL (untagged)
     // `request.tool_name` -- BEFORE `tag_permission_request` below ever
-    // runs. `mode: None`: mirrors the parent closure exactly, since a
-    // subagent's gated calls happen within the same interactive TUI
-    // session, which has no ambient `--permission-mode` either (see
-    // `permission_policy::resolve`'s doc comment).
+    // runs.
     //
     // On `Resolution::Allow`, `request_permission` (the boxed callback that
     // ultimately round-trips through `rokr_tui::PermissionHandle`'s mpsc
     // channel to the render loop) is never even called -- this is what
     // keeps a session-wide "remember" grant from ever populating that
-    // channel for a subagent's gated call, per this ticket's acceptance
+    // channel for a subagent's gated call, per ticket 74's acceptance
     // criterion ("the fast path that keeps a fan-out of subagents from
     // stalling").
+    //
+    // R-002 (post-round-1 re-critique, major): `Resolution::Deny` and
+    // `Resolution::Prompt` must NOT share an arm -- ADR 0016 Decision 1
+    // ("only Prompt reaches the callback"). Round-1's fix (F-005) merged
+    // them into one arm that both invoked `request_permission`, which was
+    // itself the bug this fixes. `Deny` now calls
+    // `note_denied_without_prompt` instead -- for headless (`Some(mode)`),
+    // that's what lets `HeadlessPermissionRequester` still record the
+    // denial (for `subtype: error_permission`) without ever reaching the
+    // human-facing callback; for the interactive TUI (`permission_mode:
+    // None`), `Deny` stays structurally unreachable (`None` only ever
+    // yields `Allow` or `Prompt`), so its no-op `note_denied_without_prompt`
+    // is never even called.
     let tagged_request_permission = |request: rokr_core::PermissionRequest| async move {
         let resolution = {
             let grants = session_grants.lock().unwrap();
             crate::permission_policy::PermissionPolicy::resolve(
-                None,
+                permission_mode,
                 &request.tool_name,
                 None,
                 &grants,
@@ -272,12 +328,10 @@ pub async fn run_subagent<P: rokr_core::Provider>(
         };
         match resolution {
             crate::permission_policy::Resolution::Allow => true,
-            // Structurally unreachable with `mode: None` today (`None` only
-            // ever yields `Allow` or `Prompt`, see `permission_policy::
-            // resolve`) -- kept so the match stays exhaustive against
-            // `Resolution`'s full shape, mirroring the parent closure in
-            // `runner.rs`.
-            crate::permission_policy::Resolution::Deny => false,
+            crate::permission_policy::Resolution::Deny => {
+                note_denied_without_prompt();
+                false
+            }
             crate::permission_policy::Resolution::Prompt => {
                 (request_permission)(tag_permission_request(request, subagent_name)).await
             }
@@ -289,9 +343,9 @@ pub async fn run_subagent<P: rokr_core::Provider>(
     // fire for the main loop only -- a subagent's own tool calls don't
     // (yet) go through either hook check, hence the hardcoded `None`s
     // rather than threading hook callbacks down from `SubagentTool`.
-    // F-005: subagents keep the pre-existing unbounded behavior (`None`) --
-    // this batch's cap is scoped to headless/eval call paths (via
-    // `SessionRunner`) and doesn't touch subagent orchestration.
+    // Subagents keep the pre-existing unbounded `max_iterations` behavior
+    // (`None`) -- headless/eval's cap is scoped to `SessionRunner`'s own
+    // send path and doesn't touch subagent orchestration.
     let (reply, _usage) = rokr_core::run_tool_loop(
         provider,
         subagent_prompt,
@@ -475,6 +529,7 @@ mod tests {
 
         let request_permission: PermissionCallback =
             Box::new(|_request| Box::pin(async { true }));
+        let note_denied: NoteDeniedCallback = Box::new(|| {});
         let session_grants = Arc::new(std::sync::Mutex::new(
             crate::permission_policy::SessionGrants::new(),
         ));
@@ -486,7 +541,9 @@ mod tests {
             &tools,
             "researcher",
             &request_permission,
+            &note_denied,
             &session_grants,
+            None,
         )
         .await
         .expect("subagent run should succeed");
@@ -558,6 +615,7 @@ mod tests {
 
         let request_permission: PermissionCallback =
             Box::new(|_request| Box::pin(async { true }));
+        let note_denied: NoteDeniedCallback = Box::new(|| {});
 
         let session_grants = Arc::new(std::sync::Mutex::new(
             crate::permission_policy::SessionGrants::new(),
@@ -570,7 +628,9 @@ mod tests {
             resilient_provider,
             temp_dir.clone(),
             request_permission,
+            note_denied,
             session_grants,
+            None,
         );
 
         let result = tool
@@ -652,6 +712,7 @@ mod tests {
             })
         });
 
+        let note_denied: NoteDeniedCallback = Box::new(|| {});
         let session_grants = Arc::new(std::sync::Mutex::new(
             crate::permission_policy::SessionGrants::new(),
         ));
@@ -663,7 +724,9 @@ mod tests {
             &tools,
             "researcher",
             &request_permission,
+            &note_denied,
             &session_grants,
+            None,
         )
         .await
         .expect("subagent run should succeed once permission is granted");
@@ -685,6 +748,77 @@ mod tests {
             request.tool_name.contains("researcher"),
             "tagged tool_name should identify the subagent that made the call, got: {}",
             request.tool_name
+        );
+    }
+
+    /// R-002 (post-round-1 re-critique, major): a `Resolution::Deny` for a
+    /// subagent's gated tool call must NEVER reach the human-facing
+    /// `request_permission` callback -- ADR 0016 Decision 1 ("only Prompt
+    /// reaches the callback"). `request_permission` here panics if invoked
+    /// at all, which is what makes this a real teeth-check: against the
+    /// pre-fix code (which routed `Deny` through this SAME arm as
+    /// `Prompt`), this test would panic instead of completing.
+    /// `note_denied_without_prompt` firing instead is asserted directly via
+    /// a shared flag.
+    #[tokio::test]
+    async fn subagent_deny_mode_never_reaches_request_permission_callback() {
+        let tool_call_reply = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "fake_gated".to_string(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }],
+        };
+        let final_reply = Message::assistant_text("done after denial");
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_reply,
+                final_reply,
+            ])),
+        };
+
+        let gated_tool = FakeGatedTool;
+        let tools: [&dyn rokr_core::ExecutableTool; 1] = [&gated_tool];
+
+        let request_permission: PermissionCallback = Box::new(|_request| {
+            Box::pin(async {
+                panic!(
+                    "request_permission must never be invoked for a Deny-mode denial (R-002)"
+                );
+            })
+        });
+
+        let denied_recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let denied_recorded_writer = denied_recorded.clone();
+        let note_denied: NoteDeniedCallback = Box::new(move || {
+            denied_recorded_writer.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let session_grants = Arc::new(std::sync::Mutex::new(
+            crate::permission_policy::SessionGrants::new(),
+        ));
+
+        let result = run_subagent(
+            &provider,
+            "you are a test subagent",
+            "run the fake gated tool".to_string(),
+            &tools,
+            "researcher",
+            &request_permission,
+            &note_denied,
+            &session_grants,
+            Some(crate::cli::PermissionMode::Deny),
+        )
+        .await
+        .expect("subagent run should still complete even though the gated call was denied");
+
+        assert_eq!(result, "done after denial");
+        assert!(
+            denied_recorded.load(std::sync::atomic::Ordering::SeqCst),
+            "note_denied_without_prompt must be called for a Deny-mode denial"
         );
     }
 
@@ -790,6 +924,7 @@ mod tests {
             })
         });
 
+        let note_denied: NoteDeniedCallback = Box::new(|| {});
         let session_grants = Arc::new(std::sync::Mutex::new(
             crate::permission_policy::SessionGrants::new(),
         ));
@@ -802,7 +937,9 @@ mod tests {
                 &tools,
                 "alice",
                 &request_permission,
+                &note_denied,
                 &session_grants,
+                None,
             ),
             run_subagent(
                 &provider,
@@ -811,7 +948,9 @@ mod tests {
                 &tools,
                 "bob",
                 &request_permission,
+                &note_denied,
                 &session_grants,
+                None,
             ),
         );
 
@@ -927,6 +1066,7 @@ mod tests {
 
         let request_permission: PermissionCallback =
             Box::new(|_request| Box::pin(async { true }));
+        let note_denied: NoteDeniedCallback = Box::new(|| {});
 
         let session_grants = Arc::new(std::sync::Mutex::new(
             crate::permission_policy::SessionGrants::new(),
@@ -935,7 +1075,9 @@ mod tests {
             resilient_provider,
             temp_dir.clone(),
             request_permission,
+            note_denied,
             session_grants,
+            None,
         );
         let tools: [&dyn ExecutableTool; 1] = [&subagent_tool];
 
