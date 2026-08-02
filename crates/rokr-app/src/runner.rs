@@ -363,7 +363,18 @@ impl SessionRunner {
                     // lock is dropped immediately (not held across the
                     // `.await` in the match arm below).
                     let resolution = {
-                        let grants = session_grants.lock().unwrap();
+                        // Silent-failure audit, final pre-ship item:
+                        // recovers from a poisoned lock instead of
+                        // re-panicking. `SessionGrants` has no
+                        // partial-mutation invariant that a torn write
+                        // could leave broken in a way worse than the
+                        // panic-cascade this avoids (a single prior panic
+                        // while holding this lock would otherwise
+                        // permanently lock out the whole session-grants
+                        // mechanism for the rest of the session).
+                        let grants = session_grants
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         crate::permission_policy::PermissionPolicy::resolve(
                             permission_mode,
                             &request.tool_name,
@@ -403,7 +414,7 @@ impl SessionRunner {
                             if decision == rokr_tui::PermissionDecision::AllowAndRemember {
                                 session_grants
                                     .lock()
-                                    .unwrap()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .grant(request.tool_name.clone());
                             }
                             matches!(

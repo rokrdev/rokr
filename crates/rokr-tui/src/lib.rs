@@ -884,6 +884,34 @@ fn poll_next_permission_request(
     }
 }
 
+/// Spawns `fut` on `handle`, then spawns a second task that awaits the
+/// first's `JoinHandle` and forwards the outcome on `tx`. Silent-failure
+/// audit, final pre-ship item: the three call sites below used to call
+/// `handle.spawn(fut)` directly and drop the returned `JoinHandle` -- if
+/// `fut` panicked, nothing observed it, so `state.pending` (cleared only by
+/// the event loop's `rx.try_recv()` picking up a message) stayed `true`
+/// forever: a silent, permanent UI hang with no error surfaced to the user.
+/// Awaiting the `JoinHandle` here and mapping `Err(JoinError)` (panic or
+/// cancellation) to the same `Err(String)` shape any other submission
+/// failure already uses means a panic now reaches `tx`/`rx` and clears
+/// `pending` via the normal receive-side handling, same as any other error.
+fn spawn_and_report<Fut>(
+    handle: &tokio::runtime::Handle,
+    fut: Fut,
+    tx: mpsc::Sender<Result<String, String>>,
+) where
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
+    let join_handle = handle.spawn(fut);
+    handle.spawn(async move {
+        let outcome = match join_handle.await {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(format!("submission task panicked: {join_error}")),
+        };
+        let _ = tx.send(outcome);
+    });
+}
+
 fn event_loop<F, Fut, C, Fut2, M, M2>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
@@ -1088,11 +1116,7 @@ where
                                             tx: perm_tx.clone(),
                                         };
                                         let submit_fut = submit(input, permission);
-                                        let tx = tx.clone();
-                                        handle.spawn(async move {
-                                            let outcome = submit_fut.await;
-                                            let _ = tx.send(outcome);
-                                        });
+                                        spawn_and_report(handle, submit_fut, tx.clone());
                                     }
                                     InputRoute::Command(input) => {
                                         // Ticket 63/64
@@ -1138,20 +1162,17 @@ where
                                                 };
                                                 submit(expanded, permission)
                                             });
-                                        let tx = tx.clone();
                                         match submit_fut_if_custom {
                                             Some(submit_fut) => {
-                                                handle.spawn(async move {
-                                                    let result = submit_fut.await;
-                                                    let _ = tx.send(result);
-                                                });
+                                                spawn_and_report(handle, submit_fut, tx.clone());
                                             }
                                             None => {
                                                 let command_fut = command(input);
-                                                handle.spawn(async move {
-                                                    let outcome = command_fut.await;
-                                                    let _ = tx.send(Ok(outcome));
-                                                });
+                                                spawn_and_report(
+                                                    handle,
+                                                    async move { Ok(command_fut.await) },
+                                                    tx.clone(),
+                                                );
                                             }
                                         }
                                     }
@@ -1801,6 +1822,41 @@ mod tests {
             "the second request's OWN oneshot must resolve to its OWN decision, not a \
              dropped-sender fallback"
         );
+    }
+
+    /// Silent-failure audit, final pre-ship item: the three `handle.spawn`
+    /// call sites in `event_loop`'s Submit/Command routing used to drop the
+    /// returned `JoinHandle`, so a panic inside the submitted future was
+    /// never observed -- `state.pending` (cleared only by `rx.try_recv()`
+    /// picking up a message in the event loop) stayed `true` forever: a
+    /// silent, permanent UI hang with nothing surfaced to the user.
+    /// `spawn_and_report` fixes this by awaiting the `JoinHandle` on a
+    /// second spawned task and mapping `Err(JoinError)` (panic or
+    /// cancellation) to the same `Err(String)` shape any other submission
+    /// failure already uses, so it reaches `rx`/`tx` and would clear
+    /// `pending` via the event loop's normal receive-side handling.
+    #[test]
+    fn spawn_and_report_surfaces_panic_as_error_instead_of_hanging_forever() {
+        async fn panicking_submit() -> Result<String, String> {
+            panic!("boom");
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+
+        spawn_and_report(&handle, panicking_submit(), tx);
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("spawn_and_report must report SOMETHING, not hang forever");
+        match outcome {
+            Err(message) => assert!(
+                message.contains("panicked"),
+                "expected a panic-shaped error message, got: {message}"
+            ),
+            Ok(response) => panic!("expected Err after a panicking task, got Ok({response:?})"),
+        }
     }
 
     #[test]
