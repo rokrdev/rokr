@@ -8,6 +8,11 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 rokr-tools = { path = "../rokr-tools" }
+# Ticket 73 (concurrent-subagent-fan-out): `run_tool_loop`'s batch-dispatch
+# loop uses `futures::future::join_all` to await the concurrent-safe subset
+# of a tool-use batch within the current task -- see ADR 0017 for why this,
+# not `tokio::spawn`, is the mechanism (ADR 0009's AFIT `Send` boundary).
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

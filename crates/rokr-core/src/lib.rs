@@ -220,6 +220,23 @@ pub trait ExecutableTool: Send + Sync {
     ) -> Option<Result<PermissionPayload, rokr_tools::ToolError>> {
         None
     }
+
+    /// Whether this tool is safe to run concurrently with other
+    /// concurrent-safe tool calls within the same `run_tool_loop` batch
+    /// (ticket 73, concurrent-subagent-fan-out; see ADR 0017). `false` (the
+    /// default) for every built-in tool (read/glob/grep/ls/websearch/bash/
+    /// write/edit/webfetch) — none of them override this — since most tools
+    /// either mutate shared state (the filesystem, a subprocess) or are
+    /// cheap enough that sequential execution is the safer default. The one
+    /// override today is `rokr-app`'s `SubagentTool`: a subagent call is a
+    /// long-running, self-contained provider round trip with a read-only
+    /// tool subset (depth-1 cap), so two subagent calls in the same batch
+    /// have no way to interfere with each other. This is a trait method
+    /// (not a tool-name string match in `run_tool_loop`) so the dispatch
+    /// loop never needs to know `"subagent"` is special by name.
+    fn concurrent_safe(&self) -> bool {
+        false
+    }
 }
 
 /// Implements [`ExecutableTool`] for a concrete `rokr_tools::Tool` type by
@@ -464,8 +481,27 @@ where
 
         transcript.push(reply);
 
-        let mut result_blocks = Vec::with_capacity(tool_uses.len());
-        for (id, name, input) in tool_uses {
+        // Runs the full per-call pipeline for one tool use -- `PreToolUse`
+        // hook, then (unless vetoed) preview/permission gate/execute, then
+        // `PostToolUse` hook -- unchanged from before ticket 73
+        // (concurrent-subagent-fan-out). Defined once as a reusable closure
+        // (not inlined per call site) so both the sequential dispatch loop
+        // and the concurrent `join_all` batch below share the exact same
+        // logic; see ADR 0017 for why the batch is split into these two
+        // groups rather than dispatched some other way.
+        //
+        // `dispatch_one` must be callable more than once (both loops below
+        // call it, and the concurrent loop calls it once per entry in the
+        // batch), but `request_permission: F` has no `Copy`/`Clone` bound --
+        // an `async move` block that captured it directly would move it out
+        // of `dispatch_one`'s environment on the FIRST call, making
+        // `dispatch_one` itself `FnOnce`. Rebinding it to a `&F` here first
+        // means the `async move` block below only ever moves a `Copy`
+        // reference, leaving the real `request_permission` untouched in the
+        // enclosing scope for every subsequent call.
+        let request_permission_ref = &request_permission;
+        let dispatch_one = |id: String, name: String, input: serde_json::Value| async move {
+            let request_permission = request_permission_ref;
             // Ticket 49 (hooks-tracer-bullet), PRD "Hooks" ordering rule:
             // `PreToolUse` hooks run first, before the permission prompt --
             // for EVERY tool-call attempt, gated or not, since a hook may
@@ -542,13 +578,69 @@ where
                 }
             }
 
-            result_blocks.push(ContentBlock::ToolResult {
+            ContentBlock::ToolResult {
                 tool_use_id: id,
                 content,
                 is_error,
                 cache_control: None,
-            });
+            }
+        };
+
+        // Ticket 73 (concurrent-subagent-fan-out; ADR 0017): partition this
+        // batch by `ExecutableTool::concurrent_safe()`, preserving each
+        // group's original relative order. A call whose tool name isn't
+        // found at all is treated as non-concurrent (it lands in
+        // `sequential_entries`) -- `dispatch_one` already produces the
+        // correct "unknown tool" error `ToolResult` for it either way, and
+        // there is no tool instance to consult `concurrent_safe()` on.
+        let batch_len = tool_uses.len();
+        let mut sequential_entries = Vec::new();
+        let mut concurrent_entries = Vec::new();
+        for (index, (id, name, input)) in tool_uses.into_iter().enumerate() {
+            let is_concurrent_safe = tools
+                .iter()
+                .find(|tool| tool.name() == name.as_str())
+                .map(|tool| tool.concurrent_safe())
+                .unwrap_or(false);
+            if is_concurrent_safe {
+                concurrent_entries.push((index, id, name, input));
+            } else {
+                sequential_entries.push((index, id, name, input));
+            }
         }
+
+        // `result_blocks` is filled in by ORIGINAL index, regardless of
+        // which group produced it or the order calls within the concurrent
+        // group actually finish in, so the final vector built below is
+        // always in original `tool_uses` order (ticket 73's ordering
+        // requirement) no matter how the two groups interleave in wall
+        // clock time.
+        let mut result_blocks: Vec<Option<ContentBlock>> = (0..batch_len).map(|_| None).collect();
+
+        // Non-concurrent-safe calls: unchanged sequential behavior, strictly
+        // in original order, one at a time.
+        for (index, id, name, input) in sequential_entries {
+            result_blocks[index] = Some(dispatch_one(id, name, input).await);
+        }
+
+        // Concurrent-safe calls: awaited together via `join_all` so they
+        // genuinely overlap in wall clock time (e.g. two `subagent` calls
+        // in one reply) -- same-task concurrency, no `tokio::spawn`, so no
+        // `Send`/`'static` bound beyond what `dispatch_one` already
+        // requires (ADR 0009, ADR 0017).
+        let concurrent_futures = concurrent_entries
+            .into_iter()
+            .map(|(index, id, name, input)| async move {
+                (index, dispatch_one(id, name, input).await)
+            });
+        for (index, block) in futures::future::join_all(concurrent_futures).await {
+            result_blocks[index] = Some(block);
+        }
+
+        let result_blocks: Vec<ContentBlock> = result_blocks
+            .into_iter()
+            .map(|block| block.expect("every original index is filled by exactly one of the sequential or concurrent dispatch groups above"))
+            .collect();
 
         transcript.push(Message {
             role: Role::User,
@@ -1964,6 +2056,153 @@ mod tests {
                 assert_eq!(input_pretty, "{\n  \"message\": \"hi\"\n}");
             }
             other => panic!("expected PermissionPayload::ToolCall, got {other:?}"),
+        }
+    }
+
+    /// A fake `concurrent_safe() -> true` tool (ticket 73,
+    /// concurrent-subagent-fan-out; see ADR 0017), standing in for
+    /// `rokr-app`'s `SubagentTool` -- this crate can't depend on `rokr-app`
+    /// to use the real thing. `execute_boxed` rendezvous on a 2-party
+    /// `tokio::sync::Barrier` before returning: the barrier only releases
+    /// once BOTH calls have reached `.wait()`, which is impossible under a
+    /// strictly-sequential dispatch loop (the first call would have to
+    /// finish -- including this very `.wait()` -- before the second call
+    /// even starts), so a sequential implementation deadlocks here forever.
+    /// Hand-implements `ExecutableTool` directly rather than going through
+    /// `impl_executable_tool!` -- that macro's generated impl always uses
+    /// the trait's default (`false`) `concurrent_safe`, and Rust doesn't
+    /// allow a second `impl ExecutableTool for FakeConcurrentSafeTool`
+    /// block to add just the override.
+    struct FakeConcurrentSafeTool {
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+    }
+
+    impl ExecutableTool for FakeConcurrentSafeTool {
+        fn name(&self) -> &str {
+            "fake_concurrent"
+        }
+
+        fn to_tool_spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "fake_concurrent".to_string(),
+                description: "fake concurrent-safe tool for tests".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            }
+        }
+
+        fn execute_boxed<'a>(
+            &'a self,
+            input: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.barrier.wait().await;
+                Ok(format!("done: {}", input["marker"]))
+            })
+        }
+
+        fn concurrent_safe(&self) -> bool {
+            true
+        }
+    }
+
+    /// Ticket 73 (concurrent-subagent-fan-out), test 1: a single assistant
+    /// reply naming the SAME concurrent-safe tool twice (distinct
+    /// `tool_use_id`s/inputs) must have both calls actually overlap in wall
+    /// clock time, not merely both eventually complete. `FakeConcurrentSafeTool`'s
+    /// barrier-of-2 proves that directly: it can only release if both calls
+    /// are in flight at once. Wrapped in a 5s `tokio::time::timeout` so a
+    /// still-sequential implementation reports as a clean timeout
+    /// (`Err(Elapsed)`), not a hung test process.
+    #[tokio::test]
+    async fn run_tool_loop_runs_concurrent_safe_tool_calls_in_one_batch_concurrently() {
+        let tool_call_reply = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_a".to_string(),
+                    name: "fake_concurrent".to_string(),
+                    input: serde_json::json!({"marker": "a"}),
+                    cache_control: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_b".to_string(),
+                    name: "fake_concurrent".to_string(),
+                    input: serde_json::json!({"marker": "b"}),
+                    cache_control: None,
+                },
+            ],
+        };
+        let final_reply = Message::assistant_text("final answer");
+
+        let provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                tool_call_reply.clone(),
+                final_reply.clone(),
+            ])),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let tool = FakeConcurrentSafeTool {
+            barrier: barrier.clone(),
+        };
+        let tools: [&dyn ExecutableTool; 1] = [&tool];
+
+        let mut transcript = vec![Message::user_text("do two concurrent things")];
+
+        let timeout_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_tool_loop(
+                &provider,
+                "you are a test agent",
+                None,
+                &mut transcript,
+                &tools,
+                |_request| async { true },
+                None,
+                None,
+                None,
+            ),
+        )
+        .await;
+
+        let (final_message, _usage) = timeout_result
+            .expect(
+                "run_tool_loop should complete within the timeout -- a timeout here means \
+                 concurrent-safe tool calls in the same batch are still being awaited \
+                 sequentially, deadlocking on the barrier",
+            )
+            .expect("loop should succeed");
+
+        assert_eq!(final_message.text(), "final answer");
+
+        let calls = provider.calls.lock().unwrap();
+        // Second call: leading system message, initial user turn, the
+        // assistant's two-tool-call turn, and the tool-result turn at index
+        // 3, which must carry both results in ORIGINAL tool_use order
+        // regardless of which call actually finished first.
+        match &calls[1][3].content[..] {
+            [ContentBlock::ToolResult {
+                tool_use_id: id_a,
+                content: content_a,
+                is_error: is_error_a,
+                ..
+            }, ContentBlock::ToolResult {
+                tool_use_id: id_b,
+                content: content_b,
+                is_error: is_error_b,
+                ..
+            }] => {
+                assert_eq!(id_a, "call_a");
+                assert!(!is_error_a);
+                assert_eq!(content_a, "done: \"a\"");
+                assert_eq!(id_b, "call_b");
+                assert!(!is_error_b);
+                assert_eq!(content_b, "done: \"b\"");
+            }
+            other => panic!("expected two ToolResult blocks in original order, got {other:?}"),
         }
     }
 }

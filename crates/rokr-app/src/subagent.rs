@@ -108,6 +108,20 @@ impl rokr_core::ExecutableTool for SubagentTool {
         }
     }
 
+    /// The one override of this default in the whole codebase (ticket 73,
+    /// concurrent-subagent-fan-out; see ADR 0017): a subagent call is a
+    /// long-running, self-contained provider round trip against a
+    /// read-only tool subset (the depth-1 cap in `execute_boxed` below), so
+    /// two subagent calls in the same `run_tool_loop` batch cannot
+    /// interfere with each other's execution the way two `write`/`bash`
+    /// calls could. This is what lets `run_tool_loop` run multiple
+    /// `subagent` calls in one assistant reply concurrently instead of
+    /// strictly sequentially, without `run_tool_loop` itself ever matching
+    /// on the tool name `"subagent"`.
+    fn concurrent_safe(&self) -> bool {
+        true
+    }
+
     fn execute_boxed<'a>(
         &'a self,
         input: serde_json::Value,
@@ -585,5 +599,187 @@ mod tests {
             "tagged tool_name should identify the subagent that made the call, got: {}",
             request.tool_name
         );
+    }
+
+    /// Ticket 73 (concurrent-subagent-fan-out), test 2 (acceptance): the
+    /// REAL `SubagentTool` (not a fake), invoked TWICE via a single
+    /// top-level assistant reply naming the `subagent` tool twice, must
+    /// have both underlying provider HTTP calls genuinely overlap in wall
+    /// clock time -- not merely both eventually complete -- when
+    /// dispatched through a real top-level `rokr_core::run_tool_loop`.
+    ///
+    /// **Deviation from the originally sketched harness**, per this
+    /// ticket's own escape hatch ("if this exact harness proves
+    /// impractical... use your engineering judgment"): the original plan
+    /// was a `wiremock::Respond` impl blocking on a shared `std::sync::
+    /// Barrier` inside `respond()`, mirroring `rokr-core`'s own test 1.
+    /// That does NOT work here -- investigation of `wiremock` 0.6's
+    /// `BareMockServer` (`mock_server/hyper.rs`) shows every incoming
+    /// request is handled under a single `tokio::sync::RwLock::write()`
+    /// held for the ENTIRE `handle_request` call, which is exactly where
+    /// `Respond::respond()` gets invoked. A single `MockServer` therefore
+    /// only ever has ONE request "inside `respond()`" at a time, by
+    /// wiremock's own design -- a barrier of 2 in `respond()` deadlocks
+    /// unconditionally, even with perfectly concurrent client dispatch,
+    /// because the second request can never even reach `respond()` until
+    /// the first (stuck on the barrier) releases that lock. Confirmed
+    /// empirically: the barrier-based version of this test hung
+    /// indefinitely both before AND after implementing concurrent
+    /// dispatch in `run_tool_loop`, proving the harness itself -- not
+    /// `run_tool_loop` -- was the problem.
+    ///
+    /// This version proves the same thing (genuine wall-clock overlap)
+    /// with timing instead of a rendezvous: every mocked response carries
+    /// `ResponseTemplate::set_delay(PER_CALL_DELAY)`. Per wiremock's own
+    /// `hyper.rs` (see its comment: "We do not wait for the delay within
+    /// the handler otherwise we would be holding on to the write-side of
+    /// the `RwLock`..."), that delay is awaited strictly AFTER the
+    /// per-request write lock is released, so a second request's
+    /// `respond()` computation can run (and start ITS OWN delay) while
+    /// the first request is still delaying. Two calls awaited
+    /// concurrently therefore take roughly `PER_CALL_DELAY` in total;
+    /// two calls awaited sequentially take roughly `2 * PER_CALL_DELAY`.
+    /// `TIMEOUT_BOUND` sits strictly between those two figures (with
+    /// generous slack on both sides for CI jitter and localhost network
+    /// overhead), so `tokio::time::timeout` reproduces the same
+    /// `Err(Elapsed(()))` red the barrier-based design was meant to
+    /// produce: it fires under today's still-sequential dispatch and
+    /// passes once the calls genuinely overlap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_concurrent_subagent_tool_calls_in_one_reply_are_dispatched_concurrently() {
+        const PER_CALL_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+        // Comfortably above one round trip (~500ms + localhost overhead)
+        // and comfortably below two sequential round trips (~1000ms +
+        // overhead), so it cleanly separates concurrent from sequential
+        // dispatch without being tight enough to flake on a loaded CI box.
+        const TIMEOUT_BOUND: std::time::Duration = std::time::Duration::from_millis(850);
+
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/messages"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                let task_text = body["messages"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": format!("final answer for: {task_text}")
+                        }],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                    .set_delay(PER_CALL_DELAY)
+            })
+            .mount(&mock_server)
+            .await;
+
+        let any_provider = rokr_provider::AnyProvider::Anthropic(
+            rokr_provider::AnthropicProvider::new(
+                mock_server.uri(),
+                "claude-3-5-sonnet-20241022",
+                "test-api-key",
+            ),
+        );
+        let resilient_provider = rokr_provider::ResilientProvider::new(any_provider);
+
+        let temp_dir = unique_temp_dir("concurrent-subagent-dispatch");
+        let agents_dir = temp_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("researcher.md"), "you are a test subagent").unwrap();
+
+        let request_permission: PermissionCallback =
+            Box::new(|_request| Box::pin(async { true }));
+
+        let subagent_tool =
+            SubagentTool::new(resilient_provider, temp_dir.clone(), request_permission);
+        let tools: [&dyn ExecutableTool; 1] = [&subagent_tool];
+
+        let top_level_tool_call_reply = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "call_a".to_string(),
+                    name: "subagent".to_string(),
+                    input: serde_json::json!({"name": "researcher", "task": "task-a"}),
+                    cache_control: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_b".to_string(),
+                    name: "subagent".to_string(),
+                    input: serde_json::json!({"name": "researcher", "task": "task-b"}),
+                    cache_control: None,
+                },
+            ],
+        };
+        let top_level_final_reply = Message::assistant_text("top-level done");
+
+        let top_level_provider = ScriptedProvider {
+            replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+                top_level_tool_call_reply,
+                top_level_final_reply,
+            ])),
+        };
+
+        let mut transcript = vec![Message::user_text("run two subagents concurrently")];
+
+        let timeout_result = tokio::time::timeout(
+            TIMEOUT_BOUND,
+            rokr_core::run_tool_loop(
+                &top_level_provider,
+                "you are a test top-level agent",
+                None,
+                &mut transcript,
+                &tools,
+                |_request| async { true },
+                None,
+                None,
+                None,
+            ),
+        )
+        .await;
+
+        let (final_message, _usage) = timeout_result
+            .expect(
+                "run_tool_loop should complete within the timeout -- a timeout here means two \
+                 concurrent `subagent` tool calls in the same reply are still taking roughly \
+                 2x PER_CALL_DELAY, i.e. still being dispatched sequentially rather than \
+                 overlapping",
+            )
+            .expect("top-level loop should succeed");
+
+        assert_eq!(final_message.text(), "top-level done");
+
+        match &transcript[transcript.len() - 2].content[..] {
+            [ContentBlock::ToolResult {
+                tool_use_id: id_a,
+                content: content_a,
+                is_error: is_error_a,
+                ..
+            }, ContentBlock::ToolResult {
+                tool_use_id: id_b,
+                content: content_b,
+                is_error: is_error_b,
+                ..
+            }] => {
+                assert_eq!(id_a, "call_a");
+                assert!(!is_error_a);
+                assert_eq!(content_a, "final answer for: task-a");
+                assert_eq!(id_b, "call_b");
+                assert!(!is_error_b);
+                assert_eq!(content_b, "final answer for: task-b");
+            }
+            other => panic!("expected two ToolResult blocks in original order, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

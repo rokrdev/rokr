@@ -2656,6 +2656,7 @@ dependencies = [
 name = "rokr-core"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "rokr-tools",
  "serde",
  "serde_json",
