@@ -48,10 +48,20 @@
    CI. Distribution rounds out this phase: install script, Homebrew,
    `rokr upgrade` self-update, and shell completions.
 
-8. **Phase 8 — Advanced execution & DX** — OS-level sandboxing, parallel
-   subagents, git workflow integration, LSP integration (optional, last),
-   and image support (clipboard paste to vision-capable models — the
-   content-block model already supports this, per ADR 0006).
+8. **Phase 8 — Execution hardening & safe concurrency** — OS-level
+   sandboxing (tracer bullet, built alone first: a `Sandbox` trait, macOS
+   Seatbelt backend, deny-by-default profile wrapping the bash/execute tool
+   path), permission modes (allowlist/auto-accept, extending the headless
+   `--permission-mode` concept into interactive TUI allowlist/session-grant
+   per ADR 0005), parallel subagents (depth-1 cap unchanged; concurrent
+   permission prompts serialize through a queue), and executable Agent
+   Skills (last, hard-gated on sandboxing validated as trustworthy, with a
+   pre-agreed cut to Phase 8.1 if sandboxing runs long).
+
+9. **Phase 9 — DX & multimodal** — git workflow integration, image support
+   (clipboard paste to vision-capable models — the content-block model
+   already supports this, per ADR 0006), and LSP integration (optional,
+   demand-gated, last).
 
 ## Design principles
 
