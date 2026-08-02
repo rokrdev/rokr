@@ -183,7 +183,12 @@ impl SessionRunner {
             let glob = rokr_tools::glob::GlobTool;
             let grep = rokr_tools::grep::GrepTool;
             let ls = rokr_tools::ls::LsTool;
-            let bash = rokr_tools::bash::BashTool;
+            // Ticket 69 (bash-command-sandbox-confinement): confine `bash`
+            // to the process's cwd via `SeatbeltSandbox`, computed once per
+            // submission rather than once per process so a later ticket can
+            // vary it per-session without touching this call site.
+            let workspace_root = std::env::current_dir().map_err(|e| e.to_string())?;
+            let bash = rokr_tools::bash::BashTool::new(workspace_root);
             let write = rokr_tools::write::WriteTool;
             let edit = rokr_tools::edit::EditTool;
             let webfetch = rokr_tools::webfetch::WebfetchTool;

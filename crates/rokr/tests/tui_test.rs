@@ -2682,6 +2682,7 @@ async fn bash_tool_call_renders_permission_prompt_and_runs_on_accept() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -3749,6 +3750,7 @@ async fn pretooluse_hook_matcher_only_vetoes_matching_tool_names() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
