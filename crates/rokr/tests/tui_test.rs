@@ -13982,3 +13982,299 @@ async fn second_gated_call_to_same_tool_after_remember_choice_never_reprompts() 
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+/// Ticket 74 (`subagent-permission-queue-serialization`), acceptance test,
+/// second half of the acceptance criterion (the first half -- "no
+/// cross-talk between two concurrent subagents' own requests" -- is covered
+/// by `crates/rokr-app/src/subagent.rs`'s
+/// `concurrent_permission_requests_from_two_subagents_each_receive_their_
+/// own_correct_response`): under a session-wide auto-accept grant (ticket
+/// 72), two CONCURRENT subagent gated-tool calls to the SAME tool must
+/// never populate the permission-prompt queue at all.
+///
+/// **Deviation from the ticket's literal "real PTY-driven TUI run" sketch**
+/// -- documented here per this ticket's own escape hatch, mirroring
+/// `subagent.rs`'s `two_concurrent_subagent_tool_calls_in_one_reply_are_
+/// dispatched_concurrently` precedent (ADR 0017 decision 5) for the general
+/// "explain the deviation" norm:
+///
+/// The real, unmodified `SubagentTool::execute_boxed` hardcodes a
+/// subagent's tool set to exactly `[read, glob, grep, ls]` (see that
+/// struct's own doc comment in `crates/rokr-app/src/subagent.rs`) -- NONE
+/// of which is `PreviewableTool`/gated. A real subagent invoked through the
+/// compiled `rokr` binary can therefore structurally never trigger ANY
+/// permission prompt today, PTY or otherwise -- there is no gated tool in
+/// its roster to call. This ticket's own files-touched list and process
+/// notes are explicit that widening that production roster to include a
+/// gated tool by default is OUT of scope (a materially bigger behavior
+/// change than this ticket asks for). A consequence: a PTY-driven version
+/// of this test would be unable to go RED even before this ticket's fix --
+/// it would show zero prompts both before and after, since there would
+/// never be anything for a subagent to gate on either way. That provides no
+/// signal, so it isn't a meaningful acceptance test regardless of how it's
+/// written.
+///
+/// Instead, this test drives `rokr_app::subagent::run_subagent` directly --
+/// made `pub` by this ticket specifically for this purpose (see its own doc
+/// comment) -- with a small injected gated test tool, the exact same
+/// pattern this ticket's sibling test in `subagent.rs` uses for the
+/// "no cross-talk" half. This still exercises the REAL production
+/// `run_subagent` / `PermissionPolicy` / `SessionGrants` code that
+/// `runner.rs` wires a live `SubagentTool` up to (see `SubagentTool`'s and
+/// `run_subagent`'s own doc comments for how `session_grants` flows through
+/// unchanged from `SessionRunner`) -- only the render loop's PTY rendering
+/// itself is out of reach here, and that portion (a session-wide grant
+/// suppressing a SECOND prompt for the PARENT's own gated calls) is already
+/// covered end-to-end over a real PTY by
+/// `second_gated_call_to_same_tool_after_remember_choice_never_reprompts`
+/// immediately above, which shares this exact same `PermissionPolicy`/
+/// `SessionGrants` machinery.
+///
+/// Structured as two phases sharing one responder/channel so the test
+/// carries its own red evidence inline, per this ticket's process notes
+/// ("Red: force the policy short-circuit off... to show prompts WOULD
+/// render absent the fix"): phase A (no grant established yet) proves the
+/// channel genuinely DOES receive one request per concurrent subagent call
+/// absent a grant -- i.e. this harness is real, not a tautology that always
+/// reads zero. Phase B (the SAME tool now granted session-wide, mirroring
+/// what pressing 'r' at a real prompt records) then proves the request
+/// count on that SAME channel does NOT increase for two more concurrent
+/// subagent calls to the same tool, while both calls still complete
+/// successfully -- proving the tool actually ran (auto-approved), not that
+/// the calls silently failed or hung.
+#[tokio::test]
+async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populate_the_permission_prompt_queue()
+ {
+    #[derive(Debug)]
+    struct AcceptanceStubError;
+
+    impl std::fmt::Display for AcceptanceStubError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "acceptance stub error")
+        }
+    }
+
+    /// Mirrors `subagent.rs`'s own private `ScriptedProvider` test fake,
+    /// duplicated here rather than shared (it's `#[cfg(test)]`-private to
+    /// that crate, unreachable from this integration test binary).
+    struct AcceptanceScriptedProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<rokr_core::Message>>,
+    }
+
+    impl rokr_core::Provider for AcceptanceScriptedProvider {
+        type Error = AcceptanceStubError;
+
+        async fn send(
+            &self,
+            _messages: &[rokr_core::Message],
+            _tools: &[rokr_core::ToolSpec],
+        ) -> Result<(rokr_core::Message, rokr_core::Usage), AcceptanceStubError> {
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(AcceptanceStubError)
+                .map(|message| (message, rokr_core::Usage::default()))
+        }
+    }
+
+    /// Mirrors `subagent.rs`'s own private `FakeGatedTool` test fake,
+    /// implemented directly against `rokr_core::ExecutableTool` (skipping
+    /// the `rokr_tools::Tool`/`PreviewableTool` bridge that fake uses,
+    /// since that bridge buys nothing extra for this test).
+    struct AcceptanceFakeGatedTool;
+
+    impl rokr_core::ExecutableTool for AcceptanceFakeGatedTool {
+        fn name(&self) -> &str {
+            "fake_gated"
+        }
+
+        fn to_tool_spec(&self) -> rokr_core::ToolSpec {
+            rokr_core::ToolSpec {
+                name: "fake_gated".to_string(),
+                description: "fake gated tool for acceptance test".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            }
+        }
+
+        fn execute_boxed<'a>(
+            &'a self,
+            _input: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>,
+        > {
+            Box::pin(async move { Ok("executed".to_string()) })
+        }
+
+        fn preview(
+            &self,
+            _input: serde_json::Value,
+        ) -> Option<Result<rokr_core::PermissionPayload, rokr_tools::ToolError>> {
+            Some(Ok(rokr_core::PermissionPayload::Command(
+                "fake command".to_string(),
+            )))
+        }
+    }
+
+    fn tool_call_reply(call_id: &str) -> rokr_core::Message {
+        rokr_core::Message {
+            role: rokr_core::Role::Assistant,
+            content: vec![rokr_core::ContentBlock::ToolUse {
+                id: call_id.to_string(),
+                name: "fake_gated".to_string(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }],
+        }
+    }
+
+    let gated_tool = AcceptanceFakeGatedTool;
+    let tools: [&dyn rokr_core::ExecutableTool; 1] = [&gated_tool];
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+        rokr_core::PermissionRequest,
+        tokio::sync::oneshot::Sender<bool>,
+    )>(8);
+
+    // A single responder drains the whole channel for the life of the
+    // test, recording every request it ever sees and auto-approving it --
+    // so "how many requests arrived" is just this vec's length at any
+    // point, regardless of which phase produced them.
+    let received: std::sync::Arc<std::sync::Mutex<Vec<rokr_core::PermissionRequest>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received_writer = received.clone();
+    tokio::spawn(async move {
+        while let Some((request, responder)) = rx.recv().await {
+            received_writer.lock().unwrap().push(request);
+            let _ = responder.send(true);
+        }
+    });
+
+    let request_permission: rokr_app::subagent::PermissionCallback = Box::new(move |request| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            if tx.send((request, resp_tx)).await.is_err() {
+                return false;
+            }
+            resp_rx.await.unwrap_or(false)
+        })
+    });
+
+    // Phase A: no grant established yet.
+    let ungranted_session_grants = std::sync::Arc::new(std::sync::Mutex::new(
+        rokr_app::permission_policy::SessionGrants::new(),
+    ));
+
+    let provider_a1 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_a1"),
+            rokr_core::Message::assistant_text("a1 done"),
+        ])),
+    };
+    let provider_a2 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_a2"),
+            rokr_core::Message::assistant_text("a2 done"),
+        ])),
+    };
+
+    let (a1_result, a2_result) = tokio::join!(
+        rokr_app::subagent::run_subagent(
+            &provider_a1,
+            "you are a test subagent",
+            "phase a, subagent 1".to_string(),
+            &tools,
+            "phase-a-one",
+            &request_permission,
+            &ungranted_session_grants,
+        ),
+        rokr_app::subagent::run_subagent(
+            &provider_a2,
+            "you are a test subagent",
+            "phase a, subagent 2".to_string(),
+            &tools,
+            "phase-a-two",
+            &request_permission,
+            &ungranted_session_grants,
+        ),
+    );
+
+    assert_eq!(
+        a1_result.expect("phase a subagent 1 should succeed"),
+        "a1 done"
+    );
+    assert_eq!(
+        a2_result.expect("phase a subagent 2 should succeed"),
+        "a2 done"
+    );
+
+    let phase_a_count = received.lock().unwrap().len();
+    assert_eq!(
+        phase_a_count, 2,
+        "red evidence: absent a session-wide grant, both concurrent subagents' gated calls \
+         must reach the permission-prompt channel -- got {phase_a_count} (expected 2). If this \
+         is 0, this test harness itself isn't exercising the permission path at all, and the \
+         phase B assertion below would be meaningless."
+    );
+
+    // Phase B: the SAME tool now granted session-wide, mirroring what
+    // pressing 'r' at a real prompt records (ticket 72).
+    let granted_session_grants = std::sync::Arc::new(std::sync::Mutex::new({
+        let mut grants = rokr_app::permission_policy::SessionGrants::new();
+        grants.grant("fake_gated");
+        grants
+    }));
+
+    let provider_b1 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_b1"),
+            rokr_core::Message::assistant_text("b1 done"),
+        ])),
+    };
+    let provider_b2 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_b2"),
+            rokr_core::Message::assistant_text("b2 done"),
+        ])),
+    };
+
+    let (b1_result, b2_result) = tokio::join!(
+        rokr_app::subagent::run_subagent(
+            &provider_b1,
+            "you are a test subagent",
+            "phase b, subagent 1".to_string(),
+            &tools,
+            "phase-b-one",
+            &request_permission,
+            &granted_session_grants,
+        ),
+        rokr_app::subagent::run_subagent(
+            &provider_b2,
+            "you are a test subagent",
+            "phase b, subagent 2".to_string(),
+            &tools,
+            "phase-b-two",
+            &request_permission,
+            &granted_session_grants,
+        ),
+    );
+
+    assert_eq!(
+        b1_result.expect("phase b subagent 1 should succeed once the grant auto-approves it"),
+        "b1 done"
+    );
+    assert_eq!(
+        b2_result.expect("phase b subagent 2 should succeed once the grant auto-approves it"),
+        "b2 done"
+    );
+
+    let phase_b_count = received.lock().unwrap().len();
+    assert_eq!(
+        phase_b_count, phase_a_count,
+        "under a session-wide auto-accept grant for the SAME tool, neither concurrent \
+         subagent's gated call should ever reach the permission-prompt channel -- expected the \
+         count to stay at {phase_a_count}, got {phase_b_count}"
+    );
+}

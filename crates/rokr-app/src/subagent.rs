@@ -19,6 +19,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// A permission-request callback, matching the shape
 /// `rokr_core::run_tool_loop` itself expects
@@ -57,10 +58,23 @@ pub type PermissionCallback = Box<
 /// subagent's own provider calls get the same retry/backoff the parent
 /// session's send path gets -- before this fix, a single transient failure
 /// inside a subagent call had no retry at all.
+///
+/// Ticket 74 (`subagent-permission-queue-serialization`): `session_grants`
+/// is the SAME `Arc<Mutex<SessionGrants>>` the parent's own
+/// `request_permission` closure in `runner.rs` consults (see that closure's
+/// doc comment) -- passed here so a subagent's gated tool call is resolved
+/// against the identical set of prior "remember for this session" grants,
+/// not a separate/absent one. Consulting happens in `run_subagent`, on the
+/// call's ORIGINAL (untagged) tool name, before `tag_permission_request`
+/// ever runs -- session grants are recorded tool-name-keyed (see
+/// `permission_policy::SessionGrants`), and tagging with the subagent's
+/// name would otherwise make a grant recorded via the parent's own flow
+/// (untagged) never match a subagent's tagged request for the same tool.
 pub struct SubagentTool {
     provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
     config_dir: PathBuf,
     request_permission: PermissionCallback,
+    session_grants: Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
 }
 
 impl SubagentTool {
@@ -68,11 +82,13 @@ impl SubagentTool {
         provider: rokr_provider::ResilientProvider<rokr_provider::AnyProvider>,
         config_dir: PathBuf,
         request_permission: PermissionCallback,
+        session_grants: Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
     ) -> Self {
         Self {
             provider,
             config_dir,
             request_permission,
+            session_grants,
         }
     }
 }
@@ -172,6 +188,7 @@ impl rokr_core::ExecutableTool for SubagentTool {
                 &tools,
                 &name,
                 &self.request_permission,
+                &self.session_grants,
             )
             .await
         })
@@ -201,18 +218,70 @@ fn tag_permission_request(
 /// monomorphizes it on the concrete `AnyProvider`, which is what keeps the
 /// resulting future provably `Send` per ADR 0009 (see `SubagentTool`'s doc
 /// comment).
-async fn run_subagent<P: rokr_core::Provider>(
+///
+/// `pub` (not the crate-private visibility every other function in this
+/// module besides `SubagentTool`'s own methods has): ticket 74
+/// (`subagent-permission-queue-serialization`)'s acceptance test lives in
+/// the `rokr` crate's own integration suite (`crates/rokr/tests/
+/// tui_test.rs`), which cannot reach a private free function in this crate.
+/// It needs this function specifically (rather than going through
+/// `SubagentTool::execute_boxed`) because `execute_boxed` hardcodes its
+/// tool set to the read-only `[read, glob, grep, ls]` roster -- none of
+/// which is gated -- so there is no way to exercise a subagent's gated-call
+/// permission path through the real, unmodified `SubagentTool` at all. This
+/// ticket deliberately does not widen that production roster (a bigger
+/// behavior change than it asks for), so the acceptance test instead calls
+/// `run_subagent` directly with an injected gated test tool, mirroring the
+/// exact pattern this module's own `FakeGatedTool` unit tests already use.
+pub async fn run_subagent<P: rokr_core::Provider>(
     provider: &P,
     subagent_prompt: &str,
     task: String,
     tools: &[&dyn rokr_core::ExecutableTool],
     subagent_name: &str,
     request_permission: &PermissionCallback,
+    session_grants: &Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
 ) -> Result<String, rokr_tools::ToolError> {
     let mut transcript = vec![rokr_core::Message::user_text(task)];
 
-    let tagged_request_permission = |request: rokr_core::PermissionRequest| {
-        (request_permission)(tag_permission_request(request, subagent_name))
+    // Ticket 74: consults the SAME `PermissionPolicy`/`SessionGrants` the
+    // parent's own `request_permission` closure in `runner.rs` consults
+    // (see that closure's doc comment), on the call's ORIGINAL (untagged)
+    // `request.tool_name` -- BEFORE `tag_permission_request` below ever
+    // runs. `mode: None`: mirrors the parent closure exactly, since a
+    // subagent's gated calls happen within the same interactive TUI
+    // session, which has no ambient `--permission-mode` either (see
+    // `permission_policy::resolve`'s doc comment).
+    //
+    // On `Resolution::Allow`, `request_permission` (the boxed callback that
+    // ultimately round-trips through `rokr_tui::PermissionHandle`'s mpsc
+    // channel to the render loop) is never even called -- this is what
+    // keeps a session-wide "remember" grant from ever populating that
+    // channel for a subagent's gated call, per this ticket's acceptance
+    // criterion ("the fast path that keeps a fan-out of subagents from
+    // stalling").
+    let tagged_request_permission = |request: rokr_core::PermissionRequest| async move {
+        let resolution = {
+            let grants = session_grants.lock().unwrap();
+            crate::permission_policy::PermissionPolicy::resolve(
+                None,
+                &request.tool_name,
+                None,
+                &grants,
+            )
+        };
+        match resolution {
+            crate::permission_policy::Resolution::Allow => true,
+            // Structurally unreachable with `mode: None` today (`None` only
+            // ever yields `Allow` or `Prompt`, see `permission_policy::
+            // resolve`) -- kept so the match stays exhaustive against
+            // `Resolution`'s full shape, mirroring the parent closure in
+            // `runner.rs`.
+            crate::permission_policy::Resolution::Deny => false,
+            crate::permission_policy::Resolution::Prompt => {
+                (request_permission)(tag_permission_request(request, subagent_name)).await
+            }
+        }
     };
 
     // Ticket 49 (hooks-tracer-bullet), extended by ticket 50
@@ -406,6 +475,9 @@ mod tests {
 
         let request_permission: PermissionCallback =
             Box::new(|_request| Box::pin(async { true }));
+        let session_grants = Arc::new(std::sync::Mutex::new(
+            crate::permission_policy::SessionGrants::new(),
+        ));
 
         let result = run_subagent(
             &provider,
@@ -414,6 +486,7 @@ mod tests {
             &tools,
             "researcher",
             &request_permission,
+            &session_grants,
         )
         .await
         .expect("subagent run should succeed");
@@ -486,10 +559,19 @@ mod tests {
         let request_permission: PermissionCallback =
             Box::new(|_request| Box::pin(async { true }));
 
+        let session_grants = Arc::new(std::sync::Mutex::new(
+            crate::permission_policy::SessionGrants::new(),
+        ));
+
         // F-004: `SubagentTool::new` must accept the resilience-wrapped
         // provider directly -- a bare `AnyProvider` field here would mean
         // this transient failure is never retried at all.
-        let tool = SubagentTool::new(resilient_provider, temp_dir.clone(), request_permission);
+        let tool = SubagentTool::new(
+            resilient_provider,
+            temp_dir.clone(),
+            request_permission,
+            session_grants,
+        );
 
         let result = tool
             .execute_boxed(serde_json::json!({
@@ -570,6 +652,10 @@ mod tests {
             })
         });
 
+        let session_grants = Arc::new(std::sync::Mutex::new(
+            crate::permission_policy::SessionGrants::new(),
+        ));
+
         let result = run_subagent(
             &provider,
             "you are a test subagent",
@@ -577,6 +663,7 @@ mod tests {
             &tools,
             "researcher",
             &request_permission,
+            &session_grants,
         )
         .await
         .expect("subagent run should succeed once permission is granted");
@@ -598,6 +685,148 @@ mod tests {
             request.tool_name.contains("researcher"),
             "tagged tool_name should identify the subagent that made the call, got: {}",
             request.tool_name
+        );
+    }
+
+    /// Ticket 74 (`subagent-permission-queue-serialization`), test 1: two
+    /// subagents dispatched CONCURRENTLY (`tokio::join!`, mirroring ticket
+    /// 73's own concurrent-dispatch mechanism), each making one gated call
+    /// via `FakeGatedTool`, must each receive back EXACTLY the answer sent
+    /// for its OWN request -- never the other's. Extends the single-caller
+    /// `subagent_gated_tool_call_surfaces_permission_request_tagged_with_
+    /// subagent_name` pattern immediately above (same hand-rolled
+    /// mpsc/oneshot responder shape) to two concurrent callers whose
+    /// answers deliberately differ: "alice" is approved, "bob" is denied.
+    ///
+    /// A `ConditionalProvider` (rather than the fixed-sequence
+    /// `ScriptedProvider`) stands in as each subagent's underlying model:
+    /// its second reply ECHOES the just-produced `ToolResult` content
+    /// (`"executed"` on approval, `"permission denied by user"` on denial)
+    /// back as the subagent's final answer, so a swapped or dropped
+    /// correlation between a request and its own response becomes visible
+    /// in the RETURNED TEXT, not just in which branch executed internally.
+    /// It's pure/stateless (computed only from the incoming `messages`
+    /// slice), so ONE shared instance safely serves both concurrent calls
+    /// with no risk of the test harness itself racing.
+    ///
+    /// Red-proof note (per this ticket's TDD process step 3): as written,
+    /// this test passed immediately -- there is no cross-talk bug in this
+    /// layer today (each call already gets its own oneshot channel, and
+    /// `run_subagent`'s local `transcript`/closures are call-local, not
+    /// shared mutable state). To confirm the test has teeth rather than
+    /// being a tautology, the responder above was temporarily changed to
+    /// send a single fixed answer to BOTH received requests regardless of
+    /// which subagent tagged them (collapsing the `alice`/`bob` branch to
+    /// always `true`) -- reproducing a "cross-talk"-shaped bug (both
+    /// callers get the same answer) -- and this test failed on bob's
+    /// assertion as expected. Restored to the discriminating responder
+    /// below afterward.
+    #[tokio::test]
+    async fn concurrent_permission_requests_from_two_subagents_each_receive_their_own_correct_response()
+     {
+        struct ConditionalProvider;
+
+        impl rokr_core::Provider for ConditionalProvider {
+            type Error = StubError;
+
+            async fn send(
+                &self,
+                messages: &[Message],
+                _tools: &[rokr_core::ToolSpec],
+            ) -> Result<(Message, rokr_core::Usage), StubError> {
+                let last = messages.last().ok_or(StubError)?;
+                let tool_result_content = last.content.iter().find_map(|block| match block {
+                    ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                });
+                let reply = match tool_result_content {
+                    None => Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolUse {
+                            id: "call_1".to_string(),
+                            name: "fake_gated".to_string(),
+                            input: serde_json::json!({}),
+                            cache_control: None,
+                        }],
+                    },
+                    Some(content) => Message::assistant_text(format!("outcome: {content}")),
+                };
+                Ok((reply, rokr_core::Usage::default()))
+            }
+        }
+
+        let provider = ConditionalProvider;
+        let gated_tool = FakeGatedTool;
+        let tools: [&dyn rokr_core::ExecutableTool; 1] = [&gated_tool];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+            rokr_core::PermissionRequest,
+            tokio::sync::oneshot::Sender<bool>,
+        )>(4);
+
+        // Drains BOTH requests off the ONE shared channel -- mirroring how
+        // a real render loop drains `rokr_tui::PermissionHandle`'s single
+        // mpsc receiver -- and answers each based on which subagent it was
+        // tagged for, deciding PER REQUEST rather than by arrival order (so
+        // this doesn't just get lucky if the two calls happen to arrive in
+        // a fixed order).
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Some((request, responder)) = rx.recv().await {
+                    let approve = request.tool_name.contains("alice");
+                    let _ = responder.send(approve);
+                }
+            }
+        });
+
+        let request_permission: PermissionCallback = Box::new(move |request| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                if tx.send((request, resp_tx)).await.is_err() {
+                    return false;
+                }
+                resp_rx.await.unwrap_or(false)
+            })
+        });
+
+        let session_grants = Arc::new(std::sync::Mutex::new(
+            crate::permission_policy::SessionGrants::new(),
+        ));
+
+        let (alice_result, bob_result) = tokio::join!(
+            run_subagent(
+                &provider,
+                "you are a test subagent",
+                "alice's task".to_string(),
+                &tools,
+                "alice",
+                &request_permission,
+                &session_grants,
+            ),
+            run_subagent(
+                &provider,
+                "you are a test subagent",
+                "bob's task".to_string(),
+                &tools,
+                "bob",
+                &request_permission,
+                &session_grants,
+            ),
+        );
+
+        let alice_result = alice_result.expect("alice's subagent run should succeed");
+        let bob_result = bob_result.expect("bob's subagent run should succeed");
+
+        assert_eq!(
+            alice_result, "outcome: executed",
+            "alice's gated call was approved -- her result must reflect the tool actually \
+             running, got: {alice_result}"
+        );
+        assert_eq!(
+            bob_result, "outcome: permission denied by user",
+            "bob's gated call was denied -- his result must reflect the denial, NOT alice's \
+             approval (cross-talk), got: {bob_result}"
         );
     }
 
@@ -699,8 +928,15 @@ mod tests {
         let request_permission: PermissionCallback =
             Box::new(|_request| Box::pin(async { true }));
 
-        let subagent_tool =
-            SubagentTool::new(resilient_provider, temp_dir.clone(), request_permission);
+        let session_grants = Arc::new(std::sync::Mutex::new(
+            crate::permission_policy::SessionGrants::new(),
+        ));
+        let subagent_tool = SubagentTool::new(
+            resilient_provider,
+            temp_dir.clone(),
+            request_permission,
+            session_grants,
+        );
         let tools: [&dyn ExecutableTool; 1] = [&subagent_tool];
 
         let top_level_tool_call_reply = Message {

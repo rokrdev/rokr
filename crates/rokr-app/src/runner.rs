@@ -250,11 +250,13 @@ impl SessionRunner {
             let request_permission_turn_index = turn_index.clone();
             let request_permission_data_dir = data_dir.clone();
             let request_permission_mcp_http_origins = mcp_http_origins.clone();
-            // Ticket 72: cloned into the PARENT `request_permission` closure
-            // only -- the subagent closure below deliberately does NOT
-            // consult `PermissionPolicy`/`session_grants` (subagent
-            // grant-recording is deferred to a later ticket, see that
-            // closure's own comment).
+            // Ticket 72: cloned into the PARENT `request_permission` closure.
+            // Ticket 74 (`subagent-permission-queue-serialization`): the
+            // subagent closure below no longer needs its own clone here --
+            // it forwards the SAME `session_grants` handle straight into
+            // `SubagentTool::new` (see the `subagent_tool` construction
+            // below), which is where `run_subagent` actually consults it
+            // (on the call's untagged tool name, before subagent-tagging).
             let request_permission_session_grants = session_grants.clone();
             let subagent_request_permission_session_handle = session_handle.clone();
             let subagent_request_permission_turn_index = turn_index.clone();
@@ -424,12 +426,24 @@ impl SessionRunner {
                             }
                         };
                         // Ticket 72: mechanical adaptation to
-                        // `PermissionDecision` only -- this subagent
-                        // closure deliberately does NOT consult
-                        // `PermissionPolicy`/`session_grants`. Subagent
-                        // grant-recording is explicitly deferred to a later
-                        // ticket (`subagent-permission-queue-serialization`,
-                        // this ticket's "unblocks").
+                        // `PermissionDecision` only. Ticket 74
+                        // (`subagent-permission-queue-serialization`): the
+                        // `PermissionPolicy`/`session_grants` consultation
+                        // for a subagent's gated call now happens one layer
+                        // up, in `subagent::run_subagent`, on the call's
+                        // ORIGINAL (untagged) tool name -- BEFORE this
+                        // closure is ever invoked at all when a session-wide
+                        // grant already covers it. This closure only runs
+                        // for the `Resolution::Prompt` case (or when
+                        // `run_subagent`'s own consultation isn't reachable,
+                        // which doesn't happen in practice): it still does
+                        // NOT re-consult `PermissionPolicy` itself, nor
+                        // record new grants from a subagent's own
+                        // `AllowAndRemember` choice (that would require
+                        // widening this closure's `bool`-only return type to
+                        // carry the full `PermissionDecision`, which this
+                        // ticket's acceptance criteria don't require -- see
+                        // ticket 74's report for the full rationale).
                         let decision = permission
                             .request(rokr_tui::PermissionRequest {
                                 tool_name: request.tool_name,
@@ -460,6 +474,7 @@ impl SessionRunner {
                 provider.clone(),
                 config_dir.clone(),
                 subagent_request_permission,
+                session_grants.clone(),
             );
 
             // PC-1 ruling (supersedes ticket 46's whole-session
