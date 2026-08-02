@@ -11,6 +11,7 @@ pub mod cli;
 pub mod upgrade;
 pub mod commands;
 pub mod headless;
+pub mod permission_policy;
 pub mod result_schema;
 pub mod runner;
 pub mod subagent;
