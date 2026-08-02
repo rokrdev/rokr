@@ -9,3 +9,7 @@
 
 .workflow/
 .claude/worktrees/
+
+# direnv
+.envrc
+.env
