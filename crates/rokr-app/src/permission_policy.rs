@@ -61,6 +61,20 @@ impl PermissionPolicy {
     /// for, given the headless-equivalent `mode` and any prior session
     /// grants.
     ///
+    /// Ticket 72 (`tui-session-allowlist-grant`) widened `mode` from
+    /// `PermissionMode` to `Option<PermissionMode>`: the interactive TUI has
+    /// no ambient permission mode at all (`--permission-mode` stays
+    /// headless-only, per `crate::cli`'s doc comment), so it has nothing
+    /// meaningful to pass here besides "no mode." `None` means exactly
+    /// that -- absent a prior grant, it resolves to `Resolution::Prompt` for
+    /// every tool, since there is no ambient mode to fall back on.
+    /// `Some(mode)` preserves the original 3-mode behavior unchanged
+    /// (`Bypass` -> `Allow`, `Deny` -> `Deny`, `AcceptEdits` -> `Allow` for
+    /// `write`/`edit` only, `Prompt` otherwise) -- this is what headless
+    /// callers pass. See `docs/adr/0016-permission-mode-policy-layer.md`'s
+    /// "Amendment (ticket 72)" section for the full rationale and rejected
+    /// alternatives.
+    ///
     /// `path` is accepted but unused today: `SessionGrants` is tool-name
     /// keyed only in this ticket (see ADR 0016), so nothing here yet
     /// branches on it. It is part of the public signature because the
@@ -69,7 +83,7 @@ impl PermissionPolicy {
     /// change.
     #[allow(unused_variables)]
     pub fn resolve(
-        mode: PermissionMode,
+        mode: Option<PermissionMode>,
         tool_name: &str,
         path: Option<&Path>,
         grants: &SessionGrants,
@@ -79,9 +93,12 @@ impl PermissionPolicy {
         }
 
         match mode {
-            PermissionMode::Bypass => Resolution::Allow,
-            PermissionMode::Deny => Resolution::Deny,
-            PermissionMode::AcceptEdits => {
+            // No ambient mode (the interactive TUI's reality): absent a
+            // prior grant (checked above), always prompt.
+            None => Resolution::Prompt,
+            Some(PermissionMode::Bypass) => Resolution::Allow,
+            Some(PermissionMode::Deny) => Resolution::Deny,
+            Some(PermissionMode::AcceptEdits) => {
                 if tool_name == "write" || tool_name == "edit" {
                     Resolution::Allow
                 } else {
@@ -101,7 +118,7 @@ mod tests {
         let grants = SessionGrants::new();
         for tool in ["bash", "write", "edit", "read", "anything"] {
             assert_eq!(
-                PermissionPolicy::resolve(PermissionMode::Bypass, tool, None, &grants),
+                PermissionPolicy::resolve(Some(PermissionMode::Bypass), tool, None, &grants),
                 Resolution::Allow,
                 "tool {tool} should be allowed under Bypass mode"
             );
@@ -113,7 +130,7 @@ mod tests {
         let grants = SessionGrants::new();
         for tool in ["bash", "write", "edit", "read"] {
             assert_eq!(
-                PermissionPolicy::resolve(PermissionMode::Deny, tool, None, &grants),
+                PermissionPolicy::resolve(Some(PermissionMode::Deny), tool, None, &grants),
                 Resolution::Deny,
                 "tool {tool} should be denied under Deny mode"
             );
@@ -124,19 +141,19 @@ mod tests {
     fn accept_edits_mode_resolves_allow_for_write_and_edit_only() {
         let grants = SessionGrants::new();
         assert_eq!(
-            PermissionPolicy::resolve(PermissionMode::AcceptEdits, "write", None, &grants),
+            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "write", None, &grants),
             Resolution::Allow
         );
         assert_eq!(
-            PermissionPolicy::resolve(PermissionMode::AcceptEdits, "edit", None, &grants),
+            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "edit", None, &grants),
             Resolution::Allow
         );
         assert_eq!(
-            PermissionPolicy::resolve(PermissionMode::AcceptEdits, "bash", None, &grants),
+            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "bash", None, &grants),
             Resolution::Prompt
         );
         assert_eq!(
-            PermissionPolicy::resolve(PermissionMode::AcceptEdits, "read", None, &grants),
+            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "read", None, &grants),
             Resolution::Prompt
         );
     }
@@ -148,12 +165,12 @@ mod tests {
 
         // A grant overrides even Deny mode.
         assert_eq!(
-            PermissionPolicy::resolve(PermissionMode::Deny, "bash", None, &grants),
+            PermissionPolicy::resolve(Some(PermissionMode::Deny), "bash", None, &grants),
             Resolution::Allow
         );
         // An ungranted tool is unaffected by the grant.
         assert_eq!(
-            PermissionPolicy::resolve(PermissionMode::Deny, "write", None, &grants),
+            PermissionPolicy::resolve(Some(PermissionMode::Deny), "write", None, &grants),
             Resolution::Deny
         );
     }
@@ -162,7 +179,47 @@ mod tests {
     fn no_matching_mode_or_grant_resolves_prompt() {
         let grants = SessionGrants::new();
         assert_eq!(
-            PermissionPolicy::resolve(PermissionMode::AcceptEdits, "bash", None, &grants),
+            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "bash", None, &grants),
+            Resolution::Prompt
+        );
+    }
+
+    /// Ticket 72: the NEW `None` semantics -- the interactive TUI has no
+    /// ambient permission mode at all (see `resolve`'s doc comment), so
+    /// with no prior grant, `None` must resolve to `Prompt` for every tool,
+    /// same as `AcceptEdits` does for a non-write/edit tool. This is the
+    /// genuinely new behavior this ticket adds; get a real RED on this
+    /// (fails with a Deny/Prompt assertion mismatch against the deliberate
+    /// placeholder above) before fixing the placeholder to the real value.
+    #[test]
+    fn none_mode_without_grant_resolves_prompt() {
+        let grants = SessionGrants::new();
+        for tool in ["bash", "write", "edit", "read", "anything"] {
+            assert_eq!(
+                PermissionPolicy::resolve(None, tool, None, &grants),
+                Resolution::Prompt,
+                "tool {tool} should be prompted for under None (no ambient mode)"
+            );
+        }
+    }
+
+    /// Ticket 72: a prior grant still overrides `None` the same way it
+    /// overrides `Deny` (`a_prior_session_grant_for_a_tool_resolves_allow_
+    /// without_prompting_again` above) -- precedence-check-first logic is
+    /// unchanged by this ticket, so this is a regression/invariant guard,
+    /// not the delta under test; it may pass immediately once the grant
+    /// check itself (unchanged) runs before the `None` placeholder arm.
+    #[test]
+    fn a_prior_session_grant_for_a_tool_resolves_allow_under_none_mode() {
+        let mut grants = SessionGrants::new();
+        grants.grant("bash");
+
+        assert_eq!(
+            PermissionPolicy::resolve(None, "bash", None, &grants),
+            Resolution::Allow
+        );
+        assert_eq!(
+            PermissionPolicy::resolve(None, "write", None, &grants),
             Resolution::Prompt
         );
     }

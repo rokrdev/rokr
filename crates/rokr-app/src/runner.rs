@@ -47,14 +47,14 @@ pub trait PermissionRequester: Clone + Send + Sync + 'static {
     fn request(
         &self,
         request: rokr_tui::PermissionRequest,
-    ) -> impl std::future::Future<Output = bool> + Send;
+    ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send;
 }
 
 impl PermissionRequester for rokr_tui::PermissionHandle {
     fn request(
         &self,
         request: rokr_tui::PermissionRequest,
-    ) -> impl std::future::Future<Output = bool> + Send {
+    ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send {
         rokr_tui::PermissionHandle::request(self, request)
     }
 }
@@ -126,6 +126,16 @@ pub struct SessionRunner {
     /// interrupt; headless/eval callers pass a conservative `Some(_)` (see
     /// `crate::headless::HEADLESS_MAX_ITERATIONS`).
     pub max_iterations: Option<u32>,
+    /// Ticket 72 (`tui-session-allowlist-grant`): accumulates "remember for
+    /// this session" grants recorded via
+    /// [`rokr_tui::PermissionDecision::AllowAndRemember`], consulted via
+    /// `crate::permission_policy::PermissionPolicy::resolve` at the top of
+    /// `run_submission`'s (parent-only, not subagent's) permission closure
+    /// so a later gated call to an already-granted tool this session never
+    /// re-reaches the interactive prompt. Mirrors `last_known_usage`'s
+    /// `Arc<std::sync::Mutex<..>>` shape exactly -- a plain sync mutex is
+    /// fine here since the lock is never held across an `.await`.
+    pub session_grants: Arc<std::sync::Mutex<crate::permission_policy::SessionGrants>>,
 }
 
 impl SessionRunner {
@@ -159,6 +169,7 @@ impl SessionRunner {
         let context_window_size = self.context_window_size;
         let auto_compact_threshold = self.auto_compact_threshold;
         let max_iterations = self.max_iterations;
+        let session_grants = self.session_grants.clone();
         async move {
             let provider = provider?;
             // F-003: ONE read lock, ONE clone of the current
@@ -239,6 +250,12 @@ impl SessionRunner {
             let request_permission_turn_index = turn_index.clone();
             let request_permission_data_dir = data_dir.clone();
             let request_permission_mcp_http_origins = mcp_http_origins.clone();
+            // Ticket 72: cloned into the PARENT `request_permission` closure
+            // only -- the subagent closure below deliberately does NOT
+            // consult `PermissionPolicy`/`session_grants` (subagent
+            // grant-recording is deferred to a later ticket, see that
+            // closure's own comment).
+            let request_permission_session_grants = session_grants.clone();
             let subagent_request_permission_session_handle = session_handle.clone();
             let subagent_request_permission_turn_index = turn_index.clone();
             let subagent_request_permission_data_dir = data_dir.clone();
@@ -264,6 +281,7 @@ impl SessionRunner {
                 let turn_index = request_permission_turn_index.clone();
                 let data_dir = request_permission_data_dir.clone();
                 let mcp_http_origins = request_permission_mcp_http_origins.clone();
+                let session_grants = request_permission_session_grants.clone();
                 async move {
                     let (detail, diff_path_and_old) = match request.payload {
                         rokr_core::PermissionPayload::Command(command) => {
@@ -295,12 +313,51 @@ impl SessionRunner {
                             )
                         }
                     };
-                    let granted = permission
-                        .request(rokr_tui::PermissionRequest {
-                            tool_name: request.tool_name,
-                            detail,
-                        })
-                        .await;
+                    // Ticket 72 (`tui-session-allowlist-grant`): resolved
+                    // BEFORE ever reaching the interactive prompt below.
+                    // `mode: None` -- the interactive TUI has no ambient
+                    // permission mode (`--permission-mode` stays
+                    // headless-only, see `permission_policy::resolve`'s doc
+                    // comment). The lock is dropped immediately (not held
+                    // across the `.await` in the `Prompt` arm below).
+                    let resolution = {
+                        let grants = session_grants.lock().unwrap();
+                        crate::permission_policy::PermissionPolicy::resolve(
+                            None,
+                            &request.tool_name,
+                            None,
+                            &grants,
+                        )
+                    };
+                    let granted = match resolution {
+                        // A prior "remember for this session" grant already
+                        // covers this tool -- skip the prompt entirely.
+                        crate::permission_policy::Resolution::Allow => true,
+                        // Structurally unreachable with `mode: None` today
+                        // (`None` only ever yields `Allow` or `Prompt`, see
+                        // `permission_policy::resolve`) -- kept so the match
+                        // stays exhaustive against `Resolution`'s full shape.
+                        crate::permission_policy::Resolution::Deny => false,
+                        crate::permission_policy::Resolution::Prompt => {
+                            let decision = permission
+                                .request(rokr_tui::PermissionRequest {
+                                    tool_name: request.tool_name.clone(),
+                                    detail,
+                                })
+                                .await;
+                            if decision == rokr_tui::PermissionDecision::AllowAndRemember {
+                                session_grants
+                                    .lock()
+                                    .unwrap()
+                                    .grant(request.tool_name.clone());
+                            }
+                            matches!(
+                                decision,
+                                rokr_tui::PermissionDecision::Allow
+                                    | rokr_tui::PermissionDecision::AllowAndRemember
+                            )
+                        }
+                    };
                     if granted {
                         capture_checkpoint_if_granted_diff(
                             diff_path_and_old,
@@ -366,12 +423,24 @@ impl SessionRunner {
                                 )
                             }
                         };
-                        let granted = permission
+                        // Ticket 72: mechanical adaptation to
+                        // `PermissionDecision` only -- this subagent
+                        // closure deliberately does NOT consult
+                        // `PermissionPolicy`/`session_grants`. Subagent
+                        // grant-recording is explicitly deferred to a later
+                        // ticket (`subagent-permission-queue-serialization`,
+                        // this ticket's "unblocks").
+                        let decision = permission
                             .request(rokr_tui::PermissionRequest {
                                 tool_name: request.tool_name,
                                 detail,
                             })
                             .await;
+                        let granted = matches!(
+                            decision,
+                            rokr_tui::PermissionDecision::Allow
+                                | rokr_tui::PermissionDecision::AllowAndRemember
+                        );
                         if granted {
                             capture_checkpoint_if_granted_diff(
                                 diff_path_and_old,
@@ -1084,8 +1153,8 @@ mod tests {
         fn request(
             &self,
             _request: rokr_tui::PermissionRequest,
-        ) -> impl std::future::Future<Output = bool> + Send {
-            async { true }
+        ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send {
+            async { rokr_tui::PermissionDecision::Allow }
         }
     }
 
@@ -1175,6 +1244,7 @@ mod tests {
             context_window_size: 200_000,
             auto_compact_threshold: 0.7,
             max_iterations: None,
+            session_grants: Arc::new(Mutex::new(crate::permission_policy::SessionGrants::new())),
         };
 
         let reply = runner
@@ -1198,5 +1268,267 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&config_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Ticket 72 (`tui-session-allowlist-grant`): a permission surface
+    /// (NOT `AlwaysGrant`) that always decides `AllowAndRemember`, while
+    /// counting how many times its `request` was actually invoked -- the
+    /// count is the behavioral proof that a SECOND gated call to the same
+    /// tool, in the same session, never reaches this stub at all (it must
+    /// be short-circuited by `PermissionPolicy::resolve` reading the grant
+    /// recorded from the FIRST call).
+    #[derive(Clone)]
+    struct RememberOnceRequester {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PermissionRequester for RememberOnceRequester {
+        fn request(
+            &self,
+            _request: rokr_tui::PermissionRequest,
+        ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { rokr_tui::PermissionDecision::AllowAndRemember }
+        }
+    }
+
+    /// Proves `run_submission`'s wiring of `PermissionPolicy::resolve` +
+    /// `SessionGrants` end to end (ticket 72): a first gated `bash` call,
+    /// decided `AllowAndRemember`, records a grant on `runner.session_grants`;
+    /// a SECOND gated `bash` call in a LATER submission on the SAME runner
+    /// must be auto-allowed via that grant WITHOUT the permission surface's
+    /// `request` ever being invoked again (the call counter stays at 1),
+    /// while the second bash command's real side effect (a second marker
+    /// file) still proves the tool loop actually ran it rather than
+    /// silently skipping it.
+    #[tokio::test]
+    async fn remembered_grant_is_recorded_after_user_chooses_remember_for_session() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        // Ticket 69 (bash-command-sandbox-confinement): `run_submission`
+        // confines `bash` to `std::env::current_dir()` via a Seatbelt
+        // sandbox profile on macOS -- a marker file outside that directory
+        // would be silently blocked. So, unlike the other `unique_temp_dir`
+        // calls below (config_dir/data_dir, never touched by the sandboxed
+        // subprocess), the bash-writable target dir must live UNDER the
+        // test process's actual current directory.
+        let target_dir = std::env::current_dir()
+            .unwrap()
+            .join(format!(
+                "rokr-runner-remember-target-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let marker_one = target_dir.join("remember-marker-one");
+        let marker_two = target_dir.join("remember-marker-two");
+        let command_one = format!("touch {}", marker_one.to_string_lossy());
+        let command_two = format!("touch {}", marker_two.to_string_lossy());
+
+        let first_reply_text = "FirstReplyAfterRememberedBash";
+        let second_reply_text = "SecondReplyAfterAutoAllowedBash";
+
+        // 1st request (first submission): the model asks to run `bash`.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-remember-bash-1",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": serde_json::json!({ "command": command_one }).to_string()
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }
+                ]
+            })))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // 2nd request (still first submission): the tool result feeds back,
+        // and the model gives a tool-call-free final reply.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-remember-bash-1-final",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": { "role": "assistant", "content": first_reply_text },
+                        "finish_reason": "stop"
+                    }
+                ]
+            })))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // 3rd request (second submission): another `bash` call, a
+        // DIFFERENT marker file -- this one must be auto-allowed via the
+        // grant recorded during the first submission.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-remember-bash-2",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": serde_json::json!({ "command": command_two }).to_string()
+                                    }
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }
+                ]
+            })))
+            .up_to_n_times(1)
+            .mount(&mock)
+            .await;
+
+        // 4th+ request(s) (still second submission): final reply.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-remember-bash-2-final",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": { "role": "assistant", "content": second_reply_text },
+                        "finish_reason": "stop"
+                    }
+                ]
+            })))
+            .mount(&mock)
+            .await;
+
+        let any = rokr_provider::AnyProvider::OpenAi(rokr_provider::OpenAiProvider::new(
+            mock.uri(),
+            "gpt-4o-mini",
+            "test-key",
+        ));
+        let policy = rokr_provider::RetryPolicy {
+            max_attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+            max_elapsed: std::time::Duration::from_secs(5),
+        };
+        let resilient = rokr_provider::ResilientProvider::with_policy(any, policy);
+        let provider: Result<SharedProvider, String> =
+            Ok(Arc::new(tokio::sync::RwLock::new(resilient)));
+
+        let (status_tx, _status_rx) = std::sync::mpsc::channel::<rokr_tui::SessionStatus>();
+        let (mcp_notice_tx, _mcp_notice_rx) = std::sync::mpsc::channel::<String>();
+
+        let config_dir = unique_temp_dir("runner-remember-config");
+        let data_dir = unique_temp_dir("runner-remember-data");
+
+        let runner = SessionRunner {
+            provider,
+            transcript: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            system_prompt: "you are a test agent".to_string(),
+            repo_map: Arc::new(Mutex::new(None)),
+            last_known_usage: Arc::new(Mutex::new(None)),
+            last_turn_usage: Arc::new(Mutex::new(None)),
+            config_dir: config_dir.clone(),
+            session_handle: Arc::new(tokio::sync::RwLock::new(None)),
+            turn_index: Arc::new(Mutex::new(0)),
+            data_dir: data_dir.clone(),
+            status_tx,
+            mcp_server_handles: Arc::new(Vec::new()),
+            mcp_notice_tx,
+            mcp_http_origins: Arc::new(HashMap::new()),
+            hooks_config: Arc::new(HashMap::new()),
+            // Build tier: `bash` must be in the tool set for this test's
+            // gated tool call to happen at all (ticket 72's design doc:
+            // "Build-tier agent so bash is in the tool set").
+            agent: AgentTier::Build,
+            context_window_size: 200_000,
+            auto_compact_threshold: 0.7,
+            max_iterations: None,
+            session_grants: Arc::new(Mutex::new(crate::permission_policy::SessionGrants::new())),
+        };
+
+        let requester = RememberOnceRequester {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let first_reply = runner
+            .run_submission("please run the first bash command".to_string(), requester.clone())
+            .await
+            .expect("the first submission should drive to a terminal Ok state");
+
+        assert!(
+            first_reply.contains(first_reply_text),
+            "expected the first submission's reply to contain the provider's final text, got: \
+             {first_reply}"
+        );
+        assert!(
+            marker_one.exists(),
+            "expected the first bash command to have run (marker file created)"
+        );
+        assert_eq!(
+            requester.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the permission surface should have been consulted exactly once for the first, \
+             ungranted bash call"
+        );
+
+        let second_reply = runner
+            .run_submission("please run the second bash command".to_string(), requester.clone())
+            .await
+            .expect("the second submission should drive to a terminal Ok state");
+
+        assert!(
+            second_reply.contains(second_reply_text),
+            "expected the second submission's reply to contain the provider's final text, got: \
+             {second_reply}"
+        );
+        assert!(
+            marker_two.exists(),
+            "expected the second bash command to have actually run (marker file created), \
+             proving the tool loop executed it rather than silently skipping it"
+        );
+        assert_eq!(
+            requester.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the permission surface's request() must NOT have been invoked again for the \
+             second, already-granted bash call -- PermissionPolicy::resolve should have \
+             short-circuited to Allow using the grant recorded from the first call"
+        );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&target_dir);
     }
 }

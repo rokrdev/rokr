@@ -175,3 +175,71 @@ it, would be exactly the kind of speculative flexibility ADR 0015's
   -- this is the behavior
   `a_prior_session_grant_for_a_tool_resolves_allow_without_prompting_again`
   exists to pin down.
+
+## Amendment (ticket 72)
+
+Ticket 72 (`tui-session-allowlist-grant`) wires `PermissionPolicy::resolve`'s
+`Resolution::Prompt` outcome into the real interactive TUI, and populates
+`SessionGrants` from a real user action (pressing `r`, "allow and
+remember," at a permission prompt) -- the two things this ADR's Decision
+section explicitly deferred to it. Doing so required one signature change
+this ADR did not originally anticipate, authorized by the orchestrator as
+an amendment to this ticket's own "no new API" scope:
+
+**`PermissionPolicy::resolve`'s `mode` parameter widens from
+`crate::cli::PermissionMode` to `Option<PermissionMode>`.** The grant
+precedence rule (decision 2, item 1 above) is completely unchanged -- a
+prior grant for `tool_name` still returns `Allow` regardless of `mode`,
+`None` included. The reason for the change: the interactive TUI has no
+ambient permission mode at all. `--permission-mode` /
+`--dangerously-skip-permissions` are headless-only flags (per
+`crate::cli`'s own doc comment, unchanged by this ticket), so a TUI call
+site has nothing meaningful to construct a `PermissionMode` from. Before
+this amendment, every call site was forced to pick SOME `PermissionMode`
+variant even when none applied, which would have meant either silently
+reusing `Deny` (misleading -- the TUI isn't "denying," it's "prompting,
+same as it always did") or `AcceptEdits` (wrong -- it would have started
+auto-allowing `write`/`edit` with no user in the loop, a real behavior
+change nobody asked for). `None` names the TUI's actual situation
+directly: no ambient mode, so (absent a grant) always `Prompt` --
+identical to today's un-widened TUI behavior for a call the user hasn't
+granted yet. `Some(mode)` preserves the original 3-mode behavior
+(`Bypass`/`Deny`/`AcceptEdits`) completely unchanged; headless continues
+to pass `Some(mode)` and is unaffected end to end (verified by this
+ticket's regression run of `accept_edits_permission_mode_grants_file_
+writes_but_denies_bash_execution` and `bypass_permission_mode_without_
+dangerously_skip_permissions_exits_two_with_stderr_error`, both
+unchanged).
+
+### Rejected: add a 4th `PermissionMode` variant (e.g. `Interactive` or
+`NoAmbientMode`)
+
+- Pro: keeps `resolve`'s `mode` parameter non-`Option`, so every call site
+  is still forced to supply something, and the type alone documents all
+  the modes that exist in one enum.
+- Con: rejected. `PermissionMode` is `crate::cli::PermissionMode` --
+  ticket 55's headless-only enum, driven by the headless-only
+  `--permission-mode` flag and documented as such in `cli.rs`'s own doc
+  comment. Adding a variant that can never be selected via
+  `--permission-mode` (since the TUI has no such flag) would mean
+  `cli.rs`'s enum no longer maps 1:1 onto "the modes `--permission-mode`
+  accepts," which is exactly the property ADR 0005/ticket 55 established
+  and this ADR's original Decision section relied on ("reuses
+  `crate::cli::PermissionMode` directly rather than introducing a
+  parallel enum"). It would also require touching `crates/rokr-app/src/
+  cli.rs`, which ticket 72's scope explicitly excludes.
+
+### Rejected: make `SessionGrants::is_granted` public so callers bypass
+`resolve` entirely for the "already granted" check
+
+- Pro: would let a caller check "is this already granted?" without
+  needing a `mode` argument at all, sidestepping the `Option` question.
+- Con: rejected. This would split the permission decision across two call
+  sites -- one path through `is_granted` directly, another through
+  `resolve`'s full precedence chain -- reintroducing exactly the "ad hoc,
+  scattered decision logic" this ADR's original Context section
+  identified as the problem ticket 71 fixed. `resolve` staying the SINGLE
+  entry point every caller goes through (this ADR's decision 1) is what
+  makes the precedence rule (grant beats even `Deny`) a property of one
+  function's tests rather than something every call site has to
+  re-derive and potentially get wrong independently.

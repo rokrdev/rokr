@@ -114,6 +114,28 @@ pub enum PermissionDetail {
     Diff { old: String, new: String },
 }
 
+/// The user's decision on a [`PermissionRequest`], round-tripped back out of
+/// the render loop through [`PermissionHandle::request`]. Ticket 72
+/// (`tui-session-allowlist-grant`): `AllowAndRemember` is a NEW third
+/// decision, distinct from a plain `Allow` -- it additionally tells the
+/// caller (`crates/rokr-app/src/runner.rs`'s `request_permission` closure)
+/// to record a `crate::permission_policy::SessionGrants` grant for this
+/// tool, so a later call to the SAME tool this session resolves `Allow`
+/// without ever reaching this prompt again. rokr-tui itself has no
+/// knowledge of `SessionGrants` (that type lives in `rokr-app`, per ADR
+/// 0016's crate boundary) -- it only carries the user's raw keypress intent
+/// back out as this enum; the app crate decides what to do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// `n`/`q`/`Esc`, or the render loop being gone: reject the tool call.
+    Deny,
+    /// `y`: run the tool call once, without recording a session grant.
+    Allow,
+    /// `r`: run the tool call AND remember this tool for the rest of the
+    /// session (a later call to the same tool never prompts again).
+    AllowAndRemember,
+}
+
 /// Plain data describing the session status line's contents (ticket 43,
 /// mouse-scroll-status-line): elapsed time is computed TUI-locally (see
 /// `AppState::elapsed`), but the context-window usage percentage requires
@@ -146,19 +168,20 @@ pub struct SessionStatus {
 /// channel into the render loop.
 #[derive(Clone)]
 pub struct PermissionHandle {
-    tx: mpsc::Sender<(PermissionRequest, oneshot::Sender<bool>)>,
+    tx: mpsc::Sender<(PermissionRequest, oneshot::Sender<PermissionDecision>)>,
 }
 
 impl PermissionHandle {
     /// Sends `request` to the render loop and waits for the user's
-    /// accept/deny decision. Resolves to `false` (deny) if the render loop
-    /// is gone, so a gated tool fails closed rather than silently running.
-    pub async fn request(&self, request: PermissionRequest) -> bool {
+    /// accept/deny/remember decision. Resolves to [`PermissionDecision::Deny`]
+    /// if the render loop is gone, so a gated tool fails closed rather than
+    /// silently running.
+    pub async fn request(&self, request: PermissionRequest) -> PermissionDecision {
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.tx.send((request, resp_tx)).is_err() {
-            return false;
+            return PermissionDecision::Deny;
         }
-        resp_rx.await.unwrap_or(false)
+        resp_rx.await.unwrap_or(PermissionDecision::Deny)
     }
 }
 
@@ -213,7 +236,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
                 view_lines.extend(truncate_diff(diff_lines(old, new)));
             }
         }
-        view_lines.push("[y] allow  [n] deny".to_string());
+        view_lines.push("[y] allow  [n] deny  [r] remember".to_string());
     } else if state.pending {
         view_lines.push("...".to_string());
     }
@@ -829,11 +852,12 @@ where
     // Carries permission requests from a spawned `submit` call into the
     // render loop the same way, paired with a oneshot the render loop uses
     // to send the user's decision back out to the awaiting `submit` call.
-    let (perm_tx, perm_rx) = mpsc::channel::<(PermissionRequest, oneshot::Sender<bool>)>();
+    let (perm_tx, perm_rx) =
+        mpsc::channel::<(PermissionRequest, oneshot::Sender<PermissionDecision>)>();
     // The responder for whichever request `state.permission_request`
     // currently holds. Kept outside `AppState` because `oneshot::Sender`
     // isn't `Clone`/`Debug`, which `AppState`'s derives require.
-    let mut pending_permission_responder: Option<oneshot::Sender<bool>> = None;
+    let mut pending_permission_responder: Option<oneshot::Sender<PermissionDecision>> = None;
     // ADR 0008: redraw only on state change, never on a fixed timer with no
     // change. Starts true so the first frame still paints.
     let mut dirty = true;
@@ -900,7 +924,12 @@ where
                         match handle_permission_key(key.code, key.modifiers) {
                             PermissionKeyAction::Quit => return Ok(()),
                             PermissionKeyAction::Allow => {
-                                let _ = responder.send(true);
+                                let _ = responder.send(PermissionDecision::Allow);
+                                state.permission_request = None;
+                                dirty = true;
+                            }
+                            PermissionKeyAction::AllowAndRemember => {
+                                let _ = responder.send(PermissionDecision::AllowAndRemember);
                                 state.permission_request = None;
                                 dirty = true;
                             }
@@ -910,7 +939,7 @@ where
                                         .view_lines
                                         .push(format!("{}: permission denied", request.tool_name));
                                 }
-                                let _ = responder.send(false);
+                                let _ = responder.send(PermissionDecision::Deny);
                                 state.permission_request = None;
                                 dirty = true;
                             }
@@ -1196,6 +1225,13 @@ fn handle_enter_key(state: &mut AppState, modifiers: KeyModifiers) -> bool {
 enum PermissionKeyAction {
     /// `y`: run the gated tool call.
     Allow,
+    /// `r`: run the gated tool call AND remember this tool for the rest of
+    /// the session (ticket 72, `tui-session-allowlist-grant`) -- a later
+    /// call to the same tool resolves allow-without-prompting via
+    /// `crate::permission_policy::SessionGrants` (in `rokr-app`; rokr-tui
+    /// itself stays unaware of that type, see `PermissionDecision`'s doc
+    /// comment).
+    AllowAndRemember,
     /// `n`, `q`, or `Esc`: deny the gated tool call. `q`/`Esc` intentionally
     /// do *not* fall through to whole-app quit here (see F-006) — a
     /// permission prompt already blocks all other input, so "back out of
@@ -1218,6 +1254,7 @@ fn handle_permission_key(code: KeyCode, modifiers: KeyModifiers) -> PermissionKe
     }
     match code {
         KeyCode::Char('y') => PermissionKeyAction::Allow,
+        KeyCode::Char('r') => PermissionKeyAction::AllowAndRemember,
         KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => PermissionKeyAction::Deny,
         _ => PermissionKeyAction::Ignore,
     }
@@ -1492,6 +1529,14 @@ mod tests {
         assert_eq!(
             handle_permission_key(KeyCode::Char('y'), KeyModifiers::NONE),
             PermissionKeyAction::Allow
+        );
+    }
+
+    #[test]
+    fn handle_permission_key_allow_and_remember_on_r() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Char('r'), KeyModifiers::NONE),
+            PermissionKeyAction::AllowAndRemember
         );
     }
 

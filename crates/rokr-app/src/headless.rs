@@ -81,7 +81,7 @@ impl crate::runner::PermissionRequester for HeadlessPermissionRequester {
     fn request(
         &self,
         request: rokr_tui::PermissionRequest,
-    ) -> impl std::future::Future<Output = bool> + Send {
+    ) -> impl std::future::Future<Output = rokr_tui::PermissionDecision> + Send {
         let mode = self.mode;
         let denied = self.denied.clone();
         async move {
@@ -105,7 +105,18 @@ impl crate::runner::PermissionRequester for HeadlessPermissionRequester {
             if !granted {
                 denied.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            granted
+            // Ticket 72 (`tui-session-allowlist-grant`): headless has no
+            // "remember for this session" affordance (no interactive user
+            // to press `r`) -- this is a MECHANICAL adaptation to
+            // `PermissionRequester::request`'s new `PermissionDecision`
+            // return type only, not a behavior change. `PermissionPolicy`
+            // is never consulted here; headless's own `mode`-driven
+            // decision above is unchanged.
+            if granted {
+                rokr_tui::PermissionDecision::Allow
+            } else {
+                rokr_tui::PermissionDecision::Deny
+            }
         }
     }
 }
@@ -555,6 +566,14 @@ pub async fn run_result_object(
         // driver (see its own doc comment), so this cap applies to eval
         // runs too without `rokr-eval` needing its own copy.
         max_iterations: Some(HEADLESS_MAX_ITERATIONS),
+        // Ticket 72: structurally required field, mechanical only -- a
+        // fresh, empty grant set every headless run. Headless's own
+        // `HeadlessPermissionRequester` above never consults
+        // `PermissionPolicy`/`SessionGrants` at all, so this has no
+        // behavioral effect on headless mode.
+        session_grants: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::permission_policy::SessionGrants::new(),
+        )),
     };
 
     let run_result = runner.run_submission(prompt, permission.clone()).await;

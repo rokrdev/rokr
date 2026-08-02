@@ -13699,3 +13699,286 @@ async fn plain_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// Ticket 72 (`tui-session-allowlist-grant`): pressing `r` ("allow and
+/// remember") at a gated `bash` call's permission prompt must record a
+/// session grant (via `rokr_app::permission_policy::SessionGrants`,
+/// threaded through `SessionRunner`) so a SECOND gated call to the SAME
+/// tool -- chained within the same submission's `run_tool_loop`, once the
+/// first tool result feeds back -- is auto-allowed without ever rendering a
+/// second permission prompt. Mirrors
+/// `bash_tool_call_renders_permission_prompt_and_runs_on_accept`'s PTY
+/// structure exactly, with three chained mock responses instead of two: one
+/// submitted prompt can trigger multiple sequential tool calls before the
+/// final reply, since `run_tool_loop` keeps calling the provider until it
+/// gets a tool-call-free response -- so this is ONE submission with two
+/// chained `bash` calls, not two separate prompts.
+#[tokio::test]
+async fn second_gated_call_to_same_tool_after_remember_choice_never_reprompts() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterRememberedSecondBashForTesting";
+
+    let temp_dir = unique_temp_dir("bash-remember-target");
+    let marker_one_path = temp_dir.join("remember-marker-one");
+    let marker_two_path = temp_dir.join("remember-marker-two");
+    let marker_one_str = marker_one_path.to_string_lossy().into_owned();
+    let marker_two_str = marker_two_path.to_string_lossy().into_owned();
+    let bash_command_one = format!("touch {marker_one_str}");
+    let bash_command_two = format!("touch {marker_two_str}");
+
+    // 1st request: the model asks to invoke `bash` for the FIRST marker.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-remember-bash-1",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command_one }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // 2nd request: the first tool result feeds back, and the SAME
+    // submission's tool loop immediately asks to invoke `bash` again, this
+    // time for the SECOND marker -- chained within one `run_tool_loop`
+    // call, not a second submitted prompt.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-remember-bash-2",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command_two }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // 3rd request: the second tool result feeds back, and the model gives
+    // a final, tool-call-free reply.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-remember-bash-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-bash-remember");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-bash-remember");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"runbash\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the FIRST permission prompt to render.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("bash") && output.contains("remember-marker-one") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("bash") && output.contains("remember-marker-one"),
+        "expected pty output to contain the first permission prompt (tool name + first \
+         marker's command), got: {output:?}"
+    );
+    assert!(
+        !marker_one_path.exists(),
+        "the first bash command must not have run before permission was granted"
+    );
+
+    // Press `r`: allow AND remember, not plain `y`.
+    writer
+        .write_all(b"r")
+        .expect("failed to write allow-and-remember keypress to pty");
+
+    // Poll in a bounded window until the final reply appears, WHILE
+    // actively asserting the second call's tell-tale text (its distinct
+    // marker filename, which would only ever appear inside a rendered
+    // permission-prompt line) never shows up -- proving the second bash
+    // call never re-prompted, not merely that the run eventually finished.
+    let final_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            !output.contains("remember-marker-two"),
+            "the second bash call's command must never appear in the rendered output -- that \
+             would mean a second permission prompt was shown instead of the grant \
+             auto-allowing it. Output so far: {output:?}"
+        );
+        if output.contains(final_reply_text) {
+            break;
+        }
+        if Instant::now() > final_deadline {
+            panic!(
+                "final reply did not appear within timeout waiting for the auto-allowed \
+                 second bash call to complete; output so far: {output:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after the chained, \
+         auto-allowed second bash call, got: {output:?}"
+    );
+    assert!(
+        marker_one_path.exists(),
+        "expected the first bash command to have run (marker file created) after pressing r"
+    );
+    assert!(
+        marker_two_path.exists(),
+        "expected the second bash command to have actually run (marker file created), proving \
+         the tool loop executed it via the auto-allowed grant rather than silently skipping it"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rokr_app::cli::{completions_script, AuthAction, Cli, Command, ReportFormat};
+use rokr_app::permission_policy::SessionGrants;
 use rokr_app::{
     append_compaction_record, default_data_dir, log_observational_hook_outcome,
     matching_hook_entries, model_pricing_to_pricing_entry, now_timestamp, run_hook_entry,
@@ -479,6 +480,17 @@ async fn main() -> ExitCode {
             let last_known_usage: Arc<std::sync::Mutex<Option<rokr_core::Usage>>> =
                 Arc::new(std::sync::Mutex::new(initial_last_known_usage));
 
+            // Ticket 72 (`tui-session-allowlist-grant`): accumulates
+            // "remember for this session" grants recorded when the user
+            // presses `r` (`PermissionDecision::AllowAndRemember`) at a
+            // permission prompt, mirroring `last_known_usage`'s
+            // `Arc<std::sync::Mutex<..>>` shape immediately above. Always
+            // starts empty -- unlike `last_known_usage`/`turn_index`, a
+            // `/resume`d session does not carry forward any prior session's
+            // grants (they were a decision scoped to that earlier process's
+            // lifetime, not persisted state).
+            let session_grants = Arc::new(std::sync::Mutex::new(SessionGrants::new()));
+
             // Ticket 38 (checkpoint-pre-images): mirrors `last_known_usage`'s
             // exact `Arc<std::sync::Mutex<>>` shape immediately above. Its
             // value equals the count of prior `Turn` records (0-based, per
@@ -751,6 +763,7 @@ async fn main() -> ExitCode {
                 // can always interrupt, unlike headless/eval's unattended
                 // runs (see `crate::headless::HEADLESS_MAX_ITERATIONS`).
                 max_iterations: None,
+                session_grants,
             };
 
             // Ticket 52 (clap-and-sessionrunner-extraction): the submit-and-run
