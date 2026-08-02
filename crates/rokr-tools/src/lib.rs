@@ -14,6 +14,7 @@ pub mod grep;
 pub mod ls;
 pub mod read;
 pub mod repo_map;
+pub mod sandbox;
 pub mod webfetch;
 pub mod websearch;
 pub mod write;
