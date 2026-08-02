@@ -1589,7 +1589,7 @@ mod tests {
         std::fs::write(&target_file, old_content).unwrap();
         let target_path = target_file.to_string_lossy().into_owned();
 
-        let write_tool = rokr_tools::write::WriteTool;
+        let write_tool = rokr_tools::write::WriteTool::new(temp_dir.clone());
         let preview = write_tool.preview(serde_json::json!({
             "path": target_path,
             "content": "new content"
@@ -1647,7 +1647,7 @@ mod tests {
             calls: std::sync::Mutex::new(Vec::new()),
         };
 
-        let write_tool = rokr_tools::write::WriteTool;
+        let write_tool = rokr_tools::write::WriteTool::new(temp_dir.clone());
         let tools: [&dyn ExecutableTool; 1] = [&write_tool];
 
         let mut transcript = vec![Message::user_text("overwrite the file")];

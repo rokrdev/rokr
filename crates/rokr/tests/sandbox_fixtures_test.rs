@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rokr_tools::bash::BashTool;
+use rokr_tools::write::WriteTool;
 use rokr_tools::Tool;
 use serde_json::json;
 
@@ -106,5 +107,34 @@ async fn in_workspace_no_network_command_succeeds_unimpeded() {
     assert_eq!(
         sandboxed, baseline_stdout,
         "sandboxed output should be byte-identical to the unsandboxed baseline"
+    );
+}
+
+/// Ticket 70 (write-edit-path-confinement): mirrors
+/// `out_of_workspace_write_attempt_is_blocked` above, but for the in-process
+/// `WriteTool` confinement check rather than `BashTool`'s `sandbox-exec`
+/// wrapping. Workspace root A, target file in sibling dir B outside it --
+/// the write must fail and the target file must never exist.
+#[tokio::test]
+async fn write_tool_out_of_workspace_write_attempt_is_blocked() {
+    let workspace = unique_temp_dir("write-workspace-a");
+    let outside = unique_temp_dir("write-workspace-b");
+    let target = outside.join("pwned.txt");
+
+    let tool = WriteTool::new(workspace.clone());
+    let result = tool
+        .execute(json!({ "path": target.to_string_lossy(), "content": "pwned" }))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "writing outside workspace_root ({}) into sibling dir ({}) should be blocked, got: {result:?}",
+        workspace.display(),
+        outside.display()
+    );
+    assert!(
+        !target.exists(),
+        "the out-of-workspace file must not have been created: {}",
+        target.display()
     );
 }

@@ -188,9 +188,9 @@ impl SessionRunner {
             // submission rather than once per process so a later ticket can
             // vary it per-session without touching this call site.
             let workspace_root = std::env::current_dir().map_err(|e| e.to_string())?;
+            let write = rokr_tools::write::WriteTool::new(workspace_root.clone());
+            let edit = rokr_tools::edit::EditTool::new(workspace_root.clone());
             let bash = rokr_tools::bash::BashTool::new(workspace_root);
-            let write = rokr_tools::write::WriteTool;
-            let edit = rokr_tools::edit::EditTool;
             let webfetch = rokr_tools::webfetch::WebfetchTool;
 
             // Ticket 28 (websearch-tool): `websearch` needs an

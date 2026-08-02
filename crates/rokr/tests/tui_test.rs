@@ -4161,6 +4161,7 @@ async fn write_tool_call_renders_diff_and_writes_file_on_accept() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -4401,6 +4402,7 @@ async fn write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_reco
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -4817,6 +4819,7 @@ async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn(
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -5477,6 +5480,7 @@ async fn edit_tool_call_renders_partial_diff_and_applies_on_accept() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 

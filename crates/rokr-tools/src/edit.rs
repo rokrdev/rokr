@@ -1,7 +1,10 @@
 //! The `edit` tool: replaces an exact string match within an existing file.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
+use crate::sandbox;
 use crate::{Preview, PreviewableTool, Tool, ToolError};
 
 #[derive(Debug, Deserialize)]
@@ -16,7 +19,27 @@ struct EditInput {
 /// `old_str` does not occur in the file. Gated per
 /// `docs/adr/0005-permission-model.md`: see [`PreviewableTool::preview`] for
 /// the side-effect-free description shown before permission is granted.
-pub struct EditTool;
+///
+/// Ticket 70 (write-edit-path-confinement): `execute` rejects any `path`
+/// that resolves outside `workspace_root` with `ToolError::ExecutionFailed`
+/// before touching the filesystem at all (gated ahead of even the initial
+/// read, not just the write -- see `execute`'s doc comment below).
+pub struct EditTool {
+    workspace_root: PathBuf,
+}
+
+impl EditTool {
+    /// Builds an `EditTool` confined to `workspace_root`. Canonicalizes
+    /// `workspace_root` here (rather than leaving it to callers) so every
+    /// caller gets it for free -- see `BashTool::new`'s doc comment for why
+    /// (macOS `/var` -> `/private/var` symlink resolution, mainly). Falls
+    /// back to the given path unchanged if canonicalization fails (e.g. the
+    /// root doesn't exist yet), rather than erroring out of construction.
+    pub fn new(workspace_root: PathBuf) -> Self {
+        let workspace_root = std::fs::canonicalize(&workspace_root).unwrap_or(workspace_root);
+        Self { workspace_root }
+    }
+}
 
 impl EditTool {
     fn apply(
@@ -74,6 +97,19 @@ impl Tool for EditTool {
     async fn execute(&self, input: serde_json::Value) -> Result<String, ToolError> {
         let input: EditInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        // Gated ahead of even the initial read, not just the write: gating
+        // only the write would still leak whether an out-of-workspace file
+        // exists (and its error kind) via the read's error, so the
+        // confinement check runs before any filesystem access at all.
+        if !sandbox::path_is_within_workspace(
+            std::path::Path::new(&input.path),
+            &self.workspace_root,
+        ) {
+            return Err(ToolError::ExecutionFailed(format!(
+                "path outside workspace root: {}",
+                input.path
+            )));
+        }
         let contents = std::fs::read_to_string(&input.path)?;
         let updated = Self::apply(&contents, &input.old_str, &input.new_str, &input.path)?;
         std::fs::write(&input.path, &updated)?;
@@ -97,7 +133,7 @@ impl PreviewableTool for EditTool {
 #[cfg(test)]
 mod tests {
     use super::EditTool;
-    use crate::{Preview, PreviewableTool, Tool};
+    use crate::{Preview, PreviewableTool, Tool, ToolError};
     use serde_json::json;
 
     #[test]
@@ -106,7 +142,7 @@ mod tests {
         let file_path = temp.path().join("greeting.txt");
         std::fs::write(&file_path, "hello world").unwrap();
 
-        let tool = EditTool;
+        let tool = EditTool::new(temp.path().to_path_buf());
         let preview = tool
             .preview(json!({
                 "path": file_path.to_string_lossy(),
@@ -158,7 +194,7 @@ mod tests {
         let file_path = temp.path().join("greeting.txt");
         std::fs::write(&file_path, "hello world").unwrap();
 
-        let tool = EditTool;
+        let tool = EditTool::new(temp.path().to_path_buf());
         tool.execute(json!({
             "path": file_path.to_string_lossy(),
             "old_str": "world",
@@ -177,7 +213,7 @@ mod tests {
         let file_path = temp.path().join("greeting.txt");
         std::fs::write(&file_path, "hello world").unwrap();
 
-        let tool = EditTool;
+        let tool = EditTool::new(temp.path().to_path_buf());
         let result = tool
             .execute(json!({
                 "path": file_path.to_string_lossy(),
@@ -195,6 +231,40 @@ mod tests {
         assert_eq!(
             contents, "hello world",
             "file must be untouched when old_str is not found"
+        );
+    }
+
+    /// Ticket 70 (write-edit-path-confinement): an `edit` target that
+    /// resolves outside `workspace_root` must be rejected with a typed
+    /// `ExecutionFailed` error before any filesystem access happens -- the
+    /// file is pre-created with known content so a "file not found" error
+    /// can't be mistaken for the confinement check firing, and the content
+    /// must remain untouched.
+    #[tokio::test]
+    async fn edit_execute_rejects_path_outside_workspace_root() {
+        let workspace_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("greeting.txt");
+        std::fs::write(&target, "original content").unwrap();
+
+        let tool = EditTool::new(workspace_root.path().to_path_buf());
+        let result = tool
+            .execute(json!({
+                "path": target.to_string_lossy(),
+                "old_str": "original",
+                "new_str": "changed"
+            }))
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::ExecutionFailed(_))),
+            "expected Err(ToolError::ExecutionFailed(_)) for out-of-workspace path, got {result:?}"
+        );
+
+        let contents = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            contents, "original content",
+            "file outside workspace root must be untouched by the confinement check"
         );
     }
 }
