@@ -740,7 +740,20 @@ async fn main() -> ExitCode {
             // that turn, in deterministic sorted order.
             let submit_mcp_notice_tx = mcp_notice_tx.clone();
 
-            let runner = SessionRunner {
+            // Ticket 75 (executable-skill-invocation): `Arc`-wrapped (rather
+            // than the previous bare, owned value) so `submit`'s closure
+            // (built below) -- an `Fn` invoked once per Enter-press, not
+            // `FnOnce` -- can cheaply clone a handle into each call's own
+            // `async move` block. This is now required because
+            // `CommandRegistry::resolve_skills` must be `.await`ed BEFORE
+            // `run_submission` is even called (see the ADR 0018 consent gate
+            // below), so the `runner.run_submission(...)` call itself has to
+            // happen from inside that same async block rather than
+            // synchronously in `submit`'s prologue as before -- a plain
+            // borrow of `runner` can't outlive that per-call boundary the
+            // way `Arc::clone` can. No change to `SessionRunner`/`runner.rs`
+            // itself: `Arc<SessionRunner>` auto-derefs for `.run_submission(...)`.
+            let runner = Arc::new(SessionRunner {
                 provider,
                 transcript,
                 system_prompt,
@@ -768,7 +781,7 @@ async fn main() -> ExitCode {
                 // all (`--permission-mode` stays headless-only) -- see
                 // `PermissionPolicy::resolve`'s doc comment.
                 permission_mode: None,
-            };
+            });
 
             // Ticket 52 (clap-and-sessionrunner-extraction): the submit-and-run
             // orchestration that used to be inlined in this closure now lives in
@@ -782,13 +795,36 @@ async fn main() -> ExitCode {
             // prompt (`InputRoute::Submit` in rokr-tui, which never goes
             // near `CommandRegistry::expand`) and an already-expanded
             // custom-command template (which DID already go through
-            // `expand`'s own skill resolution -- re-running it here is a
-            // harmless no-op, since no `@skill:` markers survive a
-            // successful first pass). See `CommandRegistry::resolve_skills`'s
-            // doc comment.
+            // `expand`'s own INERT-only skill resolution -- re-running it
+            // here is a harmless no-op for an inert mention, since none
+            // survive a successful first pass; an EXECUTABLE mention is
+            // deliberately left unresolved by `expand` and gets its real,
+            // consent-gated resolution here, its only ADR-0018-designated
+            // call site on the TUI side). See
+            // `CommandRegistry::resolve_skills`'s doc comment.
+            //
+            // Ticket 75 (executable-skill-invocation), ADR 0018 decision 3:
+            // the fresh, per-submission `permission: PermissionHandle`
+            // already threaded in here backs the interactive
+            // `ConsentResolver` too (`InteractiveConsentResolver`), reusing
+            // `PermissionDetail::Text` for the consent prompt rather than a
+            // new prompt variant. The trust store is rooted at this
+            // session's real, user-scope `config_dir` (`runner.config_dir`)
+            // -- decision 5: never a project-scope location.
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
-                let input = submit_command_registry.resolve_skills(&input);
-                runner.run_submission(input, permission)
+                let command_registry = submit_command_registry.clone();
+                let runner = Arc::clone(&runner);
+                async move {
+                    let skill_trust_store =
+                        rokr_app::skill_trust::SkillTrustStore::new(&runner.config_dir);
+                    let skill_consent =
+                        rokr_app::skill_trust::InteractiveConsentResolver::new(permission.clone());
+                    let workspace_root = std::env::current_dir().map_err(|e| e.to_string())?;
+                    let input = command_registry
+                        .resolve_skills(&input, workspace_root, skill_trust_store, skill_consent)
+                        .await?;
+                    runner.run_submission(input, permission).await
+                }
             };
 
             // Ticket 36 (session-index-list-jump): `/sessions` is added to

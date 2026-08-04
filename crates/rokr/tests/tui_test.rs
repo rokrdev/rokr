@@ -14292,3 +14292,420 @@ async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populat
          count to stay at {phase_a_count}, got {phase_b_count}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Ticket 75 (executable-skill-invocation), ADR 0018.
+// ---------------------------------------------------------------------
+
+/// ADR 0018 decision 7: the consent prompt shown before a project-scope
+/// executable skill's `run:` command ever executes must show the LITERAL
+/// `run:` command, the skill's path, and its scope -- no dry-run, no output
+/// preview. Mirrors `bash_tool_call_renders_permission_prompt_and_runs_on_accept`'s
+/// PTY-driven structure exactly, but the trigger is a plain `@skill:<name>`
+/// mention typed directly (mention resolution is pre-submission,
+/// deterministic text substitution -- it runs and shows its prompt BEFORE
+/// the mock model is ever consulted at all).
+#[tokio::test]
+async fn executable_skill_consent_prompt_shows_exact_command_before_execution() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let final_reply_text = "FinalReplyAfterSkillConsentAcceptForTesting";
+
+    let temp_dir = unique_temp_dir("skill-consent-target");
+    let marker_path = temp_dir.join("skill-consent-marker");
+    let skills_dir = temp_dir.join(".rokr").join("skills");
+    std::fs::create_dir_all(&skills_dir).expect("failed to create fixture skills dir");
+    let run_command = format!("touch {}", marker_path.to_string_lossy());
+    std::fs::write(
+        skills_dir.join("deploy.md"),
+        format!("---\nrun: {run_command}\n---\nNEVER-PREVIEW-BEFORE-CONSENT-MARKER"),
+    )
+    .expect("failed to write fixture deploy.md");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-skill-consent",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": final_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-skill-consent");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-skill-consent");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"@skill:deploy\r")
+        .expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("deploy.md") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // NOTE: ratatui's terminal-diff renderer positions each wrapped line via
+    // its own cursor-move escape sequence, including hard-wrapping a single
+    // long token (e.g. the marker's full absolute path) mid-word at the pane
+    // width -- so asserting on the full `"touch {full_path}"` string as one
+    // contiguous substring of the raw pty byte stream is not reliable, the
+    // same reason the pre-existing bash tests in this file check "bash" and
+    // the marker's distinctive basename SEPARATELY rather than the whole
+    // rendered line. Each check below is a short, single-token fragment
+    // unlikely to itself straddle a wrap boundary.
+    assert!(
+        output.contains("run:"),
+        "expected the consent prompt to show the run: field, got: {output:?}"
+    );
+    assert!(
+        output.contains("touch"),
+        "expected the consent prompt to show the literal run: command's verb, got: {output:?}"
+    );
+    assert!(
+        output.contains("skill-consent-marker"),
+        "expected the consent prompt to show the run: command's target path, got: {output:?}"
+    );
+    assert!(
+        output.contains("deploy.md"),
+        "expected the consent prompt to show the skill's path, got: {output:?}"
+    );
+    assert!(
+        output.contains("scope:"),
+        "expected the consent prompt to show the skill's scope field, got: {output:?}"
+    );
+    assert!(
+        output.contains("project"),
+        "expected the consent prompt to show the skill's scope, got: {output:?}"
+    );
+    assert!(
+        !output.contains("NEVER-PREVIEW-BEFORE-CONSENT-MARKER"),
+        "no dry-run/output preview of the skill's markdown body should appear before a decision \
+         is made (ADR 0018 decision 7), got: {output:?}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "the run: command must not have executed before consent was granted"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the skill \
+         consent prompt, got: {output:?}"
+    );
+    assert!(
+        marker_path.exists(),
+        "expected the run: command to have executed after accepting consent"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// A consented, in-workspace, no-network `run:` command's captured stdout
+/// must be inlined into the OUTGOING request in place of the `@skill:<name>`
+/// mention -- inspects the real wire-level request body the mock provider
+/// transport received (mirrors `headless_test.rs`'s
+/// `print_flag_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing_request`),
+/// so the assertion is precise about what actually got sent to the model,
+/// not just that something rendered on screen.
+#[tokio::test]
+async fn executable_skill_command_output_is_inlined_in_place_of_the_mention() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let final_reply_text = "FinalReplyAfterSkillOutputInlinedForTesting";
+
+    let temp_dir = unique_temp_dir("skill-inline-target");
+    let skills_dir = temp_dir.join(".rokr").join("skills");
+    std::fs::create_dir_all(&skills_dir).expect("failed to create fixture skills dir");
+    let stdout_marker = "SKILL-STDOUT-MARKER-12345";
+    std::fs::write(
+        skills_dir.join("greet.md"),
+        format!("---\nrun: printf {stdout_marker}\n---\nGreet skill body (must not be inlined)."),
+    )
+    .expect("failed to write fixture greet.md");
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-skill-inline",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": final_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-skill-inline");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-skill-inline");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"@skill:greet\r")
+        .expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("greet.md") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("greet.md"),
+        "expected the consent prompt to render before accepting, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let received_requests = mock_server.received_requests().await.expect(
+        "mock server should have recorded received requests (make sure the request recorder \
+         wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains(stdout_marker),
+        "expected the outgoing request body to contain the run: command's captured stdout \
+         inlined in place of the @skill:greet mention; got body: {first_request_body:?}"
+    );
+    assert!(
+        !first_request_body.contains("@skill:greet"),
+        "expected the @skill:greet mention to have been replaced, not left literal; got body: \
+         {first_request_body:?}"
+    );
+    assert!(
+        !first_request_body.contains("Greet skill body"),
+        "expected the skill's markdown BODY (as opposed to its run: command's stdout) to never \
+         be inlined for an executable skill; got body: {first_request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

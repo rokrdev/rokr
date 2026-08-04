@@ -407,7 +407,29 @@ pub async fn run_result_object(
     if let Some(cwd) = cwd.as_deref() {
         command_registry.merge_overriding(crate::CommandRegistry::discover_project_scope(cwd));
     }
-    let prompt = command_registry.resolve_skills(&prompt);
+    // Ticket 75 (executable-skill-invocation), ADR 0018 decision 4:
+    // headless dispatches consent on the same `permission_mode` ADR 0016
+    // already established for gated tool calls, via `HeadlessConsentResolver`
+    // (`crate::skill_trust`) -- not a parallel notion. The trust store is
+    // rooted at this run's real, user-scope `config_dir` (decision 5: it is
+    // NEVER a project-scope location). `workspace_root` prefers the
+    // already-resolved `cwd` (matches project-scope skill discovery just
+    // above, and `rokr-eval`'s fixture-isolation `cwd` override) over a
+    // fresh `current_dir()` read.
+    let skill_workspace_root = cwd.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+    let skill_trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
+    let skill_consent = crate::skill_trust::HeadlessConsentResolver::new(permission_mode);
+    let prompt = command_registry
+        .resolve_skills(
+            &prompt,
+            skill_workspace_root,
+            skill_trust_store,
+            skill_consent,
+        )
+        .await
+        .map_err(|err| BootstrapError::Other(format!("failed to resolve skill mentions: {err}")))?;
 
     let mut system_prompt = rokr_config::read_agent_prompt(&config_dir, agent.prompt_name())
         .map_err(|err| BootstrapError::Other(format!("failed to read agent prompt: {err}")))?;
@@ -749,5 +771,103 @@ mod tests {
         // Neither Deny nor AcceptEdits require the flag either way.
         assert!(build_permission_requester(crate::cli::PermissionMode::Deny, false).is_ok());
         assert!(build_permission_requester(crate::cli::PermissionMode::AcceptEdits, false).is_ok());
+    }
+
+    /// Ticket 75 (executable-skill-invocation), ADR 0018 decision 4: default
+    /// `PermissionMode` (no human present in headless), untrusted
+    /// project-scope executable skill -- inert (mention replaced by the
+    /// "not executed" notice), and the run continues rather than erroring
+    /// out on this alone. No trust-store entry is ever written for a
+    /// decline.
+    #[tokio::test]
+    async fn headless_untrusted_executable_skill_is_inert_under_default_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let marker_path = temp.path().join("default-mode-marker");
+        let skill_file_contents = format!(
+            "---\nrun: touch {}\n---\nDeploy body.",
+            marker_path.to_string_lossy()
+        );
+        std::fs::write(skills_dir.join("deploy.md"), &skill_file_contents).unwrap();
+
+        let registry = crate::CommandRegistry::discover_project_scope(temp.path());
+        let config_dir = temp.path().join("config");
+        let trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
+        let consent =
+            crate::skill_trust::HeadlessConsentResolver::new(crate::cli::PermissionMode::Deny);
+
+        let resolved = registry
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store.clone(),
+                consent,
+            )
+            .await
+            .expect("an untrusted skill under default mode must not error the whole run");
+
+        assert!(
+            !marker_path.exists(),
+            "the run: command must not execute under default (non-bypass) headless mode \
+             without a prior trust grant"
+        );
+        assert!(
+            resolved.to_lowercase().contains("not executed"),
+            "expected the mention to be replaced by a short not-executed notice, got: \
+             {resolved:?}"
+        );
+        let hash = crate::skill_trust::hash_skill_contents(&skill_file_contents);
+        assert!(
+            !trust_store.is_trusted(&skills_dir.join("deploy.md"), &hash),
+            "a decline under default mode must never write a trust-store entry"
+        );
+    }
+
+    /// Ticket 75 (executable-skill-invocation), ADR 0018 decision 4:
+    /// `Bypass` (`--dangerously-skip-permissions`) executes an untrusted
+    /// skill's `run:` command without ever consulting or writing a
+    /// trust-store entry -- `Bypass` means "skip every permission gate," but
+    /// does not fabricate consent history either.
+    #[tokio::test]
+    async fn headless_untrusted_executable_skill_executes_under_bypass() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let marker_path = temp.path().join("bypass-mode-marker");
+        let skill_file_contents = format!(
+            "---\nrun: printf bypass-ran && touch {}\n---\nDeploy body.",
+            marker_path.to_string_lossy()
+        );
+        std::fs::write(skills_dir.join("deploy.md"), &skill_file_contents).unwrap();
+
+        let registry = crate::CommandRegistry::discover_project_scope(temp.path());
+        let config_dir = temp.path().join("config");
+        let trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
+        let consent =
+            crate::skill_trust::HeadlessConsentResolver::new(crate::cli::PermissionMode::Bypass);
+
+        let resolved = registry
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store.clone(),
+                consent,
+            )
+            .await
+            .expect("bypass mode should execute without error");
+
+        assert!(
+            marker_path.exists(),
+            "expected the run: command to execute under --dangerously-skip-permissions bypass \
+             mode"
+        );
+        assert_eq!(resolved.trim(), "bypass-ran");
+        let hash = crate::skill_trust::hash_skill_contents(&skill_file_contents);
+        assert!(
+            !trust_store.is_trusted(&skills_dir.join("deploy.md"), &hash),
+            "Bypass must execute without EVER writing a trust-store entry -- inspecting the \
+             store after the run proves no grant was fabricated"
+        );
     }
 }

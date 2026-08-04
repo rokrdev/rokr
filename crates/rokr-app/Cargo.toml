@@ -13,6 +13,17 @@ rokr-config = { path = "../rokr-config" }
 rokr-session = { path = "../rokr-session" }
 rokr-mcp = { path = "../rokr-mcp" }
 rokr-hooks = { path = "../rokr-hooks" }
+# Ticket 75 (executable-skill-invocation): `skill_trust.rs`'s hash-pinned
+# trust store needs an error type (`SkillTrustError`) and a content-hash
+# function (`hash_skill_contents`) -- `thiserror` and `sha2` mirror the exact
+# crates `rokr-provider::auth`'s `TokenStoreError`/`code_challenge_s256`
+# already use for the same shapes (see ADR 0018's "shaped after
+# rokr-provider's TokenStore/FileTokenStore pattern" note). Not previously a
+# dependency of this crate; added here as the minimal mechanical addition
+# required to compile the new module, same precedent as this file's other
+# ticket-driven additions below.
+thiserror = { workspace = true }
+sha2 = "0.11.0"
 clap = { workspace = true }
 clap_complete = "4"
 tokio = { workspace = true }
