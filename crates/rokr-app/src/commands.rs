@@ -352,6 +352,8 @@ async fn resolve_skill_mentions_with_consent<C: ConsentResolver>(
                         command: command.clone(),
                         skill_path: skill.path.clone(),
                         scope: skill.scope,
+                        name: name.to_string(),
+                        hash: hash.clone(),
                     };
                     match consent.resolve(request).await {
                         ConsentOutcome::ApproveAndPersist => {

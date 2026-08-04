@@ -135,7 +135,16 @@ parallel notion invented for skills:
   meaning, but bypassing does not fabricate consent history either.
 - `--allow-skill`, a CI-friendly explicit allowlist flag, is explicitly
   **deferred** -- noted here as future work, not designed or implemented by
-  this ADR.
+  this ADR. *(Since implemented; the shipped design:)* a repeatable
+  `--allow-skill <name>` or `--allow-skill <name>@<sha256-hex>` flag, honored
+  in both the TUI and headless paths, checked on a trust-store miss before
+  the prompt/inert-fallback. A matching entry executes with no prompt and,
+  like the interactive "[y] run once" path above, writes no trust-store
+  entry -- the approval is ephemeral. A hash-pinned entry whose pin does not
+  match
+  the skill file's current content hash is treated as not allowed (falling
+  through to the normal flow, plus a one-line stderr notice naming the
+  mismatch) rather than silently approved.
 
 **5. Scope and store, per rulings 1, 2, and 5.** Both user- and
 project-scope skills may declare `run:` -- ADR 0014's discovery symmetry

@@ -134,6 +134,25 @@ pub struct Cli {
     #[arg(long)]
     pub dangerously_skip_permissions: bool,
 
+    /// CI-friendly pre-approval for a project-scope executable skill's
+    /// `run:` command (ADR 0018 decision 4's `--allow-skill` flag, deferred
+    /// there, implemented here), bypassing the interactive TOFU consent
+    /// prompt. Repeatable (`--allow-skill a --allow-skill b`). Each value is
+    /// either a bare skill name (pre-approves regardless of the skill
+    /// file's content hash) or `name@<sha256-hex>` (pre-approves ONLY when
+    /// the skill file's content hash -- the same hash the trust store
+    /// itself pins to -- matches exactly; a mismatch falls back to normal
+    /// consent, never silent approval). Malformed values (a hash pin that
+    /// isn't exactly 64 lowercase hex characters, or an empty name) are
+    /// rejected at parse time. Never writes a `SkillTrustStore` entry -- the
+    /// approval is ephemeral, same spirit as the interactive "[y] run once"
+    /// path. Honored in both the TUI and headless paths; a no-op for
+    /// user-scope skills, which are already auto-trusted. In CI, prefer the
+    /// pinned `name@sha256` form: the bare form approves whatever `run:`
+    /// command the current checkout happens to ship, pinned or not.
+    #[arg(long = "allow-skill", value_name = "name[@sha256]")]
+    pub allow_skill: Vec<crate::skill_trust::AllowSkillEntry>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -437,6 +456,78 @@ mod tests {
         assert!(
             Cli::try_parse_from(["rokr", "eval", "cases", "--report", "bogus"]).is_err(),
             "an unknown --report value must be a parse error"
+        );
+    }
+
+    /// ADR 0018 decision 4's `--allow-skill` flag (deferred there,
+    /// implemented here): repeatable, absent parses as an empty `Vec`
+    /// (matching this file's caller-applies-the-default pattern for other
+    /// flags), a bare name and `name@<64-lowercase-hex>` both parse, and a
+    /// malformed value (a short/non-hex/uppercase-hex pin, or an empty name)
+    /// is rejected by clap itself at arg-parse time -- not deferred to
+    /// runtime.
+    #[test]
+    fn allow_skill_flag_is_repeatable_and_rejects_malformed_values_at_parse_time() {
+        let cli = Cli::try_parse_from(["rokr", "-p", "hi"]).expect("no-flag parse should succeed");
+        assert!(
+            cli.allow_skill.is_empty(),
+            "absent --allow-skill must parse as an empty Vec"
+        );
+
+        let hash = "a".repeat(64);
+        let cli = Cli::try_parse_from([
+            "rokr",
+            "-p",
+            "hi",
+            "--allow-skill",
+            "deploy",
+            "--allow-skill",
+            &format!("release@{hash}"),
+        ])
+        .expect("two --allow-skill occurrences should parse");
+        assert_eq!(
+            cli.allow_skill.len(),
+            2,
+            "expected both occurrences to be collected"
+        );
+        assert_eq!(cli.allow_skill[0].name, "deploy");
+        assert_eq!(cli.allow_skill[0].hash, None);
+        assert_eq!(cli.allow_skill[1].name, "release");
+        assert_eq!(cli.allow_skill[1].hash, Some(hash));
+
+        assert!(
+            Cli::try_parse_from(["rokr", "-p", "hi", "--allow-skill", "deploy@short"]).is_err(),
+            "a hash pin that isn't 64 hex characters must be a parse error"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rokr",
+                "-p",
+                "hi",
+                "--allow-skill",
+                &format!("deploy@{}", "G".repeat(64)),
+            ])
+            .is_err(),
+            "a non-hex pin must be a parse error"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rokr",
+                "-p",
+                "hi",
+                "--allow-skill",
+                &format!("deploy@{}", "A".repeat(64)),
+            ])
+            .is_err(),
+            "an uppercase-hex pin must be a parse error -- only lowercase hex is accepted"
+        );
+        assert!(
+            Cli::try_parse_from(["rokr", "-p", "hi", "--allow-skill", "@abc123"]).is_err(),
+            "an empty skill name before '@' must be a parse error"
+        );
+        assert!(
+            Cli::try_parse_from(["rokr", "-p", "hi", "--allow-skill", ""]).is_err(),
+            "an empty --allow-skill value must be a parse error"
         );
     }
 

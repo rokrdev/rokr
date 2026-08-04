@@ -221,6 +221,11 @@ pub async fn run_eval(
                 agent,
                 permission_mode,
                 case_requests_bypass,
+                // ADR 0018 decision 4's `--allow-skill` is an
+                // operator-level CI flag on the `rokr eval` invocation
+                // itself, not a per-case concept -- an eval case file has
+                // no field for it, so this is always empty.
+                &[],
                 loaded_case.case.prompt.clone(),
                 Some(fixture_dir.path().to_path_buf()),
                 Some(run_override),

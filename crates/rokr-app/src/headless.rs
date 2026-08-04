@@ -188,6 +188,7 @@ pub async fn run(cli: &crate::cli::Cli, prompt: String) -> std::process::ExitCod
         agent,
         permission_mode,
         cli.dangerously_skip_permissions,
+        &cli.allow_skill,
         prompt,
         cwd,
         // A normal headless `-p` invocation never overrides anything --
@@ -369,6 +370,12 @@ pub async fn run_result_object(
     agent: crate::cli::AgentTier,
     permission_mode: crate::cli::PermissionMode,
     dangerously_skip_permissions: bool,
+    // ADR 0018 decision 4's `--allow-skill` flag (deferred there,
+    // implemented here): the parsed `Cli::allow_skill` values, threaded
+    // through to `HeadlessConsentResolver` below. `rokr-eval` (the other
+    // caller) always passes `&[]` -- an eval case file has no concept of
+    // this operator-level CI flag.
+    allow_skill: &[crate::skill_trust::AllowSkillEntry],
     prompt: String,
     cwd: Option<std::path::PathBuf>,
     run_override: Option<HeadlessRunOverride>,
@@ -420,7 +427,10 @@ pub async fn run_result_object(
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
     let skill_trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
-    let skill_consent = crate::skill_trust::HeadlessConsentResolver::new(permission_mode);
+    let skill_consent = crate::skill_trust::HeadlessConsentResolver::new(permission_mode)
+        .with_allowlist(crate::skill_trust::SkillAllowlist::new(
+            allow_skill.to_vec(),
+        ));
     let prompt = command_registry
         .resolve_skills(
             &prompt,
@@ -920,6 +930,132 @@ mod tests {
             !trust_store.is_trusted(&skills_dir.join("deploy.md"), &hash),
             "Bypass must execute without EVER writing a trust-store entry -- inspecting the \
              store after the run proves no grant was fabricated"
+        );
+    }
+
+    /// ADR 0018 decision 4's `--allow-skill` flag (deferred there,
+    /// implemented here): under DEFAULT (non-bypass) headless mode, an
+    /// otherwise-untrusted project-scope executable skill named by a bare
+    /// `--allow-skill <name>` entry executes WITHOUT ever prompting, and
+    /// (the fourth minimum test the brief asks for) writes NO trust-store
+    /// entry -- the approval is ephemeral, same spirit as the interactive
+    /// "[y] run once" path.
+    #[tokio::test]
+    async fn headless_allow_skill_flag_executes_untrusted_skill_without_trust_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let marker_path = temp.path().join("allow-skill-marker");
+        let skill_file_contents = format!(
+            "---\nrun: printf allow-skill-ran && touch {}\n---\nDeploy body.",
+            marker_path.to_string_lossy()
+        );
+        std::fs::write(skills_dir.join("deploy.md"), &skill_file_contents).unwrap();
+
+        let registry = crate::CommandRegistry::discover_project_scope(temp.path());
+        let config_dir = temp.path().join("config");
+        let trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
+        let consent =
+            crate::skill_trust::HeadlessConsentResolver::new(crate::cli::PermissionMode::Deny)
+                .with_allowlist(crate::skill_trust::SkillAllowlist::new(vec![
+                    crate::skill_trust::AllowSkillEntry {
+                        name: "deploy".to_string(),
+                        hash: None,
+                    },
+                ]));
+
+        let resolved = registry
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store.clone(),
+                consent,
+            )
+            .await
+            .expect("an allowlisted skill mention should not error");
+
+        assert!(
+            marker_path.exists(),
+            "expected the run: command to execute under default mode when pre-approved by \
+             --allow-skill, with no prior trust grant needed"
+        );
+        assert_eq!(resolved.trim(), "allow-skill-ran");
+        let hash = crate::skill_trust::hash_skill_contents(&skill_file_contents);
+        assert!(
+            !trust_store.is_trusted(&skills_dir.join("deploy.md"), &hash),
+            "--allow-skill must execute without EVER writing a trust-store entry -- the \
+             approval is ephemeral, not a fabricated TOFU grant"
+        );
+    }
+
+    /// ADR 0018 decision 4's `--allow-skill` flag: a hash-pinned entry
+    /// (`name@<sha256>`) whose pin does NOT match the skill file's current
+    /// content hash is treated as not allowed -- it falls through to the
+    /// normal default-mode flow (inert, one-line stderr notice, run
+    /// continues) rather than silently approving stale/mismatched content.
+    /// An additional notice specifically naming the hash mismatch is also
+    /// emitted.
+    #[tokio::test]
+    async fn headless_allow_skill_hash_mismatch_falls_back_to_inert_with_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        let marker_path = temp.path().join("mismatch-marker");
+        let skill_file_contents = format!(
+            "---\nrun: touch {}\n---\nDeploy body.",
+            marker_path.to_string_lossy()
+        );
+        std::fs::write(skills_dir.join("deploy.md"), &skill_file_contents).unwrap();
+
+        let registry = crate::CommandRegistry::discover_project_scope(temp.path());
+        let config_dir = temp.path().join("config");
+        let trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = notices.clone();
+        let wrong_hash = crate::skill_trust::hash_skill_contents("run: totally different");
+        let consent = crate::skill_trust::HeadlessConsentResolver::with_notice_sink(
+            crate::cli::PermissionMode::Deny,
+            move |notice: &str| recorded.lock().unwrap().push(notice.to_string()),
+        )
+        .with_allowlist(crate::skill_trust::SkillAllowlist::new(vec![
+            crate::skill_trust::AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: Some(wrong_hash),
+            },
+        ]));
+
+        let resolved = registry
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store.clone(),
+                consent,
+            )
+            .await
+            .expect("a mismatched-pin skill mention must not error the whole run");
+
+        assert!(
+            !marker_path.exists(),
+            "a hash-pinned --allow-skill entry with the WRONG pin must never execute the run: \
+             command"
+        );
+        assert!(
+            resolved.to_lowercase().contains("not executed"),
+            "expected the mention to fall back to the normal inert notice, got: {resolved:?}"
+        );
+        let recorded = notices.lock().unwrap();
+        assert!(
+            recorded.iter().any(|notice| notice.contains("deploy")
+                && (notice.contains("hash")
+                    || notice.contains("mismatch")
+                    || notice.contains("did not match"))),
+            "expected a one-line stderr notice specifically naming the allow-skill hash \
+             mismatch, got: {recorded:?}"
+        );
+        let hash = crate::skill_trust::hash_skill_contents(&skill_file_contents);
+        assert!(
+            !trust_store.is_trusted(&skills_dir.join("deploy.md"), &hash),
+            "a hash-mismatch fallback must never write a trust-store entry either"
         );
     }
 }
