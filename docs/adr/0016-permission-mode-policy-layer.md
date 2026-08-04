@@ -322,3 +322,24 @@ change ever re-merges the two arms.
   makes the precedence rule (grant beats even `Deny`) a property of one
   function's tests rather than something every call site has to
   re-derive and potentially get wrong independently.
+
+## Amendment (ADR 0019)
+
+ADR 0019 (`docs/adr/0019-read-only-git-permission-carveout.md`) extends
+`PermissionPolicy::resolve` with command-content awareness for the first
+time: a new `command: Option<&str>` parameter, threaded from every call
+site (`None` except on the `bash` path, where the raw command string is
+extracted before its `PermissionPayload` is consumed elsewhere). This is
+a narrow widening of `resolve`'s inputs, not a departure from decision 1
+above -- `resolve` remains the single entry point every caller goes
+through; a read-only-git carve-out checked upstream of `resolve` was
+considered and rejected specifically because it would reintroduce the
+dual-resolver hazard this ADR's own F-005 correction, above, documents.
+
+The new precedence placement: below `Deny`, above `AcceptEdits` -- a
+prior grant, then `Bypass`, then `Deny`, then the read-only-git
+carve-out, then `AcceptEdits`, then the default `Prompt`. The carve-out
+only ever converts what would otherwise be `Prompt` into `Allow`; it
+never overrides `Deny`, the absence of a grant, or `Bypass`. See ADR
+0019 for the full rationale, the classifier's exact conservatism spec,
+and the accepted residual risks.
