@@ -811,14 +811,26 @@ async fn main() -> ExitCode {
             // new prompt variant. The trust store is rooted at this
             // session's real, user-scope `config_dir` (`runner.config_dir`)
             // -- decision 5: never a project-scope location.
+            //
+            // ADR 0018 decision 4's `--allow-skill` flag (deferred there,
+            // implemented here): `cli.allow_skill`'s parsed values are
+            // cloned out here (`Cli` itself doesn't derive `Clone`, and
+            // `submit` is `Fn`, invoked once per Enter-press, so its body
+            // clones this owned `Vec` fresh on each call the same way it
+            // already does for `submit_command_registry`/`runner` above).
+            let allow_skill = cli.allow_skill.clone();
             let submit = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let command_registry = submit_command_registry.clone();
                 let runner = Arc::clone(&runner);
+                let allow_skill = allow_skill.clone();
                 async move {
                     let skill_trust_store =
                         rokr_app::skill_trust::SkillTrustStore::new(&runner.config_dir);
                     let skill_consent =
-                        rokr_app::skill_trust::InteractiveConsentResolver::new(permission.clone());
+                        rokr_app::skill_trust::InteractiveConsentResolver::new(permission.clone())
+                            .with_allowlist(rokr_app::skill_trust::SkillAllowlist::new(
+                                allow_skill,
+                            ));
                     let workspace_root = std::env::current_dir().map_err(|e| e.to_string())?;
                     let input = command_registry
                         .resolve_skills(&input, workspace_root, skill_trust_store, skill_consent)

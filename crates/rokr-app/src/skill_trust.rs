@@ -165,14 +165,159 @@ impl std::fmt::Display for SkillScope {
     }
 }
 
+/// One `--allow-skill` value, parsed at clap arg-parse time (ADR 0018
+/// decision 4's previously-deferred CI-friendly pre-approval flag, now
+/// implemented). Two forms: a bare skill name (`hash: None`) pre-approves
+/// that skill regardless of its content hash; `name@<sha256-hex>` (`hash:
+/// Some(..)`) pre-approves ONLY when the skill file's content hash --
+/// computed the same way [`hash_skill_contents`] computes it for the trust
+/// store -- matches exactly. Implements [`std::str::FromStr`] (rather than
+/// a bespoke clap `value_parser`) so a malformed value is rejected by clap
+/// itself, at parse time, before `Cli` is ever constructed -- see
+/// `crates/rokr-app/src/cli.rs`'s `Cli::allow_skill` field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowSkillEntry {
+    pub name: String,
+    pub hash: Option<String>,
+}
+
+/// Whether `hash` is exactly 64 lowercase hex characters -- the same shape
+/// [`hash_skill_contents`] always produces, and the only shape a hash-pinned
+/// `--allow-skill name@<hash>` value's pin is accepted in (uppercase hex is
+/// deliberately rejected rather than lowercased silently: a value clap
+/// accepted should be unambiguous about what it means, not normalized behind
+/// the operator's back).
+fn is_valid_sha256_hex(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl std::str::FromStr for AllowSkillEntry {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.split_once('@') {
+            Some((name, hash)) => {
+                if name.is_empty() {
+                    return Err(format!(
+                        "--allow-skill value {value:?} has an empty skill name before '@'"
+                    ));
+                }
+                if !is_valid_sha256_hex(hash) {
+                    return Err(format!(
+                        "--allow-skill value {value:?} has an invalid sha256 pin after '@' -- \
+                         expected exactly 64 lowercase hex characters"
+                    ));
+                }
+                Ok(AllowSkillEntry {
+                    name: name.to_string(),
+                    hash: Some(hash.to_string()),
+                })
+            }
+            None => {
+                if value.is_empty() {
+                    return Err("--allow-skill value must not be empty".to_string());
+                }
+                Ok(AllowSkillEntry {
+                    name: value.to_string(),
+                    hash: None,
+                })
+            }
+        }
+    }
+}
+
+/// The result of checking a skill mention's `(name, content hash)` against a
+/// [`SkillAllowlist`] -- see [`SkillAllowlist::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowlistCheck {
+    /// A matching entry was found (bare name, or a pinned hash that matches
+    /// exactly).
+    Allowed,
+    /// No unconditional match, but at least one pinned entry named this
+    /// skill with a DIFFERENT hash -- ADR 0018 decision 4's `--allow-skill`
+    /// note: treated as not allowed, never silently approved.
+    HashMismatch,
+    /// No entry names this skill at all.
+    NotListed,
+}
+
+/// The parsed `--allow-skill` flag values (repeatable), consulted by a
+/// [`ConsentResolver`] impl on a trust-store miss, before prompting/the
+/// inert fallback -- ADR 0018 decision 4's previously-deferred flag. Never
+/// consulted for a `Bypass`-mode headless run (already executes everything)
+/// or a user-scope skill (already auto-trusted); see `resolve_skill_mentions
+/// _with_consent`'s `SkillScope::User` arm in `crate::commands`, which never
+/// even constructs a [`SkillConsentRequest`] for that case.
+#[derive(Debug, Clone, Default)]
+pub struct SkillAllowlist {
+    entries: Vec<AllowSkillEntry>,
+}
+
+impl SkillAllowlist {
+    pub fn new(entries: Vec<AllowSkillEntry>) -> Self {
+        Self { entries }
+    }
+
+    /// Checks `name`/`hash` (a skill mention's name and its file's current
+    /// content hash) against every entry. Scans the full list rather than
+    /// short-circuiting on the first name match, so a mismatched pinned
+    /// entry earlier in the list doesn't shadow a later unconditional or
+    /// correctly-pinned entry for the same name.
+    pub fn check(&self, name: &str, hash: &str) -> AllowlistCheck {
+        let mut hash_mismatch = false;
+        for entry in &self.entries {
+            if entry.name != name {
+                continue;
+            }
+            match &entry.hash {
+                None => return AllowlistCheck::Allowed,
+                Some(pinned) if pinned == hash => return AllowlistCheck::Allowed,
+                Some(_) => hash_mismatch = true,
+            }
+        }
+        if hash_mismatch {
+            AllowlistCheck::HashMismatch
+        } else {
+            AllowlistCheck::NotListed
+        }
+    }
+}
+
+/// Whether an [`AllowlistCheck`] short-circuits consent before a
+/// [`ConsentResolver`] ever builds/shows a real prompt -- pulled out as a
+/// pure function (mirroring [`map_permission_decision`]'s precedent) so it's
+/// directly unit-testable without a live `rokr_tui::PermissionHandle` (which
+/// only `rokr_tui` itself can construct -- see `InteractiveConsentResolver`'s
+/// doc comment). `Some(outcome)` means `resolve` returns immediately,
+/// consulting neither the trust store's usual TOFU prompt path nor writing
+/// any trust-store entry (the approval is ephemeral, same spirit as "[y] run
+/// once"). `None` means normal flow proceeds -- a `HashMismatch` additionally
+/// gets a one-line stderr notice from the caller before falling through.
+fn allowlist_short_circuit(check: AllowlistCheck) -> Option<ConsentOutcome> {
+    match check {
+        AllowlistCheck::Allowed => Some(ConsentOutcome::ApproveWithoutPersisting),
+        AllowlistCheck::HashMismatch | AllowlistCheck::NotListed => None,
+    }
+}
+
 /// What the consent prompt shows: the literal `run:` command, the skill's
 /// path, and its scope -- ADR 0018 decision 7, no dry-run, no output
-/// preview.
+/// preview. `name` and `hash` (added for `--allow-skill`, ADR 0018 decision
+/// 4's previously-deferred flag) are the same mention name and content hash
+/// `resolve_skill_mentions_with_consent` already computed before building
+/// this request -- carried here so a [`ConsentResolver`] impl can check a
+/// [`SkillAllowlist`] itself, entirely inside the consent-resolution seam,
+/// without `commands.rs` needing any allowlist-awareness of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillConsentRequest {
     pub command: String,
     pub skill_path: PathBuf,
     pub scope: SkillScope,
+    pub name: String,
+    pub hash: String,
 }
 
 /// The result of asking a [`ConsentResolver`] about a [`SkillConsentRequest`].
@@ -205,15 +350,29 @@ pub trait ConsentResolver: Send + Sync {
 /// `rokr_tui::PermissionHandle` (ADR 0018 decision 3): reuses
 /// `rokr_tui::PermissionDetail::Text` to show the literal `run:` command,
 /// the skill's path, and its scope (decision 7) rather than introducing a
-/// new prompt variant.
+/// new prompt variant. `allowlist` defaults empty (`new`); a caller wires in
+/// the parsed `--allow-skill` flag values via [`Self::with_allowlist`].
 #[derive(Clone)]
 pub struct InteractiveConsentResolver {
     handle: rokr_tui::PermissionHandle,
+    allowlist: SkillAllowlist,
 }
 
 impl InteractiveConsentResolver {
     pub fn new(handle: rokr_tui::PermissionHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            allowlist: SkillAllowlist::default(),
+        }
+    }
+
+    /// ADR 0018 decision 4's `--allow-skill` flag (deferred there,
+    /// implemented here): a matching entry short-circuits [`Self::resolve`]
+    /// before it ever builds/shows the interactive prompt -- see
+    /// `allowlist_short_circuit`.
+    pub fn with_allowlist(mut self, allowlist: SkillAllowlist) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 }
 
@@ -223,7 +382,19 @@ impl ConsentResolver for InteractiveConsentResolver {
         request: SkillConsentRequest,
     ) -> impl std::future::Future<Output = ConsentOutcome> + Send {
         let handle = self.handle.clone();
+        let allowlist = self.allowlist.clone();
         async move {
+            let check = allowlist.check(&request.name, &request.hash);
+            if let Some(outcome) = allowlist_short_circuit(check) {
+                return outcome;
+            }
+            if check == AllowlistCheck::HashMismatch {
+                eprintln!(
+                    "skill '{}': --allow-skill hash pin did not match this file's current \
+                     content hash -- falling back to interactive consent",
+                    request.name
+                );
+            }
             let detail = format!(
                 "run: {}\nskill: {}\nscope: {}",
                 request.command,
@@ -283,6 +454,7 @@ fn map_permission_decision(decision: rokr_tui::PermissionDecision) -> ConsentOut
 /// stderr.
 pub struct HeadlessConsentResolver {
     mode: crate::cli::PermissionMode,
+    allowlist: SkillAllowlist,
     notice_sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
 }
 
@@ -290,8 +462,18 @@ impl HeadlessConsentResolver {
     pub fn new(mode: crate::cli::PermissionMode) -> Self {
         Self {
             mode,
+            allowlist: SkillAllowlist::default(),
             notice_sink: std::sync::Arc::new(|notice: &str| eprintln!("{notice}")),
         }
+    }
+
+    /// ADR 0018 decision 4's `--allow-skill` flag (deferred there,
+    /// implemented here): a matching entry short-circuits [`Self::resolve`]
+    /// with no prompt/notice and no trust-store write -- see
+    /// `allowlist_short_circuit`. Chainable with [`Self::with_notice_sink`].
+    pub fn with_allowlist(mut self, allowlist: SkillAllowlist) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     /// F-003 (pre-ship review): test-only seam so the exact one-line notice
@@ -306,6 +488,7 @@ impl HeadlessConsentResolver {
     ) -> Self {
         Self {
             mode,
+            allowlist: SkillAllowlist::default(),
             notice_sink: std::sync::Arc::new(sink),
         }
     }
@@ -317,18 +500,29 @@ impl ConsentResolver for HeadlessConsentResolver {
         request: SkillConsentRequest,
     ) -> impl std::future::Future<Output = ConsentOutcome> + Send {
         let mode = self.mode;
+        let allowlist = self.allowlist.clone();
         let notice_sink = self.notice_sink.clone();
         async move {
             if matches!(mode, crate::cli::PermissionMode::Bypass) {
-                ConsentOutcome::ApproveWithoutPersisting
-            } else {
-                notice_sink(&format!(
-                    "skill not executed (untrusted): {} [run: {}]",
-                    request.skill_path.display(),
-                    request.command,
-                ));
-                ConsentOutcome::Decline
+                return ConsentOutcome::ApproveWithoutPersisting;
             }
+            let check = allowlist.check(&request.name, &request.hash);
+            if let Some(outcome) = allowlist_short_circuit(check) {
+                return outcome;
+            }
+            if check == AllowlistCheck::HashMismatch {
+                notice_sink(&format!(
+                    "skill '{}': --allow-skill hash pin did not match this file's current \
+                     content hash",
+                    request.name
+                ));
+            }
+            notice_sink(&format!(
+                "skill not executed (untrusted): {} [run: {}]",
+                request.skill_path.display(),
+                request.command,
+            ));
+            ConsentOutcome::Decline
         }
     }
 }
@@ -469,6 +663,132 @@ mod tests {
         assert_eq!(
             map_permission_decision(rokr_tui::PermissionDecision::Deny),
             ConsentOutcome::Decline
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // `--allow-skill` (ADR 0018 decision 4, previously deferred).
+    // ---------------------------------------------------------------
+
+    /// A bare name and a `name@<64-hex>` value both parse; a hash pin that
+    /// is the wrong length, contains non-hex or uppercase-hex characters, or
+    /// an empty name before `@`, are all rejected -- matching
+    /// `hash_skill_contents`'s always-lowercase-64-hex output shape exactly.
+    #[test]
+    fn allow_skill_entry_parses_bare_name_and_name_at_hash_rejects_malformed() {
+        let entry: AllowSkillEntry = "deploy".parse().expect("bare name should parse");
+        assert_eq!(entry.name, "deploy");
+        assert_eq!(entry.hash, None);
+
+        let hash = hash_skill_contents("run: echo hi");
+        let entry: AllowSkillEntry = format!("deploy@{hash}")
+            .parse()
+            .expect("name@<64-hex> should parse");
+        assert_eq!(entry.name, "deploy");
+        assert_eq!(entry.hash, Some(hash));
+
+        assert!(
+            "deploy@abc123".parse::<AllowSkillEntry>().is_err(),
+            "a hash pin shorter than 64 hex chars must be rejected"
+        );
+        assert!(
+            format!("deploy@{}", "a".repeat(63))
+                .parse::<AllowSkillEntry>()
+                .is_err(),
+            "a 63-char pin must be rejected"
+        );
+        assert!(
+            format!("deploy@{}", "g".repeat(64))
+                .parse::<AllowSkillEntry>()
+                .is_err(),
+            "a pin containing non-hex characters must be rejected"
+        );
+        assert!(
+            format!("deploy@{}", "A".repeat(64))
+                .parse::<AllowSkillEntry>()
+                .is_err(),
+            "an uppercase-hex pin must be rejected -- only lowercase hex is accepted"
+        );
+        assert!(
+            "@abc".parse::<AllowSkillEntry>().is_err(),
+            "an empty skill name before '@' must be rejected"
+        );
+        assert!(
+            "".parse::<AllowSkillEntry>().is_err(),
+            "an empty bare value must be rejected"
+        );
+    }
+
+    /// `SkillAllowlist::check`: an unconditional (bare-name) entry always
+    /// matches; a pinned entry matches only the exact hash; a name not
+    /// present at all is `NotListed`; a pinned entry present under the
+    /// wrong hash is `HashMismatch`, not silently allowed.
+    #[test]
+    fn skill_allowlist_check_distinguishes_allowed_mismatch_and_not_listed() {
+        let hash_a = hash_skill_contents("run: echo original");
+        let hash_b = hash_skill_contents("run: echo edited");
+        assert_ne!(hash_a, hash_b, "fixture sanity");
+
+        let allowlist = SkillAllowlist::new(vec![
+            AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: None,
+            },
+            AllowSkillEntry {
+                name: "release".to_string(),
+                hash: Some(hash_a.clone()),
+            },
+        ]);
+
+        assert_eq!(
+            allowlist.check("deploy", &hash_b),
+            AllowlistCheck::Allowed,
+            "a bare-name entry must match regardless of hash"
+        );
+        assert_eq!(
+            allowlist.check("release", &hash_a),
+            AllowlistCheck::Allowed,
+            "a pinned entry must match its exact hash"
+        );
+        assert_eq!(
+            allowlist.check("release", &hash_b),
+            AllowlistCheck::HashMismatch,
+            "a pinned entry present under the WRONG hash must be HashMismatch, never Allowed"
+        );
+        assert_eq!(
+            allowlist.check("unknown", &hash_a),
+            AllowlistCheck::NotListed,
+            "a name with no entry at all must be NotListed"
+        );
+    }
+
+    /// Unit test for the allowlist short-circuit `InteractiveConsentResolver
+    /// ::resolve` applies BEFORE it ever builds/shows the interactive
+    /// prompt or touches its `rokr_tui::PermissionHandle` -- exercised at
+    /// the pure-function level (`allowlist_short_circuit`, the exact
+    /// function `resolve`'s first branch calls) since
+    /// `rokr_tui::PermissionHandle` has no public constructor outside
+    /// `rokr_tui` itself (see `InteractiveConsentResolver`'s doc comment
+    /// and `crate::runner`'s identical precedent for why a live handle
+    /// can't be constructed in this crate's tests) -- a full TUI
+    /// integration test is not needed to prove the short-circuit logic
+    /// itself is correct.
+    #[test]
+    fn allowlist_short_circuit_skips_prompt_only_on_an_unconditional_or_matching_pin() {
+        assert_eq!(
+            allowlist_short_circuit(AllowlistCheck::Allowed),
+            Some(ConsentOutcome::ApproveWithoutPersisting),
+            "an allowed check must short-circuit straight to a one-shot, never-persisted approval"
+        );
+        assert_eq!(
+            allowlist_short_circuit(AllowlistCheck::HashMismatch),
+            None,
+            "a mismatched pin must fall through to the normal prompt flow, not short-circuit"
+        );
+        assert_eq!(
+            allowlist_short_circuit(AllowlistCheck::NotListed),
+            None,
+            "an unlisted skill must fall through to the normal prompt flow"
         );
     }
 }
