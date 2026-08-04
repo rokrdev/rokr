@@ -840,3 +840,160 @@ async fn print_flag_prompt_with_skill_mention_inlines_skill_file_contents_in_out
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
+
+/// F-003 (major, pre-ship review): the headless acceptance criteria for an
+/// untrusted, project-scope executable skill were previously asserted only
+/// at the `HeadlessConsentResolver` unit level (`rokr-app`'s
+/// `skill_trust.rs`/`headless.rs` tests), never through the actual `rokr
+/// -p` binary path -- so a wiring regression (the wrong `permission_mode`
+/// threaded into `HeadlessConsentResolver::new`, a trust store rooted
+/// somewhere other than the real config dir, or the run aborting instead
+/// of continuing on decline) would go uncaught. Mirrors the wire-level
+/// precedent
+/// `print_flag_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing_request`
+/// above, but for a project-scope skill declaring `run:` under DEFAULT
+/// permission mode (no `--permission-mode`/`--dangerously-skip-permissions`
+/// flags at all).
+#[tokio::test]
+async fn print_flag_untrusted_executable_skill_is_not_executed_under_default_permission_mode() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("skill-exec-default-home");
+    let xdg_config_home = unique_temp_dir("skill-exec-default-xdg-config-home");
+    let project_dir = unique_temp_dir("skill-exec-default-project");
+
+    let skills_dir = project_dir.join(".rokr").join("skills");
+    std::fs::create_dir_all(&skills_dir)
+        .expect("failed to create fixture project-scope skills directory");
+    let marker_path = project_dir.join("deploy-marker");
+    std::fs::write(
+        skills_dir.join("deploy.md"),
+        format!(
+            "---\nrun: touch {}\n---\nDeploy body text.",
+            marker_path.to_string_lossy()
+        ),
+    )
+    .expect("failed to write fixture deploy.md");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    let assert = cmd
+        .arg("-p")
+        .arg("Please run @skill:deploy")
+        .current_dir(&project_dir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.lines().any(|line| line.contains("skill not executed")),
+        "expected a single stderr line matching 'skill not executed' (HeadlessConsentResolver's \
+         notice), got stderr: {stderr:?}"
+    );
+    assert!(
+        !marker_path.exists(),
+        "the run: command must never execute under default (deny) permission mode without \
+         consent"
+    );
+
+    let received_requests = mock
+        .received_requests()
+        .await
+        .expect("mock server should have recorded received requests");
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.to_lowercase().contains("not executed"),
+        "expected the echoed prompt sent to the provider to contain the not-executed notice, \
+         got body: {first_request_body:?}"
+    );
+    assert!(
+        !first_request_body.contains("Deploy body text."),
+        "a declined skill's body (which may assume its run: command already ran) must never be \
+         inlined into the outgoing request, got body: {first_request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// F-003 (major, pre-ship review), second case: under `--permission-mode
+/// bypass --dangerously-skip-permissions`, the SAME untrusted project-scope
+/// `run:` skill must actually execute (exit 0, marker file created), and
+/// -- per ADR 0018 decision 4 ("bypassing does not fabricate consent
+/// history") -- must NEVER write a `skill_trust.json` trust-store entry.
+#[tokio::test]
+async fn print_flag_untrusted_executable_skill_executes_under_bypass_without_persisting_trust() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("skill-exec-bypass-home");
+    let xdg_config_home = unique_temp_dir("skill-exec-bypass-xdg-config-home");
+    let project_dir = unique_temp_dir("skill-exec-bypass-project");
+
+    let skills_dir = project_dir.join(".rokr").join("skills");
+    std::fs::create_dir_all(&skills_dir)
+        .expect("failed to create fixture project-scope skills directory");
+    let marker_path = project_dir.join("deploy-marker");
+    std::fs::write(
+        skills_dir.join("deploy.md"),
+        format!(
+            "---\nrun: touch {}\n---\nDeploy body text.",
+            marker_path.to_string_lossy()
+        ),
+    )
+    .expect("failed to write fixture deploy.md");
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    cmd.arg("-p")
+        .arg("Please run @skill:deploy")
+        .arg("--permission-mode")
+        .arg("bypass")
+        .arg("--dangerously-skip-permissions")
+        .current_dir(&project_dir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    assert!(
+        marker_path.exists(),
+        "expected the run: command to actually execute under --permission-mode bypass \
+         --dangerously-skip-permissions"
+    );
+    let trust_store_path = xdg_config_home.join("rokr").join("skill_trust.json");
+    assert!(
+        !trust_store_path.exists(),
+        "expected Bypass to NEVER write a trust-store entry (ADR 0018 decision 4: bypassing \
+         does not fabricate consent history), but found one at {trust_store_path:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}

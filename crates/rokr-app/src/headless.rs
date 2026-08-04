@@ -824,6 +824,58 @@ mod tests {
         );
     }
 
+    /// F-003 (major, pre-ship review): the acceptance criterion "a one-line
+    /// stderr notice" was previously untestable in-process (the resolver
+    /// only ever `eprintln!`'d it directly) -- `with_notice_sink` lets a
+    /// test capture the exact text `resolve` would otherwise only print to
+    /// the real process stderr, complementing the wire-level
+    /// `crates/rokr/tests/headless_test.rs` binary spawn, which can only
+    /// assert stderr CONTAINS a matching substring, not drive the resolver
+    /// directly.
+    #[tokio::test]
+    async fn headless_consent_resolver_notice_names_skill_path_and_command_on_one_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("deploy.md"),
+            "---\nrun: echo do-not-run-me\n---\nDeploy body.",
+        )
+        .unwrap();
+
+        let registry = crate::CommandRegistry::discover_project_scope(temp.path());
+        let config_dir = temp.path().join("config");
+        let trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
+        let notices = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = notices.clone();
+        let consent = crate::skill_trust::HeadlessConsentResolver::with_notice_sink(
+            crate::cli::PermissionMode::Deny,
+            move |notice: &str| recorded.lock().unwrap().push(notice.to_string()),
+        );
+
+        let _ = registry
+            .resolve_skills("@skill:deploy", temp.path().to_path_buf(), trust_store, consent)
+            .await
+            .expect("an untrusted skill under default mode must not error the whole run");
+
+        let recorded = notices.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected exactly one notice to be emitted, got: {recorded:?}"
+        );
+        let notice = &recorded[0];
+        assert!(
+            !notice.contains('\n'),
+            "expected a single-LINE notice (no embedded newlines), got: {notice:?}"
+        );
+        assert!(
+            notice.contains("not executed") && notice.contains("echo do-not-run-me"),
+            "expected the notice to name the skill as not executed and include the literal \
+             run: command, got: {notice:?}"
+        );
+    }
+
     /// Ticket 75 (executable-skill-invocation), ADR 0018 decision 4:
     /// `Bypass` (`--dangerously-skip-permissions`) executes an untrusted
     /// skill's `run:` command without ever consulting or writing a

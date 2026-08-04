@@ -322,4 +322,6 @@ own amendment section for ticket 72).
   revisiting this ADR's core model, since it composes with (doesn't
   replace) the trust-store shape decision 5 establishes.
 - Ticket 75 is rescoped against these decisions rather than its original,
-  deferred spec; see `.workflow/kanban/backlog/75-executable-skill-invocation.md`.
+  deferred spec; see ticket 75 (`executable-skill-invocation`) on the kanban
+  board -- referenced by id/slug rather than a column path, since
+  `.workflow/` board state (which column a ticket sits in) is ephemeral.

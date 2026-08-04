@@ -460,13 +460,6 @@ fn parse_command_file(contents: &str) -> CustomCommand {
     }
 }
 
-/// Ticket 75 (executable-skill-invocation), ADR 0018: tolerantly extracts an
-/// optional `run:` frontmatter field's literal value from a skill file's raw
-/// `contents`, or `None` when there's no frontmatter block or no `run:` key
-/// within it. Deliberately does NOT alter what a skill's `contents` field
-/// stores (see [`Skill`]'s doc comment) -- this is purely a read for
-/// detecting/extracting the `run:` value, never a transformation of what
-/// gets inlined for an inert mention.
 fn parse_skill_run_field(contents: &str) -> Option<String> {
     let (frontmatter, _body) = split_frontmatter(contents)?;
     for line in frontmatter.lines() {
@@ -474,7 +467,18 @@ fn parse_skill_run_field(contents: &str) -> Option<String> {
             continue;
         };
         if key.trim() == "run" {
-            return Some(value.trim().to_string());
+            let value = value.trim();
+            // M-3 (pre-ship review): an empty or whitespace-only `run:`
+            // value must not be treated as an executable skill at all --
+            // without this guard, `Some("")` reaches `resolve_skills`,
+            // which gates it behind a real consent prompt only to run
+            // `sh -c ""` (a no-op) on approval, a pointless prompt for a
+            // command that does nothing.
+            return if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
     }
     None
@@ -829,6 +833,66 @@ mod tests {
         );
     }
 
+    /// M-3 (pre-ship review): an empty or whitespace-only `run:` value
+    /// (`run:` with nothing after it, or `run:    `) must parse as if
+    /// there were no `run:` field at all -- NOT as `Some("")`, which would
+    /// gate the skill behind a real consent prompt only to execute
+    /// `sh -c ""` (a no-op) on approval.
+    #[test]
+    fn parse_skill_run_field_treats_empty_or_whitespace_value_as_absent() {
+        assert_eq!(parse_skill_run_field("---\nrun:\n---\nBody."), None);
+        assert_eq!(parse_skill_run_field("---\nrun:   \n---\nBody."), None);
+        assert_eq!(
+            parse_skill_run_field("---\nrun: echo hi\n---\nBody."),
+            Some("echo hi".to_string()),
+            "a genuinely non-empty run: value must still parse normally"
+        );
+    }
+
+    /// M-3 (pre-ship review), end-to-end: a skill file with an empty
+    /// `run:` value must resolve exactly like an inert skill (full body
+    /// inlined, no consent prompt at all) -- confirms the parse-time guard
+    /// actually prevents a pointless consent prompt for a command that
+    /// would do nothing, not just that the parsed value looks right in
+    /// isolation.
+    #[tokio::test]
+    async fn skill_with_empty_run_field_is_resolved_as_inert_without_consent_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        // `Skill::contents` is always the file's raw, full, untouched text
+        // (see `Skill`'s doc comment) -- an inert mention inlines this
+        // verbatim, frontmatter block included, so that's exactly what
+        // must come back here.
+        let raw_contents = "---\nrun:\n---\nNoop skill body text.";
+        fs::write(skills_dir.join("noop.md"), raw_contents).unwrap();
+
+        let registry = CommandRegistry::discover_project_scope(temp.path());
+        let trust_store = fresh_trust_store(temp.path());
+        let consent = RecordingConsentResolver::default();
+
+        let resolved = registry
+            .resolve_skills(
+                "@skill:noop",
+                temp.path().to_path_buf(),
+                trust_store,
+                consent.clone(),
+            )
+            .await
+            .expect("an empty-run: skill mention should not error");
+
+        assert!(
+            !consent.was_asked(),
+            "expected an empty run: value to be treated as no run: field at all, never \
+             consulting the ConsentResolver"
+        );
+        assert_eq!(
+            resolved, raw_contents,
+            "expected the skill's full raw contents to be inlined verbatim, exactly like an \
+             inert skill"
+        );
+    }
+
     /// Load-bearing: the git-clone guard. A stub `ConsentResolver` that
     /// records whether it was asked, and declines, proves `resolve_skills`
     /// never executes the command and never bypasses the resolver.
@@ -961,6 +1025,119 @@ mod tests {
         assert!(
             resolved.contains("Before ") && resolved.contains(" after"),
             "expected the surrounding text to be preserved, got: {resolved:?}"
+        );
+    }
+
+    /// A test `ConsentResolver` stub that always returns a fixed
+    /// `ConsentOutcome`, regardless of the request -- used below to drive
+    /// `resolve_skills`' `ApproveAndPersist` vs `ApproveWithoutPersisting`
+    /// branches (commands.rs:357-365) directly, independent of
+    /// `InteractiveConsentResolver`'s TUI-decision mapping (which is
+    /// unit-tested on its own in `skill_trust.rs`, per F-002 pre-ship
+    /// review -- `map_permission_decision` can't be exercised here since it
+    /// requires a live `rokr_tui::PermissionHandle`).
+    #[derive(Clone)]
+    struct FixedConsentResolver {
+        outcome: crate::skill_trust::ConsentOutcome,
+    }
+
+    impl crate::skill_trust::ConsentResolver for FixedConsentResolver {
+        fn resolve(
+            &self,
+            _request: crate::skill_trust::SkillConsentRequest,
+        ) -> impl std::future::Future<Output = crate::skill_trust::ConsentOutcome> + Send {
+            let outcome = self.outcome;
+            async move { outcome }
+        }
+    }
+
+    /// F-002 (pre-ship review): a one-shot approval -- what
+    /// `InteractiveConsentResolver` now maps `[y] run once` to -- must
+    /// execute the skill's `run:` command WITHOUT ever writing a
+    /// trust-store grant. Complements the `map_permission_decision` unit
+    /// test in `skill_trust.rs` by proving the outcome it produces is
+    /// wired correctly end-to-end through `resolve_skills`.
+    #[tokio::test]
+    async fn approve_without_persisting_executes_but_writes_no_trust_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        let marker_path = temp.path().join("run-once-marker");
+        let skill_path = skills_dir.join("deploy.md");
+        let contents = format!(
+            "---\nrun: touch {}\n---\nDeploy body.",
+            marker_path.to_string_lossy()
+        );
+        fs::write(&skill_path, &contents).unwrap();
+        let hash = crate::skill_trust::hash_skill_contents(&contents);
+
+        let registry = CommandRegistry::discover_project_scope(temp.path());
+        let trust_store = fresh_trust_store(temp.path());
+        let consent = FixedConsentResolver {
+            outcome: crate::skill_trust::ConsentOutcome::ApproveWithoutPersisting,
+        };
+
+        registry
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store.clone(),
+                consent,
+            )
+            .await
+            .expect("a one-shot-approved skill mention should not error");
+
+        assert!(
+            marker_path.exists(),
+            "expected the run: command to execute on a one-shot approval"
+        );
+        assert!(
+            !trust_store.is_trusted(&skill_path, &hash),
+            "expected 'run once' (ApproveWithoutPersisting) to NEVER write a trust-store grant"
+        );
+    }
+
+    /// F-002 (pre-ship review): a persisted approval -- what
+    /// `InteractiveConsentResolver` now maps `[r] trust this skill version`
+    /// to -- must execute the skill's `run:` command AND write a
+    /// trust-store grant for its exact `(path, hash)`.
+    #[tokio::test]
+    async fn approve_and_persist_executes_and_writes_trust_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path().join(".rokr").join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        let marker_path = temp.path().join("persist-marker");
+        let skill_path = skills_dir.join("deploy.md");
+        let contents = format!(
+            "---\nrun: touch {}\n---\nDeploy body.",
+            marker_path.to_string_lossy()
+        );
+        fs::write(&skill_path, &contents).unwrap();
+        let hash = crate::skill_trust::hash_skill_contents(&contents);
+
+        let registry = CommandRegistry::discover_project_scope(temp.path());
+        let trust_store = fresh_trust_store(temp.path());
+        let consent = FixedConsentResolver {
+            outcome: crate::skill_trust::ConsentOutcome::ApproveAndPersist,
+        };
+
+        registry
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store.clone(),
+                consent,
+            )
+            .await
+            .expect("a persisted-approval skill mention should not error");
+
+        assert!(
+            marker_path.exists(),
+            "expected the run: command to execute on a persisted approval"
+        );
+        assert!(
+            trust_store.is_trusted(&skill_path, &hash),
+            "expected 'trust this skill version' (ApproveAndPersist) to write a trust-store grant"
         );
     }
 }

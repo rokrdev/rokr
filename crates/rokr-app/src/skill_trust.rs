@@ -106,7 +106,42 @@ impl SkillTrustStore {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string(entries)?;
-        std::fs::write(&self.path, json)?;
+
+        // M-2 (pre-ship review): hardened to 0600, mirroring
+        // `rokr-provider::auth::FileTokenStore::save`'s exact precedent --
+        // this file is consent history (which project-scope skill
+        // versions the user has trusted to execute arbitrary commands),
+        // sensitive enough to not leave world/group-readable even
+        // momentarily. Unix: create via `OpenOptions` with `mode(0o600)`
+        // so it's never written at a broader default mode first;
+        // `set_permissions` below still runs unconditionally afterward to
+        // narrow an already-existing file from a pre-fix version of this
+        // code (`mode()` only governs permissions at creation time).
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)?;
+            file.write_all(json.as_bytes())?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&self.path, &json)?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
         Ok(())
     }
 }
@@ -201,14 +236,34 @@ impl ConsentResolver for InteractiveConsentResolver {
                     detail: rokr_tui::PermissionDetail::Text(detail),
                 })
                 .await;
-            match decision {
-                rokr_tui::PermissionDecision::Allow
-                | rokr_tui::PermissionDecision::AllowAndRemember => {
-                    ConsentOutcome::ApproveAndPersist
-                }
-                rokr_tui::PermissionDecision::Deny => ConsentOutcome::Decline,
-            }
+            map_permission_decision(decision)
         }
+    }
+}
+
+/// Maps the TUI's raw `[y]/[n]/[r]` keypress intent to a skill consent
+/// outcome. Split out of [`InteractiveConsentResolver::resolve`] as a pure
+/// function so the mapping itself -- the thing F-002 (pre-ship review)
+/// found wrong -- is directly unit-testable without a live
+/// `rokr_tui::PermissionHandle` (which requires a running render loop; see
+/// this module's tests).
+///
+/// F-002 (pre-ship review): `Allow` and `AllowAndRemember` previously both
+/// mapped to `ApproveAndPersist`, so the "[y] allow once" hint rendered by
+/// rokr-tui's `permission_hint_line` was a lie -- pressing `y` wrote a
+/// permanent `SkillTrustStore` grant identical to `r`, and
+/// `ApproveWithoutPersisting` was unreachable interactively.
+/// `ApproveWithoutPersisting` exists precisely so a skill's `run:` command
+/// can execute once without being durably trusted (ADR 0018 decision 1:
+/// consent is TOFU hash-pinned and a trust-store entry is written only on
+/// an actual "trust this" decision, not on every execution) -- `y` now
+/// maps to it, matching rokr-tui's "run once" label for a skill-consent
+/// prompt, and only `r` ("trust this skill version") writes a grant.
+fn map_permission_decision(decision: rokr_tui::PermissionDecision) -> ConsentOutcome {
+    match decision {
+        rokr_tui::PermissionDecision::Allow => ConsentOutcome::ApproveWithoutPersisting,
+        rokr_tui::PermissionDecision::AllowAndRemember => ConsentOutcome::ApproveAndPersist,
+        rokr_tui::PermissionDecision::Deny => ConsentOutcome::Decline,
     }
 }
 
@@ -220,13 +275,39 @@ impl ConsentResolver for InteractiveConsentResolver {
 /// `AcceptEdits` (which only ever grants write/edit tool calls, not a
 /// skill's `run:` command) both decline, printing a one-line stderr notice
 /// first.
+///
+/// F-003 (pre-ship review): the notice is emitted through `notice_sink`
+/// rather than a bare `eprintln!`, so a test can capture and assert its
+/// exact text in-process (`with_notice_sink`) instead of the only other
+/// option being spawning the real `rokr` binary and inspecting its real
+/// stderr.
 pub struct HeadlessConsentResolver {
     mode: crate::cli::PermissionMode,
+    notice_sink: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl HeadlessConsentResolver {
     pub fn new(mode: crate::cli::PermissionMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            notice_sink: std::sync::Arc::new(|notice: &str| eprintln!("{notice}")),
+        }
+    }
+
+    /// F-003 (pre-ship review): test-only seam so the exact one-line notice
+    /// `resolve` prints on decline can be captured and asserted in-process
+    /// -- the plain `eprintln!` in the default constructor above writes to
+    /// the real process stderr, which is only observable by spawning the
+    /// actual `rokr` binary (see `crates/rokr/tests/headless_test.rs`).
+    #[cfg(test)]
+    pub fn with_notice_sink(
+        mode: crate::cli::PermissionMode,
+        sink: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            mode,
+            notice_sink: std::sync::Arc::new(sink),
+        }
     }
 }
 
@@ -236,15 +317,16 @@ impl ConsentResolver for HeadlessConsentResolver {
         request: SkillConsentRequest,
     ) -> impl std::future::Future<Output = ConsentOutcome> + Send {
         let mode = self.mode;
+        let notice_sink = self.notice_sink.clone();
         async move {
             if matches!(mode, crate::cli::PermissionMode::Bypass) {
                 ConsentOutcome::ApproveWithoutPersisting
             } else {
-                eprintln!(
+                notice_sink(&format!(
                     "skill not executed (untrusted): {} [run: {}]",
                     request.skill_path.display(),
                     request.command,
-                );
+                ));
                 ConsentOutcome::Decline
             }
         }
@@ -333,6 +415,60 @@ mod tests {
         assert!(
             !store_rooted_at_project_dir.is_trusted(&skill_path, &hash),
             "expected a store rooted at the project directory to see no trust data at all"
+        );
+    }
+
+    /// M-2 (pre-ship review): `SkillTrustStore::save` must never leave
+    /// `skill_trust.json` on disk with permissions broader than `0600` --
+    /// it records consent history (which project-scope skill versions the
+    /// user has trusted to execute arbitrary commands), matching the
+    /// precedent `rokr-provider::auth::FileTokenStore::save` already
+    /// establishes for token files.
+    #[test]
+    #[cfg(unix)]
+    fn grant_writes_trust_store_file_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SkillTrustStore::new(temp.path());
+        let skill_path = temp.path().join("deploy.md");
+
+        store
+            .grant(&skill_path, &hash_skill_contents("run: echo hi"))
+            .expect("grant should succeed");
+
+        let metadata = std::fs::metadata(temp.path().join("skill_trust.json")).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected skill_trust.json permissions to be 0600, got {mode:o}"
+        );
+    }
+
+    /// F-002 (major, pre-ship review): `InteractiveConsentResolver` used to
+    /// map BOTH `Allow` and `AllowAndRemember` to `ApproveAndPersist`, so
+    /// the "[y] allow once" hint line was a lie -- pressing `y` wrote a
+    /// permanent trust-store grant, identical to `r`, and
+    /// `ApproveWithoutPersisting` was unreachable interactively. The
+    /// resolver's mapping must match what rokr-tui's hint line tells the
+    /// user each key does: `y` = run once (never persisted), `r` = trust
+    /// this skill version (persisted), `n`/deny = don't run.
+    #[test]
+    fn permission_decision_mapping_matches_hint_line_semantics() {
+        assert_eq!(
+            map_permission_decision(rokr_tui::PermissionDecision::Allow),
+            ConsentOutcome::ApproveWithoutPersisting,
+            "'[y] run once' must never write a trust-store grant"
+        );
+        assert_eq!(
+            map_permission_decision(rokr_tui::PermissionDecision::AllowAndRemember),
+            ConsentOutcome::ApproveAndPersist,
+            "'[r] trust this skill version' must be the ONLY interactive path that writes a \
+             trust-store grant"
+        );
+        assert_eq!(
+            map_permission_decision(rokr_tui::PermissionDecision::Deny),
+            ConsentOutcome::Decline
         );
     }
 }
