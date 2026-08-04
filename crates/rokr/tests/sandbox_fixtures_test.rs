@@ -14,6 +14,10 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rokr_app::skill_trust::{
+    ConsentOutcome, ConsentResolver, SkillConsentRequest, SkillTrustStore,
+};
+use rokr_app::CommandRegistry;
 use rokr_tools::bash::BashTool;
 use rokr_tools::write::WriteTool;
 use rokr_tools::Tool;
@@ -226,5 +230,69 @@ async fn write_tool_out_of_workspace_write_attempt_is_blocked() {
         !target.exists(),
         "the out-of-workspace file must not have been created: {}",
         target.display()
+    );
+}
+
+/// A test `ConsentResolver` that always auto-approves without persisting a
+/// trust-store entry -- isolates CONTAINMENT (this test's actual subject)
+/// from CONSENT (which has its own dedicated coverage in `commands.rs`'s and
+/// `tui_test.rs`'s tests): consent is granted unconditionally here so the
+/// only thing left to prove is that the sandbox still blocks the
+/// out-of-workspace write once execution is reached.
+#[derive(Clone)]
+struct AlwaysApproveConsentResolver;
+
+impl ConsentResolver for AlwaysApproveConsentResolver {
+    fn resolve(
+        &self,
+        _request: SkillConsentRequest,
+    ) -> impl std::future::Future<Output = ConsentOutcome> + Send {
+        async { ConsentOutcome::ApproveWithoutPersisting }
+    }
+}
+
+/// Ticket 75 (executable-skill-invocation), ADR 0018 decision 2: reuses this
+/// file's shared adversarial fixture shape (workspace root A, target file in
+/// sibling dir B outside it) but drives the write attempt through a
+/// project-scope executable skill's `run:` command, resolved via
+/// `CommandRegistry::resolve_skills` with consent auto-granted (see
+/// `AlwaysApproveConsentResolver` above) -- proving containment and consent
+/// are independent gates: even a FULLY CONSENTED `run:` command is still
+/// confined by the same `SeatbeltSandbox`/`BashTool` path ticket 69
+/// established, unchanged.
+#[tokio::test]
+async fn executable_skill_out_of_workspace_write_attempt_is_blocked() {
+    let workspace = unique_temp_dir("skill-workspace-a");
+    let outside = unique_temp_dir("skill-workspace-b");
+    let target = outside.join("pwned.txt");
+
+    let skills_dir = workspace.join(".rokr").join("skills");
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    let command = format!("echo pwned > {}", target.to_string_lossy());
+    std::fs::write(
+        skills_dir.join("deploy.md"),
+        format!("---\nrun: {command}\n---\nDeploy body."),
+    )
+    .unwrap();
+
+    let registry = CommandRegistry::discover_project_scope(&workspace);
+    let trust_store = SkillTrustStore::new(&workspace.join("trust-store-config"));
+
+    let resolved = registry
+        .resolve_skills(
+            "@skill:deploy",
+            workspace.clone(),
+            trust_store,
+            AlwaysApproveConsentResolver,
+        )
+        .await
+        .expect("resolving a consented executable skill mention should not error");
+
+    assert!(
+        !target.exists(),
+        "writing outside workspace_root ({}) into sibling dir ({}) should be blocked by the \
+         sandbox even though consent was fully granted, got resolved text: {resolved:?}",
+        workspace.display(),
+        outside.display()
     );
 }
