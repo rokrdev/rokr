@@ -456,6 +456,17 @@ pub async fn run_result_object(
         system_prompt.push_str(&segment.content);
     }
 
+    // Ticket 76 (git-context-snapshot): computed once here, never
+    // recomputed mid-session, following the same fold-in pattern as the
+    // `load_memory` loop just above. Silently absent (no error, no
+    // placeholder) outside a git repo, exactly matching how an absent
+    // AGENTS.md is handled.
+    if let Some(git_context) = cwd.as_deref().and_then(crate::git::snapshot) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("# Git Context\n");
+        system_prompt.push_str(&git_context.to_prompt_text());
+    }
+
     let repo_map: Option<String> = cwd.as_deref().map(rokr_tools::repo_map::generate);
 
     let token_store = rokr_provider::auth::default_token_store(&config_dir);

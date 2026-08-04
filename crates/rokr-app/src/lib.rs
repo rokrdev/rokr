@@ -10,6 +10,7 @@
 pub mod cli;
 pub mod commands;
 pub mod commit_candidate_set;
+pub mod git;
 pub mod headless;
 pub mod permission_policy;
 pub mod result_schema;

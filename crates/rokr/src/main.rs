@@ -198,6 +198,17 @@ async fn main() -> ExitCode {
                 system_prompt.push_str(&segment.content);
             }
 
+            // Ticket 76 (git-context-snapshot): computed once here, never
+            // recomputed mid-session, following the same fold-in pattern
+            // as the `load_memory` loop just above. Silently absent (no
+            // error, no placeholder) outside a git repo, exactly matching
+            // how an absent AGENTS.md is handled.
+            if let Some(git_context) = cwd.as_deref().and_then(rokr_app::git::snapshot) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str("# Git Context\n");
+                system_prompt.push_str(&git_context.to_prompt_text());
+            }
+
             // Ticket 50 (hooks-remaining-events-and-config): loaded once
             // here (user-scope config only -- `rokr_config::load_or_init_default`
             // never reads a project-local file, so this can never be
