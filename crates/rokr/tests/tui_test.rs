@@ -2682,6 +2682,7 @@ async fn bash_tool_call_renders_permission_prompt_and_runs_on_accept() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -3749,6 +3750,7 @@ async fn pretooluse_hook_matcher_only_vetoes_matching_tool_names() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -4159,6 +4161,7 @@ async fn write_tool_call_renders_diff_and_writes_file_on_accept() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -4399,6 +4402,7 @@ async fn write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_reco
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -4815,6 +4819,7 @@ async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn(
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -5475,6 +5480,7 @@ async fn edit_tool_call_renders_partial_diff_and_applies_on_accept() {
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
     cmd.arg("--agent");
     cmd.arg("build");
 
@@ -13692,4 +13698,597 @@ async fn plain_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
+}
+
+/// Ticket 72 (`tui-session-allowlist-grant`): pressing `r` ("allow and
+/// remember") at a gated `bash` call's permission prompt must record a
+/// session grant (via `rokr_app::permission_policy::SessionGrants`,
+/// threaded through `SessionRunner`) so a SECOND gated call to the SAME
+/// tool -- chained within the same submission's `run_tool_loop`, once the
+/// first tool result feeds back -- is auto-allowed without ever rendering a
+/// second permission prompt. Mirrors
+/// `bash_tool_call_renders_permission_prompt_and_runs_on_accept`'s PTY
+/// structure exactly, with three chained mock responses instead of two: one
+/// submitted prompt can trigger multiple sequential tool calls before the
+/// final reply, since `run_tool_loop` keeps calling the provider until it
+/// gets a tool-call-free response -- so this is ONE submission with two
+/// chained `bash` calls, not two separate prompts.
+#[tokio::test]
+async fn second_gated_call_to_same_tool_after_remember_choice_never_reprompts() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterRememberedSecondBashForTesting";
+
+    let temp_dir = unique_temp_dir("bash-remember-target");
+    let marker_one_path = temp_dir.join("remember-marker-one");
+    let marker_two_path = temp_dir.join("remember-marker-two");
+    let marker_one_str = marker_one_path.to_string_lossy().into_owned();
+    let marker_two_str = marker_two_path.to_string_lossy().into_owned();
+    let bash_command_one = format!("touch {marker_one_str}");
+    let bash_command_two = format!("touch {marker_two_str}");
+
+    // 1st request: the model asks to invoke `bash` for the FIRST marker.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-remember-bash-1",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command_one }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // 2nd request: the first tool result feeds back, and the SAME
+    // submission's tool loop immediately asks to invoke `bash` again, this
+    // time for the SECOND marker -- chained within one `run_tool_loop`
+    // call, not a second submitted prompt.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-remember-bash-2",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": bash_command_two }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // 3rd request: the second tool result feeds back, and the model gives
+    // a final, tool-call-free reply.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-remember-bash-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-bash-remember");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-bash-remember");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"runbash\r")
+        .expect("failed to write prompt to pty");
+
+    // Wait for the FIRST permission prompt to render.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("bash") && output.contains("remember-marker-one") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("bash") && output.contains("remember-marker-one"),
+        "expected pty output to contain the first permission prompt (tool name + first \
+         marker's command), got: {output:?}"
+    );
+    assert!(
+        !marker_one_path.exists(),
+        "the first bash command must not have run before permission was granted"
+    );
+
+    // Press `r`: allow AND remember, not plain `y`.
+    writer
+        .write_all(b"r")
+        .expect("failed to write allow-and-remember keypress to pty");
+
+    // Poll in a bounded window until the final reply appears, WHILE
+    // actively asserting the second call's tell-tale text (its distinct
+    // marker filename, which would only ever appear inside a rendered
+    // permission-prompt line) never shows up -- proving the second bash
+    // call never re-prompted, not merely that the run eventually finished.
+    let final_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(
+            !output.contains("remember-marker-two"),
+            "the second bash call's command must never appear in the rendered output -- that \
+             would mean a second permission prompt was shown instead of the grant \
+             auto-allowing it. Output so far: {output:?}"
+        );
+        if output.contains(final_reply_text) {
+            break;
+        }
+        if Instant::now() > final_deadline {
+            panic!(
+                "final reply did not appear within timeout waiting for the auto-allowed \
+                 second bash call to complete; output so far: {output:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after the chained, \
+         auto-allowed second bash call, got: {output:?}"
+    );
+    assert!(
+        marker_one_path.exists(),
+        "expected the first bash command to have run (marker file created) after pressing r"
+    );
+    assert!(
+        marker_two_path.exists(),
+        "expected the second bash command to have actually run (marker file created), proving \
+         the tool loop executed it via the auto-allowed grant rather than silently skipping it"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+/// Ticket 74 (`subagent-permission-queue-serialization`), acceptance test,
+/// second half of the acceptance criterion (the first half -- "no
+/// cross-talk between two concurrent subagents' own requests" -- is covered
+/// by `crates/rokr-app/src/subagent.rs`'s
+/// `concurrent_permission_requests_from_two_subagents_each_receive_their_
+/// own_correct_response`): under a session-wide auto-accept grant (ticket
+/// 72), two CONCURRENT subagent gated-tool calls to the SAME tool must
+/// never populate the permission-prompt queue at all.
+///
+/// **Deviation from the ticket's literal "real PTY-driven TUI run" sketch**
+/// -- documented here per this ticket's own escape hatch, mirroring
+/// `subagent.rs`'s `two_concurrent_subagent_tool_calls_in_one_reply_are_
+/// dispatched_concurrently` precedent (ADR 0017 decision 5) for the general
+/// "explain the deviation" norm:
+///
+/// The real, unmodified `SubagentTool::execute_boxed` hardcodes a
+/// subagent's tool set to exactly `[read, glob, grep, ls]` (see that
+/// struct's own doc comment in `crates/rokr-app/src/subagent.rs`) -- NONE
+/// of which is `PreviewableTool`/gated. A real subagent invoked through the
+/// compiled `rokr` binary can therefore structurally never trigger ANY
+/// permission prompt today, PTY or otherwise -- there is no gated tool in
+/// its roster to call. This ticket's own files-touched list and process
+/// notes are explicit that widening that production roster to include a
+/// gated tool by default is OUT of scope (a materially bigger behavior
+/// change than this ticket asks for). A consequence: a PTY-driven version
+/// of this test would be unable to go RED even before this ticket's fix --
+/// it would show zero prompts both before and after, since there would
+/// never be anything for a subagent to gate on either way. That provides no
+/// signal, so it isn't a meaningful acceptance test regardless of how it's
+/// written.
+///
+/// Instead, this test drives `rokr_app::subagent::run_subagent` directly --
+/// made `pub` by this ticket specifically for this purpose (see its own doc
+/// comment) -- with a small injected gated test tool, the exact same
+/// pattern this ticket's sibling test in `subagent.rs` uses for the
+/// "no cross-talk" half. This still exercises the REAL production
+/// `run_subagent` / `PermissionPolicy` / `SessionGrants` code that
+/// `runner.rs` wires a live `SubagentTool` up to (see `SubagentTool`'s and
+/// `run_subagent`'s own doc comments for how `session_grants` flows through
+/// unchanged from `SessionRunner`) -- only the render loop's PTY rendering
+/// itself is out of reach here, and that portion (a session-wide grant
+/// suppressing a SECOND prompt for the PARENT's own gated calls) is already
+/// covered end-to-end over a real PTY by
+/// `second_gated_call_to_same_tool_after_remember_choice_never_reprompts`
+/// immediately above, which shares this exact same `PermissionPolicy`/
+/// `SessionGrants` machinery.
+///
+/// Structured as two phases sharing one responder/channel so the test
+/// carries its own red evidence inline, per this ticket's process notes
+/// ("Red: force the policy short-circuit off... to show prompts WOULD
+/// render absent the fix"): phase A (no grant established yet) proves the
+/// channel genuinely DOES receive one request per concurrent subagent call
+/// absent a grant -- i.e. this harness is real, not a tautology that always
+/// reads zero. Phase B (the SAME tool now granted session-wide, mirroring
+/// what pressing 'r' at a real prompt records) then proves the request
+/// count on that SAME channel does NOT increase for two more concurrent
+/// subagent calls to the same tool, while both calls still complete
+/// successfully -- proving the tool actually ran (auto-approved), not that
+/// the calls silently failed or hung.
+#[tokio::test]
+async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populate_the_permission_prompt_queue()
+ {
+    #[derive(Debug)]
+    struct AcceptanceStubError;
+
+    impl std::fmt::Display for AcceptanceStubError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "acceptance stub error")
+        }
+    }
+
+    /// Mirrors `subagent.rs`'s own private `ScriptedProvider` test fake,
+    /// duplicated here rather than shared (it's `#[cfg(test)]`-private to
+    /// that crate, unreachable from this integration test binary).
+    struct AcceptanceScriptedProvider {
+        replies: std::sync::Mutex<std::collections::VecDeque<rokr_core::Message>>,
+    }
+
+    impl rokr_core::Provider for AcceptanceScriptedProvider {
+        type Error = AcceptanceStubError;
+
+        async fn send(
+            &self,
+            _messages: &[rokr_core::Message],
+            _tools: &[rokr_core::ToolSpec],
+        ) -> Result<(rokr_core::Message, rokr_core::Usage), AcceptanceStubError> {
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(AcceptanceStubError)
+                .map(|message| (message, rokr_core::Usage::default()))
+        }
+    }
+
+    /// Mirrors `subagent.rs`'s own private `FakeGatedTool` test fake,
+    /// implemented directly against `rokr_core::ExecutableTool` (skipping
+    /// the `rokr_tools::Tool`/`PreviewableTool` bridge that fake uses,
+    /// since that bridge buys nothing extra for this test).
+    struct AcceptanceFakeGatedTool;
+
+    impl rokr_core::ExecutableTool for AcceptanceFakeGatedTool {
+        fn name(&self) -> &str {
+            "fake_gated"
+        }
+
+        fn to_tool_spec(&self) -> rokr_core::ToolSpec {
+            rokr_core::ToolSpec {
+                name: "fake_gated".to_string(),
+                description: "fake gated tool for acceptance test".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                cache_control: None,
+            }
+        }
+
+        fn execute_boxed<'a>(
+            &'a self,
+            _input: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>,
+        > {
+            Box::pin(async move { Ok("executed".to_string()) })
+        }
+
+        fn preview(
+            &self,
+            _input: serde_json::Value,
+        ) -> Option<Result<rokr_core::PermissionPayload, rokr_tools::ToolError>> {
+            Some(Ok(rokr_core::PermissionPayload::Command(
+                "fake command".to_string(),
+            )))
+        }
+    }
+
+    fn tool_call_reply(call_id: &str) -> rokr_core::Message {
+        rokr_core::Message {
+            role: rokr_core::Role::Assistant,
+            content: vec![rokr_core::ContentBlock::ToolUse {
+                id: call_id.to_string(),
+                name: "fake_gated".to_string(),
+                input: serde_json::json!({}),
+                cache_control: None,
+            }],
+        }
+    }
+
+    let gated_tool = AcceptanceFakeGatedTool;
+    let tools: [&dyn rokr_core::ExecutableTool; 1] = [&gated_tool];
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+        rokr_core::PermissionRequest,
+        tokio::sync::oneshot::Sender<bool>,
+    )>(8);
+
+    // A single responder drains the whole channel for the life of the
+    // test, recording every request it ever sees and auto-approving it --
+    // so "how many requests arrived" is just this vec's length at any
+    // point, regardless of which phase produced them.
+    let received: std::sync::Arc<std::sync::Mutex<Vec<rokr_core::PermissionRequest>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received_writer = received.clone();
+    tokio::spawn(async move {
+        while let Some((request, responder)) = rx.recv().await {
+            received_writer.lock().unwrap().push(request);
+            let _ = responder.send(true);
+        }
+    });
+
+    let request_permission: rokr_app::subagent::PermissionCallback = Box::new(move |request| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            if tx.send((request, resp_tx)).await.is_err() {
+                return false;
+            }
+            resp_rx.await.unwrap_or(false)
+        })
+    });
+    // R-002 (post-round-1 re-critique, major): this acceptance test never
+    // exercises a `Deny`-mode denial (both phases use `permission_mode:
+    // None`), so a no-op is correct here -- `note_denied_without_prompt` is
+    // exercised by `subagent::tests::subagent_deny_mode_never_reaches_
+    // request_permission_callback` instead.
+    let note_denied: rokr_app::subagent::NoteDeniedCallback = Box::new(|| {});
+
+    // Phase A: no grant established yet.
+    let ungranted_session_grants = std::sync::Arc::new(std::sync::Mutex::new(
+        rokr_app::permission_policy::SessionGrants::new(),
+    ));
+
+    let provider_a1 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_a1"),
+            rokr_core::Message::assistant_text("a1 done"),
+        ])),
+    };
+    let provider_a2 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_a2"),
+            rokr_core::Message::assistant_text("a2 done"),
+        ])),
+    };
+
+    let (a1_result, a2_result) = tokio::join!(
+        rokr_app::subagent::run_subagent(
+            &provider_a1,
+            "you are a test subagent",
+            "phase a, subagent 1".to_string(),
+            &tools,
+            "phase-a-one",
+            &request_permission,
+            &note_denied,
+            &ungranted_session_grants,
+            None,
+        ),
+        rokr_app::subagent::run_subagent(
+            &provider_a2,
+            "you are a test subagent",
+            "phase a, subagent 2".to_string(),
+            &tools,
+            "phase-a-two",
+            &request_permission,
+            &note_denied,
+            &ungranted_session_grants,
+            None,
+        ),
+    );
+
+    assert_eq!(
+        a1_result.expect("phase a subagent 1 should succeed"),
+        "a1 done"
+    );
+    assert_eq!(
+        a2_result.expect("phase a subagent 2 should succeed"),
+        "a2 done"
+    );
+
+    let phase_a_count = received.lock().unwrap().len();
+    assert_eq!(
+        phase_a_count, 2,
+        "red evidence: absent a session-wide grant, both concurrent subagents' gated calls \
+         must reach the permission-prompt channel -- got {phase_a_count} (expected 2). If this \
+         is 0, this test harness itself isn't exercising the permission path at all, and the \
+         phase B assertion below would be meaningless."
+    );
+
+    // Phase B: the SAME tool now granted session-wide, mirroring what
+    // pressing 'r' at a real prompt records (ticket 72).
+    let granted_session_grants = std::sync::Arc::new(std::sync::Mutex::new({
+        let mut grants = rokr_app::permission_policy::SessionGrants::new();
+        grants.grant("fake_gated");
+        grants
+    }));
+
+    let provider_b1 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_b1"),
+            rokr_core::Message::assistant_text("b1 done"),
+        ])),
+    };
+    let provider_b2 = AcceptanceScriptedProvider {
+        replies: std::sync::Mutex::new(std::collections::VecDeque::from([
+            tool_call_reply("call_b2"),
+            rokr_core::Message::assistant_text("b2 done"),
+        ])),
+    };
+
+    let (b1_result, b2_result) = tokio::join!(
+        rokr_app::subagent::run_subagent(
+            &provider_b1,
+            "you are a test subagent",
+            "phase b, subagent 1".to_string(),
+            &tools,
+            "phase-b-one",
+            &request_permission,
+            &note_denied,
+            &granted_session_grants,
+            None,
+        ),
+        rokr_app::subagent::run_subagent(
+            &provider_b2,
+            "you are a test subagent",
+            "phase b, subagent 2".to_string(),
+            &tools,
+            "phase-b-two",
+            &request_permission,
+            &note_denied,
+            &granted_session_grants,
+            None,
+        ),
+    );
+
+    assert_eq!(
+        b1_result.expect("phase b subagent 1 should succeed once the grant auto-approves it"),
+        "b1 done"
+    );
+    assert_eq!(
+        b2_result.expect("phase b subagent 2 should succeed once the grant auto-approves it"),
+        "b2 done"
+    );
+
+    let phase_b_count = received.lock().unwrap().len();
+    assert_eq!(
+        phase_b_count, phase_a_count,
+        "under a session-wide auto-accept grant for the SAME tool, neither concurrent \
+         subagent's gated call should ever reach the permission-prompt channel -- expected the \
+         count to stay at {phase_a_count}, got {phase_b_count}"
+    );
 }

@@ -660,6 +660,7 @@ async fn accept_edits_permission_mode_grants_file_writes_but_denies_bash_executi
         .arg("please write the file")
         .arg("--output-format")
         .arg("json")
+        .current_dir(&write_temp_dir)
         .env("HOME", &write_home)
         .env("XDG_CONFIG_HOME", &write_xdg_config_home)
         .env("ROKR_OPENAI_BASE_URL", write_mock.uri())

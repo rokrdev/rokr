@@ -114,6 +114,28 @@ pub enum PermissionDetail {
     Diff { old: String, new: String },
 }
 
+/// The user's decision on a [`PermissionRequest`], round-tripped back out of
+/// the render loop through [`PermissionHandle::request`]. Ticket 72
+/// (`tui-session-allowlist-grant`): `AllowAndRemember` is a NEW third
+/// decision, distinct from a plain `Allow` -- it additionally tells the
+/// caller (`crates/rokr-app/src/runner.rs`'s `request_permission` closure)
+/// to record a `crate::permission_policy::SessionGrants` grant for this
+/// tool, so a later call to the SAME tool this session resolves `Allow`
+/// without ever reaching this prompt again. rokr-tui itself has no
+/// knowledge of `SessionGrants` (that type lives in `rokr-app`, per ADR
+/// 0016's crate boundary) -- it only carries the user's raw keypress intent
+/// back out as this enum; the app crate decides what to do with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// `n`/`q`/`Esc`, or the render loop being gone: reject the tool call.
+    Deny,
+    /// `y`: run the tool call once, without recording a session grant.
+    Allow,
+    /// `r`: run the tool call AND remember this tool for the rest of the
+    /// session (a later call to the same tool never prompts again).
+    AllowAndRemember,
+}
+
 /// Plain data describing the session status line's contents (ticket 43,
 /// mouse-scroll-status-line): elapsed time is computed TUI-locally (see
 /// `AppState::elapsed`), but the context-window usage percentage requires
@@ -146,19 +168,20 @@ pub struct SessionStatus {
 /// channel into the render loop.
 #[derive(Clone)]
 pub struct PermissionHandle {
-    tx: mpsc::Sender<(PermissionRequest, oneshot::Sender<bool>)>,
+    tx: mpsc::Sender<(PermissionRequest, oneshot::Sender<PermissionDecision>)>,
 }
 
 impl PermissionHandle {
     /// Sends `request` to the render loop and waits for the user's
-    /// accept/deny decision. Resolves to `false` (deny) if the render loop
-    /// is gone, so a gated tool fails closed rather than silently running.
-    pub async fn request(&self, request: PermissionRequest) -> bool {
+    /// accept/deny/remember decision. Resolves to [`PermissionDecision::Deny`]
+    /// if the render loop is gone, so a gated tool fails closed rather than
+    /// silently running.
+    pub async fn request(&self, request: PermissionRequest) -> PermissionDecision {
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.tx.send((request, resp_tx)).is_err() {
-            return false;
+            return PermissionDecision::Deny;
         }
-        resp_rx.await.unwrap_or(false)
+        resp_rx.await.unwrap_or(PermissionDecision::Deny)
     }
 }
 
@@ -177,6 +200,37 @@ impl TuiError {
     /// an unexpected terminal I/O failure.
     pub fn is_not_a_tty(&self) -> bool {
         matches!(self, TuiError::NotATty)
+    }
+}
+
+/// Whether `tool_name` is a subagent-tagged permission request, i.e.
+/// formatted by `rokr-app`'s `subagent::tag_permission_request` as
+/// `"{tool} (subagent: {name})"`. Pre-ship review F-011 (minor): used to
+/// suppress the `[r]` remember affordance for subagent-tagged requests --
+/// see [`permission_hint_line`].
+fn is_subagent_tagged_tool_name(tool_name: &str) -> bool {
+    tool_name.contains("(subagent:")
+}
+
+/// The `[y]/[n]/[r]` hint line shown under a permission prompt.
+///
+/// Pre-ship review F-010 (minor): the old `[r] remember` hint hid that
+/// pressing `r` grants TOOL-WIDE, SESSION-SCOPED access, not a one-off --
+/// this names the tool and says "this session" explicitly.
+///
+/// Pre-ship review F-011 (minor): the `[r]` affordance is suppressed
+/// entirely for a subagent-tagged request. A subagent's `AllowAndRemember`
+/// choice is silently downgraded to a one-shot allow (see `rokr-app`'s
+/// `subagent.rs`, `tagged_request_permission`'s `PermissionCallback`, which
+/// only returns `bool` -- no way to signal "remember"), so offering an
+/// affordance that silently does nothing useful would be actively
+/// misleading. Widening `PermissionCallback`'s signature to support
+/// remember for subagents for real is deferred as follow-up work.
+fn permission_hint_line(tool_name: &str) -> String {
+    if is_subagent_tagged_tool_name(tool_name) {
+        "[y] allow once  [n] deny".to_string()
+    } else {
+        format!("[y] allow once  [n] deny  [r] always allow \"{tool_name}\" this session")
     }
 }
 
@@ -213,7 +267,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
                 view_lines.extend(truncate_diff(diff_lines(old, new)));
             }
         }
-        view_lines.push("[y] allow  [n] deny".to_string());
+        view_lines.push(permission_hint_line(&request.tool_name));
     } else if state.pending {
         view_lines.push("...".to_string());
     }
@@ -801,6 +855,63 @@ where
     )
 }
 
+/// Drains AT MOST one pending permission request from `perm_rx` into
+/// `state`/`pending_permission_responder`, returning `true` if it did
+/// (caller should mark itself dirty). Pre-ship review F-004 (major): only
+/// polls `perm_rx` when NO request is already pending a keypress -- the
+/// pre-fix bug ran `perm_rx.try_recv()` unconditionally on every loop
+/// iteration, so a second request arriving while the first was still
+/// awaiting a decision would overwrite `pending_permission_responder`,
+/// silently dropping the first request's oneshot sender (which
+/// `PermissionHandle::request` then treats as an auto-deny via
+/// `unwrap_or`). `mpsc::Receiver` already buffers, so a queued second
+/// request simply waits until the NEXT call, once the first has been
+/// answered and `pending_permission_responder` cleared.
+fn poll_next_permission_request(
+    perm_rx: &mpsc::Receiver<(PermissionRequest, oneshot::Sender<PermissionDecision>)>,
+    state: &mut AppState,
+    pending_permission_responder: &mut Option<oneshot::Sender<PermissionDecision>>,
+) -> bool {
+    if pending_permission_responder.is_some() {
+        return false;
+    }
+    if let Ok((request, responder)) = perm_rx.try_recv() {
+        state.permission_request = Some(request);
+        *pending_permission_responder = Some(responder);
+        true
+    } else {
+        false
+    }
+}
+
+/// Spawns `fut` on `handle`, then spawns a second task that awaits the
+/// first's `JoinHandle` and forwards the outcome on `tx`. Silent-failure
+/// audit, final pre-ship item: the three call sites below used to call
+/// `handle.spawn(fut)` directly and drop the returned `JoinHandle` -- if
+/// `fut` panicked, nothing observed it, so `state.pending` (cleared only by
+/// the event loop's `rx.try_recv()` picking up a message) stayed `true`
+/// forever: a silent, permanent UI hang with no error surfaced to the user.
+/// Awaiting the `JoinHandle` here and mapping `Err(JoinError)` (panic or
+/// cancellation) to the same `Err(String)` shape any other submission
+/// failure already uses means a panic now reaches `tx`/`rx` and clears
+/// `pending` via the normal receive-side handling, same as any other error.
+fn spawn_and_report<Fut>(
+    handle: &tokio::runtime::Handle,
+    fut: Fut,
+    tx: mpsc::Sender<Result<String, String>>,
+) where
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
+    let join_handle = handle.spawn(fut);
+    handle.spawn(async move {
+        let outcome = match join_handle.await {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(format!("submission task panicked: {join_error}")),
+        };
+        let _ = tx.send(outcome);
+    });
+}
+
 fn event_loop<F, Fut, C, Fut2, M, M2>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut AppState,
@@ -829,11 +940,12 @@ where
     // Carries permission requests from a spawned `submit` call into the
     // render loop the same way, paired with a oneshot the render loop uses
     // to send the user's decision back out to the awaiting `submit` call.
-    let (perm_tx, perm_rx) = mpsc::channel::<(PermissionRequest, oneshot::Sender<bool>)>();
+    let (perm_tx, perm_rx) =
+        mpsc::channel::<(PermissionRequest, oneshot::Sender<PermissionDecision>)>();
     // The responder for whichever request `state.permission_request`
     // currently holds. Kept outside `AppState` because `oneshot::Sender`
     // isn't `Clone`/`Debug`, which `AppState`'s derives require.
-    let mut pending_permission_responder: Option<oneshot::Sender<bool>> = None;
+    let mut pending_permission_responder: Option<oneshot::Sender<PermissionDecision>> = None;
     // ADR 0008: redraw only on state change, never on a fixed timer with no
     // change. Starts true so the first frame still paints.
     let mut dirty = true;
@@ -861,9 +973,7 @@ where
             dirty = false;
         }
 
-        if let Ok((request, responder)) = perm_rx.try_recv() {
-            state.permission_request = Some(request);
-            pending_permission_responder = Some(responder);
+        if poll_next_permission_request(&perm_rx, state, &mut pending_permission_responder) {
             dirty = true;
         }
 
@@ -900,7 +1010,12 @@ where
                         match handle_permission_key(key.code, key.modifiers) {
                             PermissionKeyAction::Quit => return Ok(()),
                             PermissionKeyAction::Allow => {
-                                let _ = responder.send(true);
+                                let _ = responder.send(PermissionDecision::Allow);
+                                state.permission_request = None;
+                                dirty = true;
+                            }
+                            PermissionKeyAction::AllowAndRemember => {
+                                let _ = responder.send(PermissionDecision::AllowAndRemember);
                                 state.permission_request = None;
                                 dirty = true;
                             }
@@ -910,7 +1025,7 @@ where
                                         .view_lines
                                         .push(format!("{}: permission denied", request.tool_name));
                                 }
-                                let _ = responder.send(false);
+                                let _ = responder.send(PermissionDecision::Deny);
                                 state.permission_request = None;
                                 dirty = true;
                             }
@@ -1001,11 +1116,7 @@ where
                                             tx: perm_tx.clone(),
                                         };
                                         let submit_fut = submit(input, permission);
-                                        let tx = tx.clone();
-                                        handle.spawn(async move {
-                                            let outcome = submit_fut.await;
-                                            let _ = tx.send(outcome);
-                                        });
+                                        spawn_and_report(handle, submit_fut, tx.clone());
                                     }
                                     InputRoute::Command(input) => {
                                         // Ticket 63/64
@@ -1051,20 +1162,17 @@ where
                                                 };
                                                 submit(expanded, permission)
                                             });
-                                        let tx = tx.clone();
                                         match submit_fut_if_custom {
                                             Some(submit_fut) => {
-                                                handle.spawn(async move {
-                                                    let result = submit_fut.await;
-                                                    let _ = tx.send(result);
-                                                });
+                                                spawn_and_report(handle, submit_fut, tx.clone());
                                             }
                                             None => {
                                                 let command_fut = command(input);
-                                                handle.spawn(async move {
-                                                    let outcome = command_fut.await;
-                                                    let _ = tx.send(Ok(outcome));
-                                                });
+                                                spawn_and_report(
+                                                    handle,
+                                                    async move { Ok(command_fut.await) },
+                                                    tx.clone(),
+                                                );
                                             }
                                         }
                                     }
@@ -1196,6 +1304,13 @@ fn handle_enter_key(state: &mut AppState, modifiers: KeyModifiers) -> bool {
 enum PermissionKeyAction {
     /// `y`: run the gated tool call.
     Allow,
+    /// `r`: run the gated tool call AND remember this tool for the rest of
+    /// the session (ticket 72, `tui-session-allowlist-grant`) -- a later
+    /// call to the same tool resolves allow-without-prompting via
+    /// `crate::permission_policy::SessionGrants` (in `rokr-app`; rokr-tui
+    /// itself stays unaware of that type, see `PermissionDecision`'s doc
+    /// comment).
+    AllowAndRemember,
     /// `n`, `q`, or `Esc`: deny the gated tool call. `q`/`Esc` intentionally
     /// do *not* fall through to whole-app quit here (see F-006) — a
     /// permission prompt already blocks all other input, so "back out of
@@ -1218,6 +1333,7 @@ fn handle_permission_key(code: KeyCode, modifiers: KeyModifiers) -> PermissionKe
     }
     match code {
         KeyCode::Char('y') => PermissionKeyAction::Allow,
+        KeyCode::Char('r') => PermissionKeyAction::AllowAndRemember,
         KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => PermissionKeyAction::Deny,
         _ => PermissionKeyAction::Ignore,
     }
@@ -1472,6 +1588,81 @@ mod tests {
         );
     }
 
+    /// Pre-ship review F-010 (minor): the old `[r] remember` hint hid that
+    /// pressing `r` grants TOOL-WIDE, SESSION-SCOPED access, not a one-off
+    /// -- the new hint must name the actual tool and say "this session"
+    /// explicitly.
+    #[test]
+    fn permission_prompt_hint_names_tool_and_session_scope_for_remember() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            permission_request: Some(PermissionRequest {
+                tool_name: "bash".to_string(),
+                detail: PermissionDetail::Text("some command".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rendered = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("allow once") && rendered.contains("deny"),
+            "expected the one-off allow/deny hints to still be present: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("always allow \"bash\" this session"),
+            "expected the hint to name the tool (\"bash\") and say \"this session\" \
+             explicitly, not just '[r] remember': {rendered:?}"
+        );
+    }
+
+    /// Pre-ship review F-011 (minor): a subagent's `AllowAndRemember`
+    /// choice is silently downgraded to a one-shot allow (see
+    /// `subagent.rs`'s `tagged_request_permission`), so the `[r]`
+    /// affordance must be suppressed entirely for a subagent-tagged
+    /// request -- offering it would be actively misleading (it looks like
+    /// it should remember, but silently doesn't). A non-subagent-tagged
+    /// request must still show it (contrast case).
+    #[test]
+    fn permission_prompt_hint_suppresses_remember_for_subagent_tagged_request() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            permission_request: Some(PermissionRequest {
+                tool_name: "bash (subagent: reviewer)".to_string(),
+                detail: PermissionDetail::Text("some command".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let rendered = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("allow once") && rendered.contains("deny"),
+            "expected the one-off allow/deny hints to still be present: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("[r]"),
+            "expected the [r] remember affordance to be ABSENT for a subagent-tagged \
+             request (it silently does nothing useful for subagents): {rendered:?}"
+        );
+    }
+
     #[test]
     fn truncate_diff_leaves_short_diffs_untouched() {
         let lines: Vec<String> = (0..5).map(|i| format!("-{i}")).collect();
@@ -1492,6 +1683,14 @@ mod tests {
         assert_eq!(
             handle_permission_key(KeyCode::Char('y'), KeyModifiers::NONE),
             PermissionKeyAction::Allow
+        );
+    }
+
+    #[test]
+    fn handle_permission_key_allow_and_remember_on_r() {
+        assert_eq!(
+            handle_permission_key(KeyCode::Char('r'), KeyModifiers::NONE),
+            PermissionKeyAction::AllowAndRemember
         );
     }
 
@@ -1537,6 +1736,127 @@ mod tests {
             handle_permission_key(KeyCode::Char('x'), KeyModifiers::NONE),
             PermissionKeyAction::Ignore
         );
+    }
+
+    /// Pre-ship review F-004 (major): two `PermissionRequest`s queued on
+    /// `perm_rx` before either is answered must NOT collide -- the second
+    /// must not overwrite `pending_permission_responder` (silently dropping
+    /// the first request's oneshot sender, which `PermissionHandle::request`
+    /// treats as an auto-deny via `unwrap_or`) while the first is still
+    /// awaiting a keypress. `mpsc::Receiver` already buffers, so the second
+    /// request should simply wait in the channel until `poll_next_permission_
+    /// request` is called again AFTER the first has been answered and
+    /// `pending_permission_responder` cleared. Also asserts the FIRST
+    /// request is the one actually rendered/prompted first (`state
+    /// .permission_request` holds it, not the second).
+    #[test]
+    fn second_permission_request_does_not_overwrite_first_pending_responder() {
+        let (perm_tx, perm_rx) =
+            mpsc::channel::<(PermissionRequest, oneshot::Sender<PermissionDecision>)>();
+        let (resp1_tx, mut resp1_rx) = oneshot::channel();
+        let (resp2_tx, mut resp2_rx) = oneshot::channel();
+
+        let request_one = PermissionRequest {
+            tool_name: "bash".to_string(),
+            detail: PermissionDetail::Text("first command".to_string()),
+        };
+        let request_two = PermissionRequest {
+            tool_name: "write".to_string(),
+            detail: PermissionDetail::Text("second command".to_string()),
+        };
+
+        // Both requests queued BEFORE any keypress -- mpsc buffers them.
+        perm_tx.send((request_one.clone(), resp1_tx)).unwrap();
+        perm_tx.send((request_two.clone(), resp2_tx)).unwrap();
+
+        let mut state = AppState::default();
+        let mut pending_permission_responder: Option<oneshot::Sender<PermissionDecision>> = None;
+
+        // First poll picks up request_one and renders/prompts it first.
+        assert!(poll_next_permission_request(
+            &perm_rx,
+            &mut state,
+            &mut pending_permission_responder
+        ));
+        assert_eq!(state.permission_request, Some(request_one.clone()));
+        assert!(pending_permission_responder.is_some());
+
+        // A SECOND poll (simulating the next loop iteration, before any
+        // keypress answers the first) must be a no-op: request_two must NOT
+        // overwrite state.permission_request or the pending responder.
+        assert!(!poll_next_permission_request(
+            &perm_rx,
+            &mut state,
+            &mut pending_permission_responder
+        ));
+        assert_eq!(
+            state.permission_request,
+            Some(request_one),
+            "the second request must not have overwritten the first, still-pending one"
+        );
+
+        // Answer the first request -- its OWN oneshot must resolve to its
+        // OWN decision, not a dropped-sender fallback to Deny.
+        pending_permission_responder
+            .take()
+            .unwrap()
+            .send(PermissionDecision::Allow)
+            .unwrap();
+        assert_eq!(resp1_rx.try_recv(), Ok(PermissionDecision::Allow));
+
+        // NOW polling picks up the second request, previously buffered.
+        assert!(poll_next_permission_request(
+            &perm_rx,
+            &mut state,
+            &mut pending_permission_responder
+        ));
+        assert_eq!(state.permission_request, Some(request_two));
+        pending_permission_responder
+            .take()
+            .unwrap()
+            .send(PermissionDecision::Deny)
+            .unwrap();
+        assert_eq!(
+            resp2_rx.try_recv(),
+            Ok(PermissionDecision::Deny),
+            "the second request's OWN oneshot must resolve to its OWN decision, not a \
+             dropped-sender fallback"
+        );
+    }
+
+    /// Silent-failure audit, final pre-ship item: the three `handle.spawn`
+    /// call sites in `event_loop`'s Submit/Command routing used to drop the
+    /// returned `JoinHandle`, so a panic inside the submitted future was
+    /// never observed -- `state.pending` (cleared only by `rx.try_recv()`
+    /// picking up a message in the event loop) stayed `true` forever: a
+    /// silent, permanent UI hang with nothing surfaced to the user.
+    /// `spawn_and_report` fixes this by awaiting the `JoinHandle` on a
+    /// second spawned task and mapping `Err(JoinError)` (panic or
+    /// cancellation) to the same `Err(String)` shape any other submission
+    /// failure already uses, so it reaches `rx`/`tx` and would clear
+    /// `pending` via the event loop's normal receive-side handling.
+    #[test]
+    fn spawn_and_report_surfaces_panic_as_error_instead_of_hanging_forever() {
+        async fn panicking_submit() -> Result<String, String> {
+            panic!("boom");
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+
+        spawn_and_report(&handle, panicking_submit(), tx);
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("spawn_and_report must report SOMETHING, not hang forever");
+        match outcome {
+            Err(message) => assert!(
+                message.contains("panicked"),
+                "expected a panic-shaped error message, got: {message}"
+            ),
+            Ok(response) => panic!("expected Err after a panicking task, got Ok({response:?})"),
+        }
     }
 
     #[test]
