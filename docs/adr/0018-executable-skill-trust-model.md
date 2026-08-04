@@ -78,11 +78,13 @@ user the exact literal command plus the skill's path and scope, and asks
 for a trust decision. Nothing ever auto-executes on first sight -- this is
 what closes the `git clone && rokr` supply-chain hazard ADR 0014 decision 2
 was protecting against and ticket 75 as originally specced reopened. On
-approval, the pair is recorded and the command executes; on decline, the
-mention resolves to a short "skill not executed" notice, never the skill's
-body (ruling 3 -- the body may assume the command already ran, so inlining
-it after a decline would hand the model instructions premised on a false
-state).
+approval, the pair is recorded and the command executes; an approval may
+alternatively be one-shot ([y] run once), executing without recording the pair
+-- only an explicit trust decision ([r] trust this skill version) records it.
+On decline, the mention resolves to a short "skill not executed" notice,
+never the skill's body (ruling 3 -- the body may assume the command already
+ran, so inlining it after a decline would hand the model instructions premised
+on a false state).
 
 **2. Containment (sandboxing) remains mandatory and orthogonal to
 consent.** A `run:` command that clears the consent check in decision 1
