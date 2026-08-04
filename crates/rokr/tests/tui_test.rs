@@ -2813,6 +2813,435 @@ async fn bash_tool_call_renders_permission_prompt_and_runs_on_accept() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+/// Ticket 77 (read-only-git-carveout, ADR 0019) acceptance test: closely
+/// modeled on `bash_tool_call_renders_permission_prompt_and_runs_on_accept`
+/// above, but for an unambiguously read-only git command (`git status`)
+/// inside a real repo. The carve-out inside `PermissionPolicy::resolve`
+/// must convert what would otherwise be a `Prompt` into an `Allow`, so no
+/// permission prompt is ever rendered -- the PTY output goes straight from
+/// the submitted prompt to the final assistant reply, with no keypress
+/// needed in between.
+#[tokio::test]
+async fn read_only_git_status_executes_without_permission_prompt() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterReadOnlyGitStatusForTesting";
+
+    let project_dir = unique_temp_dir("read-only-git-status-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("a.txt"), "hello").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-m", "first commit"]);
+
+    // First call: the model asks to invoke the `bash` tool with an
+    // unambiguously read-only git command.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-read-only-git-status",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": "git status" }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Second call: the loop feeds the tool result back, and the model
+    // replies with a final, tool-call-free text answer.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-read-only-git-status-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-read-only-git-status");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-read-only-git-status");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"checkgitstatus\r")
+        .expect("failed to write prompt to pty");
+
+    // No accept/reject keypress is written here at all: the carve-out
+    // means no permission prompt should ever render, so the PTY output
+    // should go straight to the final assistant reply.
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply with no permission prompt \
+         needed for a read-only `git status` invocation, got: {output:?}"
+    );
+    assert!(
+        !output.contains("[y]") && !output.contains("[n]"),
+        "expected no permission prompt to ever render for a read-only `git status` invocation, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// Ticket 77 (read-only-git-carveout, ADR 0019) acceptance test: a bash
+/// command that is NOT unambiguously read-only git -- here, a chained
+/// command that starts with a read-only-looking `git status` but appends a
+/// disqualifying shell metacharacter and a mutating command -- must still
+/// render a permission prompt, proving the carve-out didn't over-widen.
+#[tokio::test]
+async fn ambiguous_or_mutating_git_invocations_still_prompt() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let final_reply_text = "FinalReplyAfterAmbiguousGitRejectForTesting";
+    let ambiguous_command = "git status && rm -rf x";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-ambiguous-git",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": serde_json::json!({ "command": ambiguous_command }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-ambiguous-git-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_reply_text
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-ambiguous-git");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-ambiguous-git");
+    let temp_dir = unique_temp_dir("ambiguous-git-target");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&temp_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"runambiguousgit\r")
+        .expect("failed to write prompt to pty");
+
+    // The carve-out must NOT classify this command as read-only git (it
+    // has a disqualifying `&&` and a mutating `rm -rf`), so a permission
+    // prompt must render before anything executes.
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("[y]") && output.contains("[n]") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // The permission prompt's detail text word-wraps across PTY cell
+    // positions with cursor-movement escape sequences between words, so a
+    // literal multi-word substring like "git status" won't appear
+    // contiguous in the raw buffer -- check individual word tokens instead,
+    // matching how `bash_tool_call_renders_permission_prompt_and_runs_on_
+    // accept` above checks for the tool name and a single-token marker
+    // rather than the full command string.
+    assert!(
+        output.contains("bash"),
+        "expected pty output to contain the tool name 'bash' in a permission prompt, got: {output:?}"
+    );
+    assert!(
+        output.contains("status") && output.contains("-rf"),
+        "expected pty output to contain the ambiguous command's distinguishing tokens in a \
+         permission prompt, got: {output:?}"
+    );
+    assert!(
+        output.contains("[y]") && output.contains("[n]"),
+        "expected a permission prompt to render for a non-read-only-git bash command, got: \
+         {output:?}"
+    );
+
+    writer
+        .write_all(b"n")
+        .expect("failed to write reject keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after rejecting the \
+         ambiguous git tool call, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
 #[tokio::test]
 async fn bash_tool_call_skips_execution_on_reject() {
     use wiremock::matchers::{method, path};

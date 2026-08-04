@@ -317,6 +317,15 @@ pub async fn run_subagent<P: rokr_core::Provider>(
     // yields `Allow` or `Prompt`), so its no-op `note_denied_without_prompt`
     // is never even called.
     let tagged_request_permission = |request: rokr_core::PermissionRequest| async move {
+        // Ticket 77 (read-only-git-carveout, ADR 0019): `request` is NOT
+        // consumed until the `Prompt` arm below (`tag_permission_request
+        // (request, subagent_name)`), so this clone just gives
+        // `PermissionPolicy::resolve` the raw command text on the `bash`
+        // path without needing to move `request` early.
+        let command_text: Option<String> = match &request.payload {
+            rokr_core::PermissionPayload::Command(command) => Some(command.clone()),
+            _ => None,
+        };
         let resolution = {
             // Silent-failure audit, final pre-ship item: recovers from a
             // poisoned lock instead of re-panicking. `SessionGrants` has no
@@ -332,6 +341,7 @@ pub async fn run_subagent<P: rokr_core::Provider>(
                 permission_mode,
                 &request.tool_name,
                 None,
+                command_text.as_deref(),
                 &grants,
             )
         };

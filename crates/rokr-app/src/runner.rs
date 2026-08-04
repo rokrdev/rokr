@@ -324,6 +324,16 @@ impl SessionRunner {
                 let mcp_http_origins = request_permission_mcp_http_origins.clone();
                 let session_grants = request_permission_session_grants.clone();
                 async move {
+                    // Ticket 77 (read-only-git-carveout, ADR 0019): cloned
+                    // out BEFORE the consuming match below moves `command`
+                    // into `PermissionDetail::Text` -- this is what lets the
+                    // `PermissionPolicy::resolve` call further down see the
+                    // raw command text on the `bash` path without fighting
+                    // the borrow checker over an already-moved `String`.
+                    let command_text: Option<String> = match &request.payload {
+                        rokr_core::PermissionPayload::Command(command) => Some(command.clone()),
+                        _ => None,
+                    };
                     let (detail, diff_path_and_old) = match request.payload {
                         rokr_core::PermissionPayload::Command(command) => {
                             (rokr_tui::PermissionDetail::Text(command), None)
@@ -379,6 +389,7 @@ impl SessionRunner {
                             permission_mode,
                             &request.tool_name,
                             None,
+                            command_text.as_deref(),
                             &grants,
                         )
                     };
