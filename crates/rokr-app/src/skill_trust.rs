@@ -376,6 +376,32 @@ impl InteractiveConsentResolver {
     }
 }
 
+/// Builds the literal text `InteractiveConsentResolver::resolve` shows via
+/// `PermissionDetail::Text` -- pulled out as its own function (F-001,
+/// review) so it's unit-testable without a live `rokr_tui::PermissionHandle`.
+/// The TUI holds the terminal in raw mode plus the alternate screen, so a
+/// bare `eprintln!` (headless's approach, via `notice_sink`) would be
+/// garbled or simply invisible on this path -- the hash-mismatch note has to
+/// travel IN-BAND, as the first line of the same detail text the prompt
+/// already renders, or the user has no way to see why they're being
+/// prompted despite having passed `--allow-skill`.
+fn build_skill_consent_detail(request: &SkillConsentRequest, hash_mismatch: bool) -> String {
+    let mut detail = String::new();
+    if hash_mismatch {
+        detail.push_str(&format!(
+            "note: --allow-skill pin for '{}' did not match this file's current content hash\n",
+            request.name
+        ));
+    }
+    detail.push_str(&format!(
+        "run: {}\nskill: {}\nscope: {}",
+        request.command,
+        request.skill_path.display(),
+        request.scope,
+    ));
+    detail
+}
+
 impl ConsentResolver for InteractiveConsentResolver {
     fn resolve(
         &self,
@@ -388,19 +414,8 @@ impl ConsentResolver for InteractiveConsentResolver {
             if let Some(outcome) = allowlist_short_circuit(check) {
                 return outcome;
             }
-            if check == AllowlistCheck::HashMismatch {
-                eprintln!(
-                    "skill '{}': --allow-skill hash pin did not match this file's current \
-                     content hash -- falling back to interactive consent",
-                    request.name
-                );
-            }
-            let detail = format!(
-                "run: {}\nskill: {}\nscope: {}",
-                request.command,
-                request.skill_path.display(),
-                request.scope,
-            );
+            let detail =
+                build_skill_consent_detail(&request, check == AllowlistCheck::HashMismatch);
             let decision = handle
                 .request(rokr_tui::PermissionRequest {
                     tool_name: "skill".to_string(),
@@ -760,6 +775,105 @@ mod tests {
             AllowlistCheck::NotListed,
             "a name with no entry at all must be NotListed"
         );
+    }
+
+    /// F-002 (review): `SkillAllowlist::check`'s doc comment promises a
+    /// mismatched pinned entry earlier in the list never shadows a later
+    /// matching entry for the SAME name -- the full list is always scanned,
+    /// not short-circuited on the first name match. Covers all three
+    /// multi-entry shapes: a wrong pin followed by the right pin, a wrong
+    /// pin followed by an unconditional bare-name entry, and two different
+    /// wrong pins with no matching entry at all.
+    #[test]
+    fn skill_allowlist_check_scans_full_list_for_same_name_entries() {
+        let wrong_hash_a = hash_skill_contents("run: echo wrong a");
+        let wrong_hash_b = hash_skill_contents("run: echo wrong b");
+        let right_hash = hash_skill_contents("run: echo right");
+
+        let allowlist = SkillAllowlist::new(vec![
+            AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: Some(wrong_hash_a.clone()),
+            },
+            AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: Some(right_hash.clone()),
+            },
+        ]);
+        assert_eq!(
+            allowlist.check("deploy", &right_hash),
+            AllowlistCheck::Allowed,
+            "a wrong pin earlier in the list must not shadow a later CORRECT pin for the same \
+             name"
+        );
+
+        let allowlist = SkillAllowlist::new(vec![
+            AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: Some(wrong_hash_a.clone()),
+            },
+            AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: None,
+            },
+        ]);
+        assert_eq!(
+            allowlist.check("deploy", &wrong_hash_b),
+            AllowlistCheck::Allowed,
+            "a wrong pin earlier in the list must not shadow a later UNCONDITIONAL (bare-name) \
+             entry for the same name"
+        );
+
+        let allowlist = SkillAllowlist::new(vec![
+            AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: Some(wrong_hash_a.clone()),
+            },
+            AllowSkillEntry {
+                name: "deploy".to_string(),
+                hash: Some(wrong_hash_b.clone()),
+            },
+        ]);
+        assert_eq!(
+            allowlist.check("deploy", &right_hash),
+            AllowlistCheck::HashMismatch,
+            "two different wrong pins for the same name, with no entry matching the actual \
+             hash, must still be HashMismatch, not NotListed"
+        );
+    }
+
+    /// F-001 (review): the TUI holds the terminal in raw mode plus the
+    /// alternate screen, so a bare `eprintln!` on hash-mismatch fallback
+    /// (headless's approach) would be garbled or invisible here -- the note
+    /// must instead be the first line of the SAME `PermissionDetail::Text`
+    /// the consent prompt already renders, so the user can see why they're
+    /// being prompted despite having passed `--allow-skill`.
+    #[test]
+    fn skill_consent_detail_prepends_mismatch_note_only_when_hash_mismatched() {
+        let request = SkillConsentRequest {
+            command: "echo hi".to_string(),
+            skill_path: PathBuf::from("/fake/.rokr/skills/deploy.md"),
+            scope: SkillScope::Project,
+            name: "deploy".to_string(),
+            hash: hash_skill_contents("run: echo hi"),
+        };
+
+        let detail = build_skill_consent_detail(&request, true);
+        assert!(
+            detail.starts_with("note: --allow-skill pin for 'deploy' did not match"),
+            "expected the mismatch note as the FIRST line of the detail text, got: {detail:?}"
+        );
+        assert!(
+            detail.contains("run: echo hi") && detail.contains("skill: "),
+            "expected the usual run:/skill:/scope: fields to still be present, got: {detail:?}"
+        );
+
+        let detail = build_skill_consent_detail(&request, false);
+        assert!(
+            !detail.contains("note:"),
+            "expected no mismatch note when there was no hash mismatch, got: {detail:?}"
+        );
+        assert!(detail.starts_with("run: echo hi"));
     }
 
     /// Unit test for the allowlist short-circuit `InteractiveConsentResolver

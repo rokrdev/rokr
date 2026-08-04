@@ -147,7 +147,9 @@ pub struct Cli {
     /// rejected at parse time. Never writes a `SkillTrustStore` entry -- the
     /// approval is ephemeral, same spirit as the interactive "[y] run once"
     /// path. Honored in both the TUI and headless paths; a no-op for
-    /// user-scope skills, which are already auto-trusted.
+    /// user-scope skills, which are already auto-trusted. In CI, prefer the
+    /// pinned `name@sha256` form: the bare form approves whatever `run:`
+    /// command the current checkout happens to ship, pinned or not.
     #[arg(long = "allow-skill", value_name = "name[@sha256]")]
     pub allow_skill: Vec<crate::skill_trust::AllowSkillEntry>,
 
@@ -483,7 +485,11 @@ mod tests {
             &format!("release@{hash}"),
         ])
         .expect("two --allow-skill occurrences should parse");
-        assert_eq!(cli.allow_skill.len(), 2, "expected both occurrences to be collected");
+        assert_eq!(
+            cli.allow_skill.len(),
+            2,
+            "expected both occurrences to be collected"
+        );
         assert_eq!(cli.allow_skill[0].name, "deploy");
         assert_eq!(cli.allow_skill[0].hash, None);
         assert_eq!(cli.allow_skill[1].name, "release");

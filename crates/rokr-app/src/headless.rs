@@ -428,7 +428,9 @@ pub async fn run_result_object(
     });
     let skill_trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
     let skill_consent = crate::skill_trust::HeadlessConsentResolver::new(permission_mode)
-        .with_allowlist(crate::skill_trust::SkillAllowlist::new(allow_skill.to_vec()));
+        .with_allowlist(crate::skill_trust::SkillAllowlist::new(
+            allow_skill.to_vec(),
+        ));
     let prompt = command_registry
         .resolve_skills(
             &prompt,
@@ -953,15 +955,14 @@ mod tests {
         let registry = crate::CommandRegistry::discover_project_scope(temp.path());
         let config_dir = temp.path().join("config");
         let trust_store = crate::skill_trust::SkillTrustStore::new(&config_dir);
-        let consent = crate::skill_trust::HeadlessConsentResolver::new(
-            crate::cli::PermissionMode::Deny,
-        )
-        .with_allowlist(crate::skill_trust::SkillAllowlist::new(vec![
-            crate::skill_trust::AllowSkillEntry {
-                name: "deploy".to_string(),
-                hash: None,
-            },
-        ]));
+        let consent =
+            crate::skill_trust::HeadlessConsentResolver::new(crate::cli::PermissionMode::Deny)
+                .with_allowlist(crate::skill_trust::SkillAllowlist::new(vec![
+                    crate::skill_trust::AllowSkillEntry {
+                        name: "deploy".to_string(),
+                        hash: None,
+                    },
+                ]));
 
         let resolved = registry
             .resolve_skills(
@@ -1044,11 +1045,10 @@ mod tests {
         );
         let recorded = notices.lock().unwrap();
         assert!(
-            recorded
-                .iter()
-                .any(|notice| notice.contains("deploy")
-                    && (notice.contains("hash") || notice.contains("mismatch")
-                        || notice.contains("did not match"))),
+            recorded.iter().any(|notice| notice.contains("deploy")
+                && (notice.contains("hash")
+                    || notice.contains("mismatch")
+                    || notice.contains("did not match"))),
             "expected a one-line stderr notice specifically naming the allow-skill hash \
              mismatch, got: {recorded:?}"
         );
