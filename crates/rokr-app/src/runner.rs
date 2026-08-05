@@ -352,14 +352,12 @@ impl SessionRunner {
                         } => {
                             let origin = mcp_http_origins.get(&server).map(String::as_str);
                             (
-                                rokr_tui::PermissionDetail::Text(
-                                    format_tool_call_permission_text(
-                                        &server,
-                                        &tool,
-                                        &input_pretty,
-                                        origin,
-                                    ),
-                                ),
+                                rokr_tui::PermissionDetail::Text(format_tool_call_permission_text(
+                                    &server,
+                                    &tool,
+                                    &input_pretty,
+                                    origin,
+                                )),
                                 None,
                             )
                         }
@@ -466,8 +464,7 @@ impl SessionRunner {
                     let session_handle = subagent_request_permission_session_handle.clone();
                     let turn_index = subagent_request_permission_turn_index.clone();
                     let data_dir = subagent_request_permission_data_dir.clone();
-                    let mcp_http_origins =
-                        subagent_request_permission_mcp_http_origins.clone();
+                    let mcp_http_origins = subagent_request_permission_mcp_http_origins.clone();
                     Box::pin(async move {
                         let (detail, diff_path_and_old) = match request.payload {
                             rokr_core::PermissionPayload::Command(command) => {
@@ -485,8 +482,7 @@ impl SessionRunner {
                                 tool,
                                 input_pretty,
                             } => {
-                                let origin =
-                                    mcp_http_origins.get(&server).map(String::as_str);
+                                let origin = mcp_http_origins.get(&server).map(String::as_str);
                                 (
                                     rokr_tui::PermissionDetail::Text(
                                         format_tool_call_permission_text(
@@ -601,7 +597,14 @@ impl SessionRunner {
                 AgentTier::Plan => vec![&read, &glob, &grep, &ls],
                 AgentTier::Build => {
                     vec![
-                        &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
+                        &read,
+                        &glob,
+                        &grep,
+                        &ls,
+                        &bash,
+                        &write,
+                        &edit,
+                        &webfetch,
                         &subagent_tool,
                     ]
                 }
@@ -632,11 +635,11 @@ impl SessionRunner {
             // read error (missing file, permissions, non-UTF-8,
             // ...) is treated as `NotFound`.
             let mut expanded_input =
-                rokr_core::mentions::expand_mentions(&input, |path| {
-                    match std::fs::read_to_string(path) {
-                        Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
-                        Err(_) => rokr_core::mentions::MentionResolution::NotFound,
-                    }
+                rokr_core::mentions::expand_mentions(&input, |path| match std::fs::read_to_string(
+                    path,
+                ) {
+                    Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
+                    Err(_) => rokr_core::mentions::MentionResolution::NotFound,
                 });
 
             // `UserPromptSubmit` (PRD "Hooks"; architect decision:
@@ -686,8 +689,7 @@ impl SessionRunner {
                 }
             }
             if !injected_user_prompt_context.is_empty() {
-                expanded_input =
-                    format!("{expanded_input}\n\n{injected_user_prompt_context}");
+                expanded_input = format!("{expanded_input}\n\n{injected_user_prompt_context}");
             }
 
             let mut transcript = transcript.lock().await;
@@ -740,9 +742,7 @@ impl SessionRunner {
                                 rokr_hooks::HookResult::Success { .. } => {}
                                 rokr_hooks::HookResult::Blocked { stderr } => {
                                     if entry.blocking.unwrap_or(true) {
-                                        return rokr_core::PreToolHookOutcome::Deny(
-                                            stderr,
-                                        );
+                                        return rokr_core::PreToolHookOutcome::Deny(stderr);
                                     }
                                     eprintln!(
                                         "PreToolUse hook exited 2 but its config entry \
@@ -937,12 +937,7 @@ impl SessionRunner {
                         // tail turn is `raw_turn_count - 1` and the
                         // summary replaces through `raw_turn_count - 2`.
                         let raw_turn_count = *turn_index.lock().unwrap();
-                        append_compaction_record(
-                            &session_handle,
-                            &compacted,
-                            raw_turn_count,
-                        )
-                        .await;
+                        append_compaction_record(&session_handle, &compacted, raw_turn_count).await;
                         *transcript = compacted;
                         None
                     }
@@ -1136,8 +1131,13 @@ pub async fn capture_checkpoint_if_granted_diff(
     };
 
     let current_turn_index = *turn_index.lock().unwrap();
-    let checkpoint_store = rokr_session::CheckpointStore::open(data_dir, session_handle.session_id());
-    let old_content: Option<&str> = if old.is_empty() { None } else { Some(old.as_str()) };
+    let checkpoint_store =
+        rokr_session::CheckpointStore::open(data_dir, session_handle.session_id());
+    let old_content: Option<&str> = if old.is_empty() {
+        None
+    } else {
+        Some(old.as_str())
+    };
 
     match checkpoint_store.snapshot(current_turn_index, &path, old_content) {
         Ok((snapshot_id, newly_written)) => {
@@ -1221,8 +1221,7 @@ pub fn default_data_dir() -> std::path::PathBuf {
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".local/share"))
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".local/share"));
     base.join("rokr")
@@ -1630,7 +1629,10 @@ mod tests {
         };
 
         let first_reply = runner
-            .run_submission("please run the first bash command".to_string(), requester.clone())
+            .run_submission(
+                "please run the first bash command".to_string(),
+                requester.clone(),
+            )
             .await
             .expect("the first submission should drive to a terminal Ok state");
 
@@ -1651,7 +1653,10 @@ mod tests {
         );
 
         let second_reply = runner
-            .run_submission("please run the second bash command".to_string(), requester.clone())
+            .run_submission(
+                "please run the second bash command".to_string(),
+                requester.clone(),
+            )
             .await
             .expect("the second submission should drive to a terminal Ok state");
 

@@ -168,19 +168,43 @@ mod tests {
     fn accept_edits_mode_resolves_allow_for_write_and_edit_only() {
         let grants = SessionGrants::new();
         assert_eq!(
-            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "write", None, None, &grants),
+            PermissionPolicy::resolve(
+                Some(PermissionMode::AcceptEdits),
+                "write",
+                None,
+                None,
+                &grants
+            ),
             Resolution::Allow
         );
         assert_eq!(
-            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "edit", None, None, &grants),
+            PermissionPolicy::resolve(
+                Some(PermissionMode::AcceptEdits),
+                "edit",
+                None,
+                None,
+                &grants
+            ),
             Resolution::Allow
         );
         assert_eq!(
-            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "bash", None, None, &grants),
+            PermissionPolicy::resolve(
+                Some(PermissionMode::AcceptEdits),
+                "bash",
+                None,
+                None,
+                &grants
+            ),
             Resolution::Prompt
         );
         assert_eq!(
-            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "read", None, None, &grants),
+            PermissionPolicy::resolve(
+                Some(PermissionMode::AcceptEdits),
+                "read",
+                None,
+                None,
+                &grants
+            ),
             Resolution::Prompt
         );
     }
@@ -206,7 +230,13 @@ mod tests {
     fn no_matching_mode_or_grant_resolves_prompt() {
         let grants = SessionGrants::new();
         assert_eq!(
-            PermissionPolicy::resolve(Some(PermissionMode::AcceptEdits), "bash", None, None, &grants),
+            PermissionPolicy::resolve(
+                Some(PermissionMode::AcceptEdits),
+                "bash",
+                None,
+                None,
+                &grants
+            ),
             Resolution::Prompt
         );
     }

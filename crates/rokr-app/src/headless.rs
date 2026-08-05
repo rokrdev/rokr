@@ -321,8 +321,10 @@ struct ModelEnvOverride {
 
 impl ModelEnvOverride {
     fn apply(model: &str) -> Self {
-        let vars: [&'static str; 2] =
-            [rokr_provider::openai::ENV_MODEL, rokr_provider::anthropic::ENV_MODEL];
+        let vars: [&'static str; 2] = [
+            rokr_provider::openai::ENV_MODEL,
+            rokr_provider::anthropic::ENV_MODEL,
+        ];
         let previous = vars
             .into_iter()
             .map(|var| {
@@ -484,7 +486,9 @@ pub async fn run_result_object(
     // `model_name` below is read straight off `run_override` rather than
     // re-reading the env var, so it's correct even after the guard is gone.
     let built = {
-        let _model_override_guard = run_override.as_ref().map(|o| ModelEnvOverride::apply(&o.model));
+        let _model_override_guard = run_override
+            .as_ref()
+            .map(|o| ModelEnvOverride::apply(&o.model));
         rokr_provider::build_provider(
             requested_provider_name,
             resolved_auth,
@@ -875,7 +879,12 @@ mod tests {
         );
 
         let _ = registry
-            .resolve_skills("@skill:deploy", temp.path().to_path_buf(), trust_store, consent)
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store,
+                consent,
+            )
             .await
             .expect("an untrusted skill under default mode must not error the whole run");
 

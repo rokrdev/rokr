@@ -66,8 +66,9 @@ mod tests {
     fn empty_session_manifest_yields_empty_candidate_set() {
         let data_dir = tempfile::tempdir().expect("tempdir");
 
-        let result = distinct_touched_paths(data_dir.path().to_path_buf(), "session-with-no-manifest")
-            .expect("no manifest file is not an error");
+        let result =
+            distinct_touched_paths(data_dir.path().to_path_buf(), "session-with-no-manifest")
+                .expect("no manifest file is not an error");
 
         assert_eq!(result, Vec::<String>::new());
     }
@@ -75,7 +76,8 @@ mod tests {
     #[test]
     fn single_turn_multiple_snapshots_of_same_path_yield_one_entry() {
         let data_dir = tempfile::tempdir().expect("tempdir");
-        let store = rokr_session::CheckpointStore::open(data_dir.path().to_path_buf(), "sess-dup-write");
+        let store =
+            rokr_session::CheckpointStore::open(data_dir.path().to_path_buf(), "sess-dup-write");
 
         // First write to "a.rs" at turn 0: real pre-image capture.
         store
@@ -97,7 +99,8 @@ mod tests {
     #[test]
     fn distinct_paths_touched_across_multiple_turns_are_deduped() {
         let data_dir = tempfile::tempdir().expect("tempdir");
-        let store = rokr_session::CheckpointStore::open(data_dir.path().to_path_buf(), "sess-multi-turn");
+        let store =
+            rokr_session::CheckpointStore::open(data_dir.path().to_path_buf(), "sess-multi-turn");
 
         store
             .snapshot(0, "a.rs", None)

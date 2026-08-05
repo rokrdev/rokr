@@ -187,8 +187,8 @@ impl rokr_core::ExecutableTool for SubagentTool {
                 })?
                 .to_string();
 
-            let subagent_prompt = rokr_config::read_agent_prompt(&self.config_dir, &name)
-                .map_err(|err| {
+            let subagent_prompt =
+                rokr_config::read_agent_prompt(&self.config_dir, &name).map_err(|err| {
                     rokr_tools::ToolError::ExecutionFailed(format!(
                         "failed to load subagent '{name}' prompt: {err}"
                     ))
@@ -546,8 +546,7 @@ mod tests {
         let read_tool = rokr_tools::read::ReadTool;
         let tools: [&dyn rokr_core::ExecutableTool; 1] = [&read_tool];
 
-        let request_permission: PermissionCallback =
-            Box::new(|_request| Box::pin(async { true }));
+        let request_permission: PermissionCallback = Box::new(|_request| Box::pin(async { true }));
         let note_denied: NoteDeniedCallback = Box::new(|| {});
         let session_grants = Arc::new(std::sync::Mutex::new(
             crate::permission_policy::SessionGrants::new(),
@@ -603,21 +602,24 @@ mod tests {
             .await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/messages"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "msg_test",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "subagent final answer after retry"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "subagent final answer after retry"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })),
+            )
             .mount(&mock_server)
             .await;
 
-        let any_provider = rokr_provider::AnyProvider::Anthropic(rokr_provider::AnthropicProvider::new(
-            mock_server.uri(),
-            "claude-3-5-sonnet-20241022",
-            "test-api-key",
-        ));
+        let any_provider =
+            rokr_provider::AnyProvider::Anthropic(rokr_provider::AnthropicProvider::new(
+                mock_server.uri(),
+                "claude-3-5-sonnet-20241022",
+                "test-api-key",
+            ));
         let fast_policy = rokr_provider::RetryPolicy {
             max_attempts: 5,
             base_delay: std::time::Duration::from_millis(1),
@@ -632,8 +634,7 @@ mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(agents_dir.join("researcher.md"), "you are a test subagent").unwrap();
 
-        let request_permission: PermissionCallback =
-            Box::new(|_request| Box::pin(async { true }));
+        let request_permission: PermissionCallback = Box::new(|_request| Box::pin(async { true }));
         let note_denied: NoteDeniedCallback = Box::new(|| {});
 
         let session_grants = Arc::new(std::sync::Mutex::new(
@@ -710,8 +711,9 @@ mod tests {
             tokio::sync::oneshot::Sender<bool>,
         )>(1);
 
-        let received_request: std::sync::Arc<tokio::sync::Mutex<Option<rokr_core::PermissionRequest>>> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let received_request: std::sync::Arc<
+            tokio::sync::Mutex<Option<rokr_core::PermissionRequest>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let received_request_writer = received_request.clone();
         tokio::spawn(async move {
             if let Some((request, responder)) = rx.recv().await {
@@ -804,9 +806,7 @@ mod tests {
 
         let request_permission: PermissionCallback = Box::new(|_request| {
             Box::pin(async {
-                panic!(
-                    "request_permission must never be invoked for a Deny-mode denial (R-002)"
-                );
+                panic!("request_permission must never be invoked for a Deny-mode denial (R-002)");
             })
         });
 
@@ -875,8 +875,8 @@ mod tests {
     /// assertion as expected. Restored to the discriminating responder
     /// below afterward.
     #[tokio::test]
-    async fn concurrent_permission_requests_from_two_subagents_each_receive_their_own_correct_response()
-     {
+    async fn concurrent_permission_requests_from_two_subagents_each_receive_their_own_correct_response(
+    ) {
         struct ConditionalProvider;
 
         impl rokr_core::Provider for ConditionalProvider {
@@ -1069,13 +1069,12 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let any_provider = rokr_provider::AnyProvider::Anthropic(
-            rokr_provider::AnthropicProvider::new(
+        let any_provider =
+            rokr_provider::AnyProvider::Anthropic(rokr_provider::AnthropicProvider::new(
                 mock_server.uri(),
                 "claude-3-5-sonnet-20241022",
                 "test-api-key",
-            ),
-        );
+            ));
         let resilient_provider = rokr_provider::ResilientProvider::new(any_provider);
 
         let temp_dir = unique_temp_dir("concurrent-subagent-dispatch");
@@ -1083,8 +1082,7 @@ mod tests {
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(agents_dir.join("researcher.md"), "you are a test subagent").unwrap();
 
-        let request_permission: PermissionCallback =
-            Box::new(|_request| Box::pin(async { true }));
+        let request_permission: PermissionCallback = Box::new(|_request| Box::pin(async { true }));
         let note_denied: NoteDeniedCallback = Box::new(|| {});
 
         let session_grants = Arc::new(std::sync::Mutex::new(
