@@ -1070,6 +1070,7 @@ async fn main() -> ExitCode {
                             handle_commit_command(cwd.as_deref(), &data_dir, &session_handle, permission)
                                 .await
                         }
+                        "/pr" => handle_pr_command(cwd.as_deref(), permission).await,
                         "/mcp" => format_mcp_listing(&mcp_configs, &mcp_server_handles),
                         "/hooks" => format_hooks_listing(&hooks_config),
                         // Ticket 57: `/cost` folds the CURRENT session's own
@@ -1263,7 +1264,11 @@ fn draft_commit_message(paths: &[String]) -> String {
         [only] => format!("update {only}"),
         _ => format!("update {} files", paths.len()),
     };
-    let file_list = paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
+    let file_list = paths
+        .iter()
+        .map(|p| format!("- {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!("{commit_type}: {summary}\n\n{file_list}")
 }
 
@@ -1287,7 +1292,10 @@ async fn handle_commit_command(
     };
 
     if rokr_app::git::snapshot(cwd).is_none() {
-        return format!("/commit requires a git repository; {} is not one", cwd.display());
+        return format!(
+            "/commit requires a git repository; {} is not one",
+            cwd.display()
+        );
     }
 
     let session_id = match session_handle.read().await.as_ref() {
@@ -1343,6 +1351,111 @@ async fn handle_commit_command(
     }
 }
 
+/// Ticket 80 (pr-command): branches `/pr` refuses to run from directly.
+/// PRD decision: refuse and offer branch creation instead of silently
+/// opening a PR against no sensible base.
+const PR_PROTECTED_BRANCHES: [&str; 3] = ["main", "master", "develop"];
+
+/// Ticket 80 (pr-command): drafts a title (the oldest commit subject since
+/// branching) and a body (a bullet list of every commit subject since
+/// branching) from `commits` -- deliberately simple, no diff-content-aware
+/// drafting, same scope limitation `draft_commit_message` (ticket 79)
+/// already established for `/commit`.
+fn draft_pr_title_and_body(branch: &str, commits: &[String]) -> (String, String) {
+    let title = commits
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("Changes from {branch}"));
+    let body = commits
+        .iter()
+        .map(|c| format!("- {c}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (title, body)
+}
+
+/// Ticket 80 (pr-command): `/pr`'s handler. Same trusted, in-process
+/// authority `/commit` (ticket 79) already has -- bypasses
+/// `PermissionPolicy`/the read-only-git classifier/the sandbox entirely,
+/// and reuses the same confirmation surface
+/// (`rokr_tui::PermissionDetail::Text`). Refuses outright on
+/// `main`/`master`/`develop`, offering branch creation (a single
+/// confirmation) instead of drafting a PR against no sensible base. `gh`
+/// missing/unauthenticated degrades gracefully: `GhError`'s own `Display`
+/// already embeds the exact manual `gh pr create` command, so printing it
+/// alongside the drafted title/body needs no separate formatting per error
+/// variant.
+async fn handle_pr_command(cwd: Option<&Path>, permission: rokr_tui::PermissionHandle) -> String {
+    let Some(cwd) = cwd else {
+        return "/pr requires a git repository, but no working directory is available".to_string();
+    };
+
+    if rokr_app::git::snapshot(cwd).is_none() {
+        return format!(
+            "/pr requires a git repository; {} is not one",
+            cwd.display()
+        );
+    }
+
+    let Some(branch) = rokr_app::git::current_branch(cwd) else {
+        return "failed to determine the current branch".to_string();
+    };
+
+    if PR_PROTECTED_BRANCHES.contains(&branch.as_str()) {
+        let suggested = match rokr_app::git::short_head_sha(cwd) {
+            Some(sha) => format!("pr/{sha}"),
+            None => "pr/new".to_string(),
+        };
+        let decision = permission
+            .request(rokr_tui::PermissionRequest {
+                tool_name: "pr".to_string(),
+                detail: rokr_tui::PermissionDetail::Text(format!(
+                    "/pr refuses to run directly on '{branch}'. Create and switch to a new \
+                     branch '{suggested}' instead?"
+                )),
+            })
+            .await;
+        return match decision {
+            rokr_tui::PermissionDecision::Allow
+            | rokr_tui::PermissionDecision::AllowAndRemember => {
+                match rokr_app::git::create_branch(cwd, &suggested) {
+                    Ok(()) => format!(
+                        "Created and switched to branch '{suggested}'. Run /pr again to open a \
+                         pull request."
+                    ),
+                    Err(err) => format!("failed to create branch '{suggested}': {err}"),
+                }
+            }
+            rokr_tui::PermissionDecision::Deny => "/pr cancelled".to_string(),
+        };
+    }
+
+    let base = rokr_app::git::default_base_branch(cwd);
+    let commits = rokr_app::git::commits_since_merge_base(cwd, &base).unwrap_or_default();
+    if commits.is_empty() {
+        return format!("no commits since branching from '{base}'; nothing to open a PR for");
+    }
+
+    let (title, body) = draft_pr_title_and_body(&branch, &commits);
+
+    let decision = permission
+        .request(rokr_tui::PermissionRequest {
+            tool_name: "pr".to_string(),
+            detail: rokr_tui::PermissionDetail::Text(format!("Title:\n{title}\n\nBody:\n{body}")),
+        })
+        .await;
+
+    match decision {
+        rokr_tui::PermissionDecision::Deny => "/pr cancelled".to_string(),
+        rokr_tui::PermissionDecision::Allow | rokr_tui::PermissionDecision::AllowAndRemember => {
+            match rokr_app::gh::create_pr(cwd, &title, &body) {
+                Ok(url) => format!("Created pull request: {url}"),
+                Err(err) => format!("{err}\n\nTitle:\n{title}\n\nBody:\n{body}"),
+            }
+        }
+    }
+}
+
 /// F-004 (pre-ship review): the set of command NAMES (the token
 /// immediately after the leading `/`, before any arguments) that the
 /// `command` closure's match arms above claim, kept as a single explicit
@@ -1375,6 +1488,7 @@ fn is_builtin_command(name: &str) -> bool {
             | "compact"
             | "memory"
             | "commit"
+            | "pr"
     )
 }
 
@@ -1389,8 +1503,8 @@ mod is_builtin_command_tests {
     #[test]
     fn recognizes_every_builtin_command_name() {
         for name in [
-            "model", "resume", "rollback", "search", "mcp", "hooks", "cost", "sessions",
-            "compact", "memory", "commit",
+            "model", "resume", "rollback", "search", "mcp", "hooks", "cost", "sessions", "compact",
+            "memory", "commit",
         ] {
             assert!(
                 is_builtin_command(name),
@@ -1944,13 +2058,16 @@ async fn set_active_provider(
 /// history. A session's model can't change mid-session in today's schema
 /// (no per-`Turn` model field, same limitation `SessionIndexEntry::last_model`
 /// already documents), so a single `Header`-derived string is enough.
-fn fold_session_usage_and_model(records: &[rokr_session::SessionRecord]) -> (rokr_core::Usage, String) {
+fn fold_session_usage_and_model(
+    records: &[rokr_session::SessionRecord],
+) -> (rokr_core::Usage, String) {
     let mut usage = rokr_core::Usage::default();
     let mut model = String::new();
     for record in records {
         match record {
             rokr_session::SessionRecord::Header {
-                model: header_model, ..
+                model: header_model,
+                ..
             } => {
                 model = header_model.clone();
             }
@@ -2018,7 +2135,9 @@ async fn format_cost_all_summary(
     for entry in &entries {
         let records = store.read_records(&entry.session_id);
         let (usage, model) = fold_session_usage_and_model(&records);
-        let pricing_entry = model_pricing.get(&model).map(model_pricing_to_pricing_entry);
+        let pricing_entry = model_pricing
+            .get(&model)
+            .map(model_pricing_to_pricing_entry);
         total_cost_usd += rokr_core::pricing::calculate_cost(usage, pricing_entry.as_ref());
         total_usage.input_tokens += usage.input_tokens;
         total_usage.output_tokens += usage.output_tokens;
@@ -2116,8 +2235,14 @@ mod tests {
 
         let (usage, model) = fold_session_usage_and_model(&records);
 
-        assert_eq!(usage.input_tokens, 600, "input tokens must be summed across all turns");
-        assert_eq!(usage.output_tokens, 250, "output tokens must be summed across all turns");
+        assert_eq!(
+            usage.input_tokens, 600,
+            "input tokens must be summed across all turns"
+        );
+        assert_eq!(
+            usage.output_tokens, 250,
+            "output tokens must be summed across all turns"
+        );
         assert_eq!(
             usage.cache_read_tokens, 30,
             "cache-read tokens must be summed across all turns"
@@ -2126,7 +2251,10 @@ mod tests {
             usage.cache_write_tokens, 20,
             "cache-write tokens must be summed across all turns"
         );
-        assert_eq!(model, "gpt-4o-mini", "model must be resolved off the Header record");
+        assert_eq!(
+            model, "gpt-4o-mini",
+            "model must be resolved off the Header record"
+        );
     }
 
     /// F-014: an empty record slice (e.g. a brand-new session with nothing
@@ -2158,8 +2286,15 @@ mod tests {
 
         let (usage, model) = fold_session_usage_and_model(&records);
 
-        assert_eq!(usage, rokr_core::Usage::default(), "no Turn records means no usage to sum");
-        assert_eq!(model, "claude-test", "model must still resolve off the Header record");
+        assert_eq!(
+            usage,
+            rokr_core::Usage::default(),
+            "no Turn records means no usage to sum"
+        );
+        assert_eq!(
+            model, "claude-test",
+            "model must still resolve off the Header record"
+        );
     }
 
     /// F-014: an all-zero `Usage` (e.g. a session/header-only case with
@@ -3396,7 +3531,10 @@ mod tests {
 
         let resolved_again =
             resolve_memory_path(&cwd).expect("should resolve the already-existing memory path");
-        assert_eq!(resolved_again, expected, "should still resolve to <cwd>/AGENTS.md");
+        assert_eq!(
+            resolved_again, expected,
+            "should still resolve to <cwd>/AGENTS.md"
+        );
         assert_eq!(
             std::fs::read_to_string(&expected).unwrap(),
             existing_content,

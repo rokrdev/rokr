@@ -129,9 +129,11 @@ pub enum CommitError {
 /// True if any line of `message` is a `Co-Authored-By:` git trailer
 /// (case-insensitive, leading whitespace ignored).
 fn contains_co_author_line(message: &str) -> bool {
-    message
-        .lines()
-        .any(|line| line.trim_start().to_ascii_lowercase().starts_with("co-authored-by:"))
+    message.lines().any(|line| {
+        line.trim_start()
+            .to_ascii_lowercase()
+            .starts_with("co-authored-by:")
+    })
 }
 
 /// Stages EXACTLY `paths` (never `-A`/`.`) and commits them with `message`,
@@ -180,6 +182,61 @@ pub fn staged_paths(cwd: &Path) -> Vec<String> {
     run_git(cwd, &["diff", "--cached", "--name-only"])
         .map(|s| s.lines().map(|line| line.to_string()).collect())
         .unwrap_or_default()
+}
+
+/// The current branch name (`git rev-parse --abbrev-ref HEAD`) -- used by
+/// `/pr` (ticket 80) to decide whether it's running on a protected branch
+/// and to resolve which branch's commits get drafted into a PR title/body.
+pub fn current_branch(cwd: &Path) -> Option<String> {
+    run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+}
+
+/// The base branch `/pr` (ticket 80) diffs against: whichever of
+/// `main`/`master` exists as a real ref in this repo, `main` preferred.
+/// Falls back to `"main"` if neither resolves -- `commits_since_merge_base`
+/// then simply returns `None`, which `/pr`'s caller already treats as
+/// "nothing to draft from".
+pub fn default_base_branch(cwd: &Path) -> String {
+    for candidate in ["main", "master"] {
+        if run_git(cwd, &["rev-parse", "--verify", candidate]).is_some() {
+            return candidate.to_string();
+        }
+    }
+    "main".to_string()
+}
+
+/// Commit subjects on `HEAD` since its merge-base with `base_branch`,
+/// oldest first -- `/pr` (ticket 80) drafts its title/body from these.
+/// `None` when the merge-base can't be determined (e.g. `base_branch`
+/// doesn't exist, or the two branches share no history).
+pub fn commits_since_merge_base(cwd: &Path, base_branch: &str) -> Option<Vec<String>> {
+    let merge_base = run_git(cwd, &["merge-base", base_branch, "HEAD"])?;
+    let range = format!("{merge_base}..HEAD");
+    let log = run_git(cwd, &["log", "--reverse", "--pretty=%s", &range])?;
+    Some(log.lines().map(|line| line.to_string()).collect())
+}
+
+/// The short SHA of `HEAD` (`git rev-parse --short HEAD`) -- used by `/pr`
+/// (ticket 80) to build a suggested branch name when refusing to run on a
+/// protected branch.
+pub fn short_head_sha(cwd: &Path) -> Option<String> {
+    run_git(cwd, &["rev-parse", "--short", "HEAD"])
+}
+
+/// Creates and checks out a new branch named `name` (`git checkout -b`) --
+/// used by `/pr` (ticket 80)'s refusal path on `main`/`master` to offer
+/// branch creation as an alternative to proceeding.
+pub fn create_branch(cwd: &Path, name: &str) -> Result<(), String> {
+    let status = Command::new("git")
+        .args(["checkout", "-b", name])
+        .current_dir(cwd)
+        .status()
+        .map_err(|err| format!("failed to spawn git: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("git checkout -b {name} failed"))
+    }
 }
 
 #[cfg(test)]
@@ -300,7 +357,10 @@ mod tests {
             .expect("failed to write b.txt");
 
         let result = super::commit(dir.path(), &["b.txt".to_string()], "chore: add b.txt");
-        assert!(result.is_ok(), "expected commit to succeed, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected commit to succeed, got: {result:?}"
+        );
 
         let subject_output = Command::new("git")
             .args(["log", "-1", "--pretty=%s"])
@@ -319,8 +379,10 @@ mod tests {
             .output()
             .expect("git show should spawn");
         let files_stdout = String::from_utf8_lossy(&files_output.stdout).to_string();
-        let committed_files: Vec<&str> =
-            files_stdout.lines().filter(|line| !line.is_empty()).collect();
+        let committed_files: Vec<&str> = files_stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
         assert_eq!(
             committed_files,
             vec!["b.txt"],
@@ -334,7 +396,9 @@ mod tests {
             .output()
             .expect("git status should spawn");
         assert!(
-            !String::from_utf8_lossy(&status_output.stdout).trim().is_empty(),
+            !String::from_utf8_lossy(&status_output.stdout)
+                .trim()
+                .is_empty(),
             "expected a.txt's modification to remain uncommitted, proving it was never staged"
         );
     }
@@ -372,5 +436,73 @@ mod tests {
             commit_count, 1,
             "expected no new commit to have been created when the message was refused"
         );
+    }
+
+    #[test]
+    fn commits_since_merge_base_returns_subjects_oldest_first_on_feature_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello", "initial commit");
+        assert!(Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git checkout should spawn")
+            .success());
+        commit(dir.path(), "b.txt", "one", "feature commit one");
+        commit(dir.path(), "c.txt", "two", "feature commit two");
+
+        let subjects = commits_since_merge_base(dir.path(), "main")
+            .expect("expected Some on a real feature branch with a real base");
+
+        assert_eq!(
+            subjects,
+            vec![
+                "feature commit one".to_string(),
+                "feature commit two".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn commits_since_merge_base_is_none_when_base_branch_does_not_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello", "initial commit");
+
+        let result = commits_since_merge_base(dir.path(), "nonexistent-base-branch");
+
+        assert!(
+            result.is_none(),
+            "expected None when the base branch doesn't exist, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn create_branch_creates_and_checks_out_new_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello", "initial commit");
+
+        let result = create_branch(dir.path(), "pr/abc123");
+
+        assert!(
+            result.is_ok(),
+            "expected create_branch to succeed, got: {result:?}"
+        );
+        assert_eq!(
+            current_branch(dir.path()),
+            Some("pr/abc123".to_string()),
+            "expected the repo to actually be checked out onto the new branch"
+        );
+    }
+
+    #[test]
+    fn default_base_branch_prefers_main_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello", "initial commit");
+
+        assert_eq!(default_base_branch(dir.path()), "main");
     }
 }

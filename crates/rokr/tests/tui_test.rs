@@ -265,7 +265,6 @@ async fn typed_prompt_renders_model_response_in_view() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
 
-
 /// Ticket 52 (clap-and-sessionrunner-extraction) acceptance test: a full
 /// PTY session round trip -- render, type a prompt, get the model's reply
 /// back in the View -- must behave identically now that the `submit`
@@ -572,9 +571,7 @@ async fn submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl()
     let sessions_dir = xdg_data_home.join("rokr").join("sessions");
     let session_dir_entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&sessions_dir)
         .unwrap_or_else(|err| {
-            panic!(
-                "expected sessions directory to exist at {sessions_dir:?}, got error: {err:?}"
-            )
+            panic!("expected sessions directory to exist at {sessions_dir:?}, got error: {err:?}")
         })
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.path().is_dir())
@@ -631,7 +628,9 @@ async fn submitting_a_prompt_persists_header_and_turn_records_to_session_jsonl()
                  submitted prompt"
             );
         }
-        other => panic!("expected the second session.jsonl record to be a Turn record, got: {other:?}"),
+        other => {
+            panic!("expected the second session.jsonl record to be a Turn record, got: {other:?}")
+        }
     }
 
     let _ = std::fs::remove_dir_all(&home);
@@ -993,7 +992,9 @@ async fn resuming_a_session_resends_prior_assistant_reply_in_next_request() {
             for prompt in prompts {
                 let mut line = prompt.as_bytes().to_vec();
                 line.push(b'\r');
-                writer.write_all(&line).expect("failed to write prompt to pty");
+                writer
+                    .write_all(&line)
+                    .expect("failed to write prompt to pty");
 
                 // Wait for the prompt to be echoed AND at least the reply to
                 // land before submitting the next prompt, so turns don't race.
@@ -1035,7 +1036,10 @@ async fn resuming_a_session_resends_prior_assistant_reply_in_next_request() {
                 }
                 thread::sleep(Duration::from_millis(50));
             };
-            assert!(status.success(), "expected rokr to exit cleanly, got: {status:?}");
+            assert!(
+                status.success(),
+                "expected rokr to exit cleanly, got: {status:?}"
+            );
         }
     };
 
@@ -1374,10 +1378,9 @@ async fn resume_without_confirm_warns_and_confirm_swaps_transcript_and_writer() 
         "expected the post-jump turn to be appended to the TARGET session's log, got: {target_contents_after:?}"
     );
 
-    let origin_contents_after = std::fs::read_to_string(
-        sessions_root.join(&origin_session_id).join("session.jsonl"),
-    )
-    .unwrap_or_default();
+    let origin_contents_after =
+        std::fs::read_to_string(sessions_root.join(&origin_session_id).join("session.jsonl"))
+            .unwrap_or_default();
     assert!(
         !origin_contents_after.contains("postjumpsubmittedturn"),
         "the post-jump turn must NOT appear in the ORIGIN session's log, got: {origin_contents_after:?}"
@@ -4997,7 +5000,10 @@ async fn write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_reco
             .map(|entry| entry.path())
             .collect::<Vec<_>>()
     );
-    let snapshot_file_name = snapshot_entries[0].file_name().to_string_lossy().into_owned();
+    let snapshot_file_name = snapshot_entries[0]
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
     assert!(
         snapshot_file_name.starts_with("t0-"),
         "expected the snapshot id to be keyed by turn_index 0 (this session's first turn), \
@@ -5535,8 +5541,7 @@ async fn rollback_command_restores_file_and_truncates_transcript_to_target_turn(
         received_requests.len()
     );
     let turn3_body =
-        String::from_utf8_lossy(&received_requests[received_requests.len() - 1].body)
-            .into_owned();
+        String::from_utf8_lossy(&received_requests[received_requests.len() - 1].body).into_owned();
     assert!(
         turn3_body.contains("turnzerowriteprompt"),
         "expected turn 3's request body to still contain turn 0's prompt (kept by rollback to \
@@ -7439,8 +7444,7 @@ async fn auto_compaction_failure_leaves_transcript_intact_and_shows_notice() {
     // emitted. Read from `RetryPolicy::default()` itself, not
     // hardcoded, so this stays correct if the policy's attempt count ever
     // changes.
-    let compaction_failure_attempts =
-        u64::from(rokr_provider::RetryPolicy::default().max_attempts);
+    let compaction_failure_attempts = u64::from(rokr_provider::RetryPolicy::default().max_attempts);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(500))
@@ -8419,7 +8423,9 @@ fn search_command_returns_matching_session_ids_for_content_substring() {
             model: "claude-fixture".to_string(),
         },
         rokr_session::SessionRecord::Turn {
-            messages: vec![rokr_core::Message::user_text("please find zzyzxfindableterm in here")],
+            messages: vec![rokr_core::Message::user_text(
+                "please find zzyzxfindableterm in here",
+            )],
             usage: rokr_session::UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -8493,7 +8499,9 @@ fn search_command_returns_matching_session_ids_for_content_substring() {
             model: "claude-fixture".to_string(),
         },
         rokr_session::SessionRecord::Turn {
-            messages: vec![rokr_core::Message::user_text("completely unrelated content")],
+            messages: vec![rokr_core::Message::user_text(
+                "completely unrelated content",
+            )],
             usage: rokr_session::UsageRecord {
                 input_tokens: 1,
                 output_tokens: 1,
@@ -8676,7 +8684,12 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
     {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("failed to open pty (run 1)");
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
@@ -8687,10 +8700,16 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
         cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
         cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
 
-        let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty (run 1)");
+        let mut child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("failed to spawn rokr in pty (run 1)");
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader (run 1)");
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("failed to clone pty reader (run 1)");
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -8707,7 +8726,10 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
             }
         });
 
-        let mut writer = pair.master.take_writer().expect("failed to take pty writer (run 1)");
+        let mut writer = pair
+            .master
+            .take_writer()
+            .expect("failed to take pty writer (run 1)");
 
         let mut output = String::new();
         let render_deadline = Instant::now() + Duration::from_secs(10);
@@ -8745,10 +8767,15 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
              {history_contents:?}"
         );
 
-        writer.write_all(b"\x03").expect("failed to write Ctrl+C to pty (run 1)");
+        writer
+            .write_all(b"\x03")
+            .expect("failed to write Ctrl+C to pty (run 1)");
         let exit_deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
-            if let Some(status) = child.try_wait().expect("failed to poll rokr exit status (run 1)") {
+            if let Some(status) = child
+                .try_wait()
+                .expect("failed to poll rokr exit status (run 1)")
+            {
                 break status;
             }
             if Instant::now() > exit_deadline {
@@ -8757,7 +8784,10 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
             }
             thread::sleep(Duration::from_millis(50));
         };
-        assert!(status.success(), "expected rokr (run 1) to exit cleanly, got status: {status:?}");
+        assert!(
+            status.success(),
+            "expected rokr (run 1) to exit cleanly, got status: {status:?}"
+        );
     }
 
     // --- Run 2: a fresh process against the SAME XDG_DATA_HOME. Pressing
@@ -8765,7 +8795,12 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
     {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("failed to open pty (run 2)");
 
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
@@ -8776,10 +8811,16 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
         cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
         cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
 
-        let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty (run 2)");
+        let mut child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("failed to spawn rokr in pty (run 2)");
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader (run 2)");
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("failed to clone pty reader (run 2)");
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
@@ -8796,7 +8837,10 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
             }
         });
 
-        let mut writer = pair.master.take_writer().expect("failed to take pty writer (run 2)");
+        let mut writer = pair
+            .master
+            .take_writer()
+            .expect("failed to take pty writer (run 2)");
 
         let mut output = String::new();
         let render_deadline = Instant::now() + Duration::from_secs(10);
@@ -8836,10 +8880,15 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
              {output:?}"
         );
 
-        writer.write_all(b"\x03").expect("failed to write Ctrl+C to pty (run 2)");
+        writer
+            .write_all(b"\x03")
+            .expect("failed to write Ctrl+C to pty (run 2)");
         let exit_deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
-            if let Some(status) = child.try_wait().expect("failed to poll rokr exit status (run 2)") {
+            if let Some(status) = child
+                .try_wait()
+                .expect("failed to poll rokr exit status (run 2)")
+            {
                 break status;
             }
             if Instant::now() > exit_deadline {
@@ -8848,7 +8897,10 @@ async fn pressing_up_after_restart_recalls_previously_submitted_prompt_from_hist
             }
             thread::sleep(Duration::from_millis(50));
         };
-        assert!(status.success(), "expected rokr (run 2) to exit cleanly, got status: {status:?}");
+        assert!(
+            status.success(),
+            "expected rokr (run 2) to exit cleanly, got status: {status:?}"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&home);
@@ -9085,10 +9137,11 @@ async fn multiline_prompt_composed_with_shift_enter_submits_as_single_prompt_on_
 /// both the original typed text and the script's appended text, joined by
 /// the newline the script inserts.
 #[tokio::test]
-async fn pressing_editor_keybinding_with_scripted_editor_command_updates_prompt_buffer_from_edited_file() {
+async fn pressing_editor_keybinding_with_scripted_editor_command_updates_prompt_buffer_from_edited_file(
+) {
+    use std::os::unix::fs::PermissionsExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use std::os::unix::fs::PermissionsExt;
 
     let mock_server = MockServer::start().await;
 
@@ -9155,7 +9208,12 @@ async fn pressing_editor_keybinding_with_scripted_editor_command_updates_prompt_
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
-    cmd.env("EDITOR", editor_script_path.to_str().expect("script path should be valid utf-8"));
+    cmd.env(
+        "EDITOR",
+        editor_script_path
+            .to_str()
+            .expect("script path should be valid utf-8"),
+    );
 
     let mut child = pair
         .slave
@@ -9227,7 +9285,9 @@ async fn pressing_editor_keybinding_with_scripted_editor_command_updates_prompt_
          Ctrl+E, got pty output: {output:?}"
     );
 
-    writer.write_all(b"\r").expect("failed to write Enter to pty");
+    writer
+        .write_all(b"\r")
+        .expect("failed to write Enter to pty");
 
     let response_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < response_deadline {
@@ -9266,7 +9326,11 @@ async fn pressing_editor_keybinding_with_scripted_editor_command_updates_prompt_
         "mock server should have recorded received requests \
          (make sure the request recorder wasn't disabled)",
     );
-    assert_eq!(received_requests.len(), 1, "expected exactly one outgoing request");
+    assert_eq!(
+        received_requests.len(),
+        1,
+        "expected exactly one outgoing request"
+    );
 
     let request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
     let expected_joined_content = format!("{typed_line}\\n{edited_line}");
@@ -9734,7 +9798,12 @@ async fn zero_usage_turn_leaves_context_percentage_at_previous_known_value() {
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("failed to open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
@@ -9744,10 +9813,16 @@ async fn zero_usage_turn_leaves_context_percentage_at_previous_known_value() {
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
 
-    let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty");
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader");
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -9764,7 +9839,10 @@ async fn zero_usage_turn_leaves_context_percentage_at_previous_known_value() {
         }
     });
 
-    let mut writer = pair.master.take_writer().expect("failed to take pty writer");
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
 
     let mut output = String::new();
     let render_deadline = Instant::now() + Duration::from_secs(10);
@@ -9853,7 +9931,10 @@ async fn zero_usage_turn_leaves_context_percentage_at_previous_known_value() {
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
@@ -10063,7 +10144,12 @@ async fn mcp_tool_call_renders_permission_prompt_and_returns_result_from_fake_st
     // not the ROKR_MCP_SERVER env var ticket 44 used -- the server name
     // stays "interim" since `qualified_tool_name` above is computed from
     // it.
-    write_mcp_config(&xdg_config_home, "interim", &fake_mcp_server_path(), serde_json::json!({}));
+    write_mcp_config(
+        &xdg_config_home,
+        "interim",
+        &fake_mcp_server_path(),
+        serde_json::json!({}),
+    );
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -10371,7 +10457,9 @@ async fn http_mcp_server_tool_call_surfaces_origin_in_permission_prompt() {
     // text -- proving the HTTP-transport tool call really ran end-to-end.
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains(FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT))
+        .and(body_string_contains(
+            FAKE_HTTP_MCP_SERVER_FIXED_RESPONSE_TEXT,
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "chatcmpl-test-http-mcp-accept-final",
             "object": "chat.completion",
@@ -10391,7 +10479,12 @@ async fn http_mcp_server_tool_call_surfaces_origin_in_permission_prompt() {
 
     let home = unique_temp_dir("home-http-mcp-accept");
     let xdg_config_home = unique_temp_dir("xdg-config-home-http-mcp-accept");
-    write_http_mcp_config(&xdg_config_home, "remote", &mcp_mock_server.uri(), bearer_token);
+    write_http_mcp_config(
+        &xdg_config_home,
+        "remote",
+        &mcp_mock_server.uri(),
+        bearer_token,
+    );
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -10616,7 +10709,12 @@ async fn mcp_server_configured_via_rokr_json_appears_in_tool_set_after_startup()
 
     let home = unique_temp_dir("home-mcp-config");
     let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-config");
-    write_mcp_config(&xdg_config_home, "scripted", &fake_mcp_server_path(), serde_json::json!({}));
+    write_mcp_config(
+        &xdg_config_home,
+        "scripted",
+        &fake_mcp_server_path(),
+        serde_json::json!({}),
+    );
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -10741,7 +10839,10 @@ async fn mcp_server_configured_via_rokr_json_appears_in_tool_set_after_startup()
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
@@ -10925,12 +11026,14 @@ async fn failed_mcp_server_shows_status_notice_and_session_continues_without_its
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
 }
-
 
 /// Ticket 51 (mcp-hooks-introspection) acceptance test: `/mcp` lists every
 /// configured server's connection state and (for a connected server) its
@@ -11035,7 +11138,9 @@ fn mcp_command_lists_servers_connection_state_and_tools() {
         thread::sleep(Duration::from_millis(50));
     }
 
-    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+    writer
+        .write_all(b"/mcp\r")
+        .expect("failed to write /mcp to pty");
 
     let listing_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < listing_deadline {
@@ -11351,7 +11456,9 @@ fn mcp_reconnect_command_restarts_a_degraded_server() {
         "expected a one-line status notice mentioning the failed server 'flaky', got: {output:?}"
     );
 
-    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+    writer
+        .write_all(b"/mcp\r")
+        .expect("failed to write /mcp to pty");
     let degraded_listing_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < degraded_listing_deadline {
         while let Ok(chunk) = rx.try_recv() {
@@ -11380,7 +11487,9 @@ fn mcp_reconnect_command_restarts_a_degraded_server() {
     // for the real connect+list_tools round-trip to complete before a
     // fresh `/mcp` reflects it.
     thread::sleep(Duration::from_millis(500));
-    writer.write_all(b"/mcp\r").expect("failed to write /mcp to pty");
+    writer
+        .write_all(b"/mcp\r")
+        .expect("failed to write /mcp to pty");
 
     let reconnect_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < reconnect_deadline {
@@ -11423,7 +11532,6 @@ fn mcp_reconnect_command_restarts_a_degraded_server() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&marker_dir);
 }
-
 
 /// Ticket 46 (mcp-namespace-multi-server-freeze) acceptance test: two
 /// configured stdio servers ("server_a", "server_b") each expose a tool
@@ -11670,7 +11778,10 @@ async fn two_mcp_servers_with_colliding_tool_name_both_reachable_by_namespaced_n
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
@@ -11885,7 +11996,10 @@ async fn slow_server_joins_snapshot_on_first_ready_reached_between_turns() {
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let received_requests = mock_server.received_requests().await.expect(
         "mock server should have recorded received requests \
@@ -11903,8 +12017,7 @@ async fn slow_server_joins_snapshot_on_first_ready_reached_between_turns() {
          'slow' was still gated (Starting), never having reached Ready, so it had not yet \
          joined the session's tool set; got body: {first_request_body:?}"
     );
-    let second_request_body =
-        String::from_utf8_lossy(&received_requests[1].body).into_owned();
+    let second_request_body = String::from_utf8_lossy(&received_requests[1].body).into_owned();
     assert!(
         second_request_body.contains(&slow_server_qualified_name),
         "expected turn 2's outgoing request to CONTAIN '{slow_server_qualified_name}' -- PC-1: \
@@ -12035,7 +12148,12 @@ async fn mcp_tool_call_renders_server_and_tool_in_permission_prompt_text() {
     let xdg_config_home = unique_temp_dir("xdg-config-home-mcp-prompt-text");
     // No `auto_approve` set at all -- defaults to empty, so "echo" is NOT
     // on the allowlist and the call must be gated through a prompt.
-    write_mcp_config(&xdg_config_home, "interim", &fake_mcp_server_path(), serde_json::json!({}));
+    write_mcp_config(
+        &xdg_config_home,
+        "interim",
+        &fake_mcp_server_path(),
+        serde_json::json!({}),
+    );
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -12182,7 +12300,10 @@ async fn mcp_tool_call_renders_server_and_tool_in_permission_prompt_text() {
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
@@ -12371,7 +12492,10 @@ async fn mcp_tool_on_auto_approve_list_executes_without_permission_prompt() {
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
@@ -12552,7 +12676,10 @@ async fn cost_command_prints_token_breakdown_cache_hit_rate_and_dollar_estimate(
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
@@ -12798,7 +12925,10 @@ async fn cost_all_flag_folds_every_session_on_disk() {
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&xdg_config_home);
@@ -12979,9 +13109,9 @@ async fn builtin_command_wins_over_same_named_custom_command_even_with_unrecogni
 /// responsive state.
 #[tokio::test]
 async fn memory_command_suspends_tui_and_opens_project_memory_file_in_scripted_editor() {
+    use std::os::unix::fs::PermissionsExt;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use std::os::unix::fs::PermissionsExt;
 
     let mock_server = MockServer::start().await;
 
@@ -13051,7 +13181,12 @@ async fn memory_command_suspends_tui_and_opens_project_memory_file_in_scripted_e
     cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
     cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
     cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
-    cmd.env("EDITOR", editor_script_path.to_str().expect("script path should be valid utf-8"));
+    cmd.env(
+        "EDITOR",
+        editor_script_path
+            .to_str()
+            .expect("script path should be valid utf-8"),
+    );
     cmd.cwd(&project_dir);
 
     let mut child = pair
@@ -13618,8 +13753,7 @@ async fn project_scope_command_containing_bang_prefixed_syntax_expands_to_inert_
     let home = unique_temp_dir("home-bang-prefix-trust-boundary");
     let xdg_config_home = unique_temp_dir("xdg-config-home-bang-prefix-trust-boundary");
     let project_dir = unique_temp_dir("bang-prefix-trust-boundary-project");
-    let marker_path =
-        unique_temp_dir("bang-marker-parent").join("should-never-be-created.marker");
+    let marker_path = unique_temp_dir("bang-marker-parent").join("should-never-be-created.marker");
 
     let project_commands_dir = project_dir.join(".rokr").join("commands");
     std::fs::create_dir_all(&project_commands_dir)
@@ -14472,8 +14606,8 @@ async fn second_gated_call_to_same_tool_after_remember_choice_never_reprompts() 
 /// successfully -- proving the tool actually ran (auto-approved), not that
 /// the calls silently failed or hung.
 #[tokio::test]
-async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populate_the_permission_prompt_queue()
- {
+async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populate_the_permission_prompt_queue(
+) {
     #[derive(Debug)]
     struct AcceptanceStubError;
 
@@ -14531,7 +14665,9 @@ async fn concurrent_subagents_under_session_wide_auto_accept_grant_never_populat
             &'a self,
             _input: serde_json::Value,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<Output = Result<String, rokr_tools::ToolError>> + Send + 'a,
+            >,
         > {
             Box::pin(async move { Ok("executed".to_string()) })
         }
@@ -15189,7 +15325,11 @@ async fn git_context_segment_appears_in_system_prompt_inside_a_repo() {
     git(&["config", "user.name", "Test"]);
     std::fs::write(project_dir.join("a.txt"), "hello").unwrap();
     git(&["add", "a.txt"]);
-    git(&["commit", "-m", "DistinctiveGitContextCommitSubjectForTesting"]);
+    git(&[
+        "commit",
+        "-m",
+        "DistinctiveGitContextCommitSubjectForTesting",
+    ]);
     std::fs::write(project_dir.join("untracked.txt"), "dirty").unwrap();
 
     let pty_system = native_pty_system();
@@ -15428,7 +15568,12 @@ async fn commit_command_commits_exactly_the_candidate_paths_with_conventional_co
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("failed to open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
@@ -15442,39 +15587,67 @@ async fn commit_command_commits_exactly_the_candidate_paths_with_conventional_co
     cmd.arg("--agent");
     cmd.arg("build");
 
-    let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty");
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader");
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => { if tx.send(buf[..n].to_vec()).is_err() { break; } }
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
     });
 
-    let mut writer = pair.master.take_writer().expect("failed to take pty writer");
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
 
     let mut output = String::new();
     let render_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < render_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("Header") && output.contains("View") && output.contains("Prompt") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(output.contains("Header"), "expected pty output to contain Header, got: {output:?}");
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
 
-    writer.write_all(b"writeagenttouchedfile\r").expect("failed to write prompt to pty");
+    writer
+        .write_all(b"writeagenttouchedfile\r")
+        .expect("failed to write prompt to pty");
 
     let prompt_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < prompt_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("-preimagebeforeagentwrite") && output.contains("+postimageafteragentwrite") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("-preimagebeforeagentwrite")
+            && output.contains("+postimageafteragentwrite")
+        {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15482,12 +15655,18 @@ async fn commit_command_commits_exactly_the_candidate_paths_with_conventional_co
         "expected pty output to contain the write tool's diff, got: {output:?}"
     );
 
-    writer.write_all(b"y").expect("failed to write accept keypress to pty");
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
 
     let response_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < response_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains(final_reply_text) { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15496,12 +15675,18 @@ async fn commit_command_commits_exactly_the_candidate_paths_with_conventional_co
          got: {output:?}"
     );
 
-    writer.write_all(b"/commit\r").expect("failed to write /commit to pty");
+    writer
+        .write_all(b"/commit\r")
+        .expect("failed to write /commit to pty");
 
     let commit_prompt_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < commit_prompt_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("agent-touched.txt") && output.contains("chore:") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("agent-touched.txt") && output.contains("chore:") {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15514,12 +15699,18 @@ async fn commit_command_commits_exactly_the_candidate_paths_with_conventional_co
          message, got: {output:?}"
     );
 
-    writer.write_all(b"y").expect("failed to write accept keypress for /commit to pty");
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for /commit to pty");
 
     let committed_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < committed_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("Committed") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Committed") {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15530,24 +15721,32 @@ async fn commit_command_commits_exactly_the_candidate_paths_with_conventional_co
     writer.write_all(b"q").expect("failed to write q to pty");
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
-        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") { break status; }
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
         if Instant::now() > exit_deadline {
             let _ = child.kill();
             panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let log_output = std::process::Command::new("git")
         .args(["log", "--pretty=%s"])
         .current_dir(&project_dir)
         .output()
         .expect("git log should spawn");
-    let subjects: Vec<String> =
-        String::from_utf8_lossy(&log_output.stdout).lines().map(|l| l.to_string()).collect();
+    let subjects: Vec<String> = String::from_utf8_lossy(&log_output.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
     assert_eq!(
-        subjects.len(), 2,
+        subjects.len(),
+        2,
         "expected exactly one new commit beyond the initial commit, got subjects: {subjects:?}"
     );
     assert!(
@@ -15620,7 +15819,11 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
 
     // A file staged BEFORE rokr's session starts -- never touched by rokr,
     // so it will never appear in the candidate set.
-    std::fs::write(project_dir.join("stale-staged.txt"), "staged before session").unwrap();
+    std::fs::write(
+        project_dir.join("stale-staged.txt"),
+        "staged before session",
+    )
+    .unwrap();
     git(&["add", "stale-staged.txt"]);
 
     let target_file = project_dir.join("agent-touched.txt");
@@ -15683,7 +15886,12 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("failed to open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
@@ -15697,39 +15905,67 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
     cmd.arg("--agent");
     cmd.arg("build");
 
-    let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty");
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader");
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => { if tx.send(buf[..n].to_vec()).is_err() { break; } }
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
     });
 
-    let mut writer = pair.master.take_writer().expect("failed to take pty writer");
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
 
     let mut output = String::new();
     let render_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < render_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("Header") && output.contains("View") && output.contains("Prompt") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(output.contains("Header"), "expected pty output to contain Header, got: {output:?}");
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
 
-    writer.write_all(b"writeagenttouchedfile\r").expect("failed to write prompt to pty");
+    writer
+        .write_all(b"writeagenttouchedfile\r")
+        .expect("failed to write prompt to pty");
 
     let prompt_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < prompt_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("-preimagebeforeagentwrite") && output.contains("+postimageafteragentwrite") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("-preimagebeforeagentwrite")
+            && output.contains("+postimageafteragentwrite")
+        {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15737,12 +15973,18 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
         "expected pty output to contain the write tool's diff, got: {output:?}"
     );
 
-    writer.write_all(b"y").expect("failed to write accept keypress to pty");
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
 
     let response_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < response_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains(final_reply_text) { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15751,12 +15993,18 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
          got: {output:?}"
     );
 
-    writer.write_all(b"/commit\r").expect("failed to write /commit to pty");
+    writer
+        .write_all(b"/commit\r")
+        .expect("failed to write /commit to pty");
 
     let commit_prompt_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < commit_prompt_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("warning:") && output.contains("stale-staged.txt") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("warning:") && output.contains("stale-staged.txt") {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15774,12 +16022,18 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
          alongside the warning, got: {output:?}"
     );
 
-    writer.write_all(b"y").expect("failed to write accept keypress for /commit to pty");
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for /commit to pty");
 
     let committed_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < committed_deadline {
-        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
-        if output.contains("Committed") { break; }
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Committed") {
+            break;
+        }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
@@ -15791,14 +16045,19 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
     writer.write_all(b"q").expect("failed to write q to pty");
     let exit_deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
-        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") { break status; }
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
         if Instant::now() > exit_deadline {
             let _ = child.kill();
             panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
         }
         thread::sleep(Duration::from_millis(50));
     };
-    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
 
     let show_output = std::process::Command::new("git")
         .args(["show", "--name-only", "--pretty=format:", "HEAD"])
@@ -15837,4 +16096,616 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&xdg_data_home);
     let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// Ticket 80 (pr-command): resolves the ABSOLUTE path to the real `git`
+/// binary via the ambient `PATH` at test-run time (`which git`) -- used to
+/// build PATH-shim directories below that stay independent of whatever
+/// `gh` install state the machine running this suite happens to have.
+fn real_git_binary_path() -> PathBuf {
+    let output = std::process::Command::new("which")
+        .arg("git")
+        .output()
+        .expect("`which` should spawn");
+    assert!(
+        output.status.success(),
+        "`which git` should find a real git binary on this machine"
+    );
+    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// Ticket 80 (pr-command): builds a temp directory containing ONLY a
+/// symlink to the real `git` binary. Setting a spawned `rokr` process's
+/// `PATH` to EXACTLY this directory (not appended to the ambient `PATH`)
+/// guarantees `gh` is unresolvable regardless of whether the machine
+/// running this suite has a real `gh` installed -- a deterministic "gh
+/// truly absent" environment, not a hope about CI/dev machine state.
+fn path_shim_without_gh() -> PathBuf {
+    let shim_dir = unique_temp_dir("pr-command-path-shim-no-gh");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(real_git_binary_path(), shim_dir.join("git"))
+        .expect("failed to symlink git into PATH shim dir");
+    shim_dir
+}
+
+/// Ticket 80 (pr-command): the fixed fake PR URL the `gh` stub script
+/// (below) prints on success -- distinctive enough it can't plausibly
+/// appear in rendered TUI chrome by accident.
+const FAKE_GH_PR_URL: &str = "https://github.com/example/fake-repo/pull/42";
+
+/// Ticket 80 (pr-command): same PATH-shim mechanism as
+/// `path_shim_without_gh`, but the shim directory ALSO contains a `gh`
+/// stub -- a plain, hand-written shell script (not a compiled fixture
+/// binary; this ticket's chosen mechanism so no new Cargo.toml [[bin]]
+/// target or fixture crate is needed) that recognizes exactly the `pr
+/// create --title <t> --body <b>` invocation shape `gh.rs`'s `create_pr`
+/// makes and always succeeds, printing `FAKE_GH_PR_URL` to stdout -- so the
+/// stubbed-gh acceptance test below proves `/pr` actually reaches and
+/// invokes `gh`, without ever touching the network or creating a real PR.
+fn path_shim_with_stubbed_gh() -> PathBuf {
+    let shim_dir = unique_temp_dir("pr-command-path-shim-stubbed-gh");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(real_git_binary_path(), shim_dir.join("git"))
+        .expect("failed to symlink git into PATH shim dir");
+    let gh_stub_path = shim_dir.join("gh");
+    std::fs::write(
+        &gh_stub_path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then\n  echo \"{FAKE_GH_PR_URL}\"\n  exit 0\nfi\nexit 1\n"
+        ),
+    )
+    .expect("failed to write gh stub script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&gh_stub_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&gh_stub_path, perms).unwrap();
+    }
+    shim_dir
+}
+
+/// Ticket 80 (pr-command) acceptance test: on a protected branch (`main`),
+/// `/pr` must refuse outright rather than silently opening a PR against no
+/// sensible base, and instead offer to create a new branch (a single
+/// confirmation).
+#[tokio::test]
+async fn pr_command_on_main_refuses_and_offers_branch_creation() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    let project_dir = unique_temp_dir("pr-command-main-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("tracked.txt"), "initial content").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    let short_sha_output = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("git rev-parse should spawn");
+    let short_sha = String::from_utf8_lossy(&short_sha_output.stdout)
+        .trim()
+        .to_string();
+    let expected_suggested_branch = format!("pr/{short_sha}");
+
+    let home = unique_temp_dir("home-pr-command-main");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-pr-command-main");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-pr-command-main");
+    let path_shim = path_shim_without_gh();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("PATH", &path_shim);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/pr\r")
+        .expect("failed to write /pr to pty");
+
+    let refusal_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < refusal_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(&expected_suggested_branch) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("main"),
+        "expected /pr's refusal prompt to mention the protected branch 'main', got: {output:?}"
+    );
+    assert!(
+        output.contains(&expected_suggested_branch),
+        "expected /pr's refusal prompt to offer the suggested branch name {expected_suggested_branch:?}, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let created_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < created_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Created") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Created"),
+        "expected /pr to report the new branch was created after accepting, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let branch_output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("git rev-parse should spawn");
+    let branch = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
+    assert_eq!(
+        branch, expected_suggested_branch,
+        "expected the repo to actually be checked out onto the newly created branch"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let _ = std::fs::remove_dir_all(&path_shim);
+}
+
+/// Ticket 80 (pr-command) acceptance test: on a feature branch with `gh`
+/// stubbed (see `path_shim_with_stubbed_gh`), `/pr` drafts a title/body
+/// from the commits since the branch's merge-base with `main`, shows both
+/// in the confirmation prompt, and -- once approved -- actually invokes
+/// `gh pr create`, reporting the URL the (stubbed) `gh` printed back.
+#[tokio::test]
+async fn pr_command_drafts_and_confirms_pr_on_feature_branch_with_gh_stubbed() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    let project_dir = unique_temp_dir("pr-command-feature-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("tracked.txt"), "initial content").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+    git(&["checkout", "-b", "feature-branch-for-pr-test"]);
+    std::fs::write(project_dir.join("feature-one.txt"), "one").unwrap();
+    git(&["add", "feature-one.txt"]);
+    git(&[
+        "commit",
+        "-m",
+        "DistinctiveFeatureCommitSubjectOneForPrTest",
+    ]);
+    std::fs::write(project_dir.join("feature-two.txt"), "two").unwrap();
+    git(&["add", "feature-two.txt"]);
+    git(&[
+        "commit",
+        "-m",
+        "DistinctiveFeatureCommitSubjectTwoForPrTest",
+    ]);
+
+    let home = unique_temp_dir("home-pr-command-feature");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-pr-command-feature");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-pr-command-feature");
+    let path_shim = path_shim_with_stubbed_gh();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("PATH", &path_shim);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/pr\r")
+        .expect("failed to write /pr to pty");
+
+    let confirm_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < confirm_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("DistinctiveFeatureCommitSubjectOneForPrTest")
+            && output.contains("DistinctiveFeatureCommitSubjectTwoForPrTest")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("DistinctiveFeatureCommitSubjectOneForPrTest"),
+        "expected /pr's confirmation prompt to draft a title from the first commit since \
+         merge-base, got: {output:?}"
+    );
+    assert!(
+        output.contains("DistinctiveFeatureCommitSubjectTwoForPrTest"),
+        "expected /pr's confirmation prompt to draft a body listing every commit since \
+         merge-base, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let created_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < created_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(FAKE_GH_PR_URL) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(FAKE_GH_PR_URL),
+        "expected /pr to report the URL the stubbed gh printed after approval, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let _ = std::fs::remove_dir_all(&path_shim);
+}
+
+/// Ticket 80 (pr-command) acceptance test: with `gh` entirely absent from
+/// `PATH` (see `path_shim_without_gh`), `/pr` still drafts and confirms a
+/// title/body from real commits, then -- once approved -- must print the
+/// drafted title/body plus the EXACT manual `gh pr create` command the
+/// user can run themselves, exiting gracefully rather than crashing.
+#[tokio::test]
+async fn pr_command_with_gh_absent_prints_manual_fallback() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    let project_dir = unique_temp_dir("pr-command-gh-absent-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("tracked.txt"), "initial content").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+    git(&["checkout", "-b", "feature-branch-gh-absent"]);
+    std::fs::write(project_dir.join("feature-only.txt"), "content").unwrap();
+    git(&["add", "feature-only.txt"]);
+    git(&["commit", "-m", "DistinctiveGhAbsentCommitSubjectForPrTest"]);
+
+    let home = unique_temp_dir("home-pr-command-gh-absent");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-pr-command-gh-absent");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-pr-command-gh-absent");
+    let path_shim = path_shim_without_gh();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("PATH", &path_shim);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"/pr\r")
+        .expect("failed to write /pr to pty");
+
+    let confirm_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < confirm_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("DistinctiveGhAbsentCommitSubjectForPrTest") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("DistinctiveGhAbsentCommitSubjectForPrTest"),
+        "expected /pr's confirmation prompt to draft a title from the commit since merge-base \
+         even with gh absent, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress to pty");
+
+    let fallback_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < fallback_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("installed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("installed"),
+        "expected /pr to report gh as not installed rather than crash, got: {output:?}"
+    );
+    assert!(
+        output.contains("--title"),
+        "expected /pr to print the exact manual gh pr create invocation (--title flag) as a fallback, got: {output:?}"
+    );
+    assert!(
+        output.contains("DistinctiveGhAbsentCommitSubjectForPrTest"),
+        "expected /pr's manual-fallback output to still include the drafted title/body, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly (not crash) after gh-absent fallback, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+    let _ = std::fs::remove_dir_all(&path_shim);
 }
