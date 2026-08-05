@@ -16709,3 +16709,453 @@ async fn pr_command_with_gh_absent_prints_manual_fallback() {
     let _ = std::fs::remove_dir_all(&project_dir);
     let _ = std::fs::remove_dir_all(&path_shim);
 }
+
+/// Ticket 81 (pre-edit-divergence-note) acceptance test: closely modeled on
+/// `edit_tool_call_renders_partial_diff_and_applies_on_accept` above, but the
+/// target file is hand-dirtied (an uncommitted change diverging from HEAD,
+/// standing in for a user editing the file by hand mid-session) BEFORE the
+/// agent's own `edit` tool call. The diff-review permission prompt must
+/// carry a one-line divergence note in addition to the usual diff.
+#[tokio::test]
+async fn edit_permission_prompt_shows_divergence_note_for_user_dirtied_file() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let final_reply_text = "FinalReplyAfterDivergenceNoteRejectForTesting";
+
+    let project_dir = unique_temp_dir("divergence-note-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    let target_file = project_dir.join("tracked.txt");
+    std::fs::write(&target_file, "headcontentvalue\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    // Hand-dirty the tracked file AFTER the commit, uncommitted -- this is
+    // the "user separately edited by hand mid-session" case (PRD
+    // "Divergence safety"), never through rokr's own write/edit tools.
+    // Single-token values throughout (no spaces): ratatui only redraws
+    // cells that actually changed, so a multi-word phrase's raw ANSI byte
+    // stream can have cursor-jump gaps where a space cell was already
+    // blank and thus never rewritten -- a literal substring match on the
+    // raw pty bytes would then spuriously fail even though the rendered
+    // screen is correct (see `agents_md_content_appears_in_outgoing_system_prompt`'s
+    // doc comment above for the same convention).
+    std::fs::write(&target_file, "userdirtiedvalue\n").unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+    let old_str = "userdirtiedvalue";
+    let new_str = "agentreplacedvalue";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-divergence-note",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "edit",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "old_str": old_str,
+                                        "new_str": new_str
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-divergence-note-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": final_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-divergence-note");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-divergence-note");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"editthedirtiedfile\r")
+        .expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("-userdirtiedvalue") && output.contains("+agentreplacedvalue") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("-userdirtiedvalue"),
+        "expected pty output to contain the edit tool's diff, got: {output:?}"
+    );
+    assert!(
+        output.contains("diverges"),
+        "expected the permission prompt to carry a one-line divergence note for a \
+         user-dirtied file, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"n")
+        .expect("failed to write reject keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after rejecting the edit, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// Ticket 81 (pre-edit-divergence-note) acceptance test: the converse of
+/// `edit_permission_prompt_shows_divergence_note_for_user_dirtied_file`
+/// above -- the target file is UNTOUCHED since the initial commit (no
+/// hand-edit, no divergence from HEAD), so the diff-review permission
+/// prompt must show the usual diff with NO divergence note.
+#[tokio::test]
+async fn edit_permission_prompt_shows_no_note_for_clean_file() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let final_reply_text = "FinalReplyAfterCleanFileRejectForTesting";
+
+    let project_dir = unique_temp_dir("clean-file-note-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    let target_file = project_dir.join("tracked.txt");
+    std::fs::write(&target_file, "headcontentvalue\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    // NOT dirtied -- the file on disk still matches HEAD exactly.
+    let target_path = target_file.to_string_lossy().into_owned();
+    let old_str = "headcontentvalue";
+    let new_str = "agenteditedvalue";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-clean-file-note",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "edit",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "old_str": old_str,
+                                        "new_str": new_str
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-clean-file-note-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": final_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-clean-file-note");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-clean-file-note");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"editthecleanfile\r")
+        .expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("-headcontentvalue") && output.contains("+agenteditedvalue") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("-headcontentvalue"),
+        "expected pty output to contain the edit tool's diff, got: {output:?}"
+    );
+    assert!(
+        !output.contains("diverges"),
+        "expected NO divergence note for a clean file that matches HEAD, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"n")
+        .expect("failed to write reject keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after rejecting the edit, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}

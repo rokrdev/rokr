@@ -239,6 +239,66 @@ pub fn create_branch(cwd: &Path, name: &str) -> Result<(), String> {
     }
 }
 
+/// Resolves `path` (as supplied on a `PermissionPayload::Diff`, which may be
+/// absolute or relative -- see `runner.rs`'s `pre_edit_divergence_note`) to a
+/// path relative to `cwd`'s repo root, suitable for a `git show HEAD:<path>`
+/// pathspec. Canonicalizes BOTH sides before stripping the prefix when
+/// `path` is absolute -- mirrors `WriteTool::new`'s doc comment on why
+/// (macOS's `/var` -> `/private/var` symlink resolution means a raw,
+/// non-canonical absolute path and a canonical `cwd` otherwise fail to
+/// share a common prefix even when they name the same file). `None` if
+/// `path` can't be resolved onto `cwd` at all (e.g. it names a file outside
+/// the repo, or neither side exists on disk yet).
+fn to_repo_relative_pathspec(cwd: &Path, path: &str) -> Option<String> {
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        return Some(candidate.to_string_lossy().replace('\\', "/"));
+    }
+    let canonical_cwd = std::fs::canonicalize(cwd).ok()?;
+    let canonical_path = std::fs::canonicalize(candidate).ok()?;
+    let relative = canonical_path.strip_prefix(&canonical_cwd).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// The file's content at `HEAD:<path>` in the repo at `cwd`, or `None` when
+/// `cwd` isn't inside a git work tree, `path` can't be made repo-relative,
+/// or the path simply doesn't exist at `HEAD` yet (e.g. a brand-new,
+/// untracked file) -- all three collapse into "nothing to compare against".
+///
+/// Deliberately does NOT go through `run_git` here: `run_git`'s blanket
+/// `.trim()` is right for the branch names/log subjects/etc. every other
+/// caller uses it for, but wrong for a file's actual byte content -- it
+/// would silently strip a trailing newline that `std::fs::read_to_string`
+/// (the pre-image side of this comparison, see
+/// `pre_image_diverges_from_head`) does NOT strip, making an untouched,
+/// byte-identical file look like it diverges from `HEAD`.
+fn head_content_at_path(cwd: &Path, path: &str) -> Option<String> {
+    let relative = to_repo_relative_pathspec(cwd, path)?;
+    let output = Command::new("git")
+        .args(["show", &format!("HEAD:{relative}")])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Ticket 81 (pre-edit-divergence-note): true if `pre_image` (the file's
+/// full on-disk content just before a write/edit permission decision)
+/// differs from its content at `HEAD` in the repo at `cwd` -- signals "this
+/// file changed by a path rokr doesn't know about" (PRD "Divergence
+/// safety") without blocking the write. Never flags when there's nothing to
+/// compare against (outside a git repo, or a file that doesn't exist at
+/// `HEAD` yet -- a brand-new file has nothing to diverge from).
+pub fn pre_image_diverges_from_head(cwd: &Path, path: &str, pre_image: &str) -> bool {
+    match head_content_at_path(cwd, path) {
+        Some(head_content) => head_content != pre_image,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +564,33 @@ mod tests {
         commit(dir.path(), "a.txt", "hello", "initial commit");
 
         assert_eq!(default_base_branch(dir.path()), "main");
+    }
+
+    #[test]
+    fn pre_image_diverging_from_head_is_detected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello from HEAD", "initial commit");
+
+        let diverges = pre_image_diverges_from_head(dir.path(), "a.txt", "hello from a user edit");
+
+        assert!(
+            diverges,
+            "expected a pre-image differing from HEAD's content to be flagged as diverging"
+        );
+    }
+
+    #[test]
+    fn pre_image_matching_head_is_not_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello from HEAD", "initial commit");
+
+        let diverges = pre_image_diverges_from_head(dir.path(), "a.txt", "hello from HEAD");
+
+        assert!(
+            !diverges,
+            "expected a pre-image matching HEAD's content to not be flagged as diverging"
+        );
     }
 }

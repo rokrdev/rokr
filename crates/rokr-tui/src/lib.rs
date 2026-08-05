@@ -110,8 +110,16 @@ pub enum PermissionDetail {
     /// A single free-form description, e.g. the shell command for `bash`.
     Text(String),
     /// Old/new content for a `write`-style change, rendered as a
-    /// line-level diff.
-    Diff { old: String, new: String },
+    /// line-level diff. `note` (ticket 81, pre-edit-divergence-note): an
+    /// optional one-line warning rendered after the diff, when the file's
+    /// pre-image diverges from `HEAD` by a path outside this session (e.g.
+    /// the user hand-edited it mid-session) -- `None` for a clean file.
+    /// Never blocks the write either way (PRD "Divergence safety").
+    Diff {
+        old: String,
+        new: String,
+        note: Option<String>,
+    },
 }
 
 /// The user's decision on a [`PermissionRequest`], round-tripped back out of
@@ -295,17 +303,25 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
                     cap_text_to_rows(text, width, detail_height, |t| format!("{prefix}{t}\""));
                 (vec![format!("{prefix}{capped}\"")], detail_height)
             }
-            PermissionDetail::Diff { old, new } => {
+            PermissionDetail::Diff { old, new, note } => {
                 let mut lines = vec![format!("permission needed: {}", request.tool_name)];
                 lines.extend(truncate_diff(diff_lines(old, new)));
-                let needed: u16 =
-                    lines.iter().map(|line| wrapped_row_count(line, width)).sum();
+                if let Some(note) = note {
+                    lines.push(note.clone());
+                }
+                let needed: u16 = lines
+                    .iter()
+                    .map(|line| wrapped_row_count(line, width))
+                    .sum();
                 (lines, needed.min(remaining))
             }
         };
         let transcript_height = remaining.saturating_sub(detail_height);
 
-        let transcript_area = Rect { height: transcript_height, ..view_inner };
+        let transcript_area = Rect {
+            height: transcript_height,
+            ..view_inner
+        };
         let detail_area = Rect {
             y: view_inner.y + transcript_height,
             height: detail_height,
@@ -317,8 +333,11 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
             ..view_inner
         };
 
-        let transcript_total: u16 =
-            state.view_lines.iter().map(|line| wrapped_row_count(line, width)).sum();
+        let transcript_total: u16 = state
+            .view_lines
+            .iter()
+            .map(|line| wrapped_row_count(line, width))
+            .sum();
         let transcript_scroll = transcript_total.saturating_sub(transcript_height);
         let transcript = Paragraph::new(state.view_lines.join("\n"))
             .wrap(Wrap { trim: false })
@@ -413,7 +432,11 @@ fn status_line_text(state: &AppState) -> String {
     // context-percent text, not in place of it -- a notice (e.g. a failed
     // MCP server) is additional information, not a replacement for the
     // existing status line.
-    if let Some(notice) = state.session_status.as_ref().and_then(|s| s.notice.as_deref()) {
+    if let Some(notice) = state
+        .session_status
+        .as_ref()
+        .and_then(|s| s.notice.as_deref())
+    {
         text.push_str(" | ");
         text.push_str(notice);
     }
@@ -1188,7 +1211,12 @@ where
                         continue;
                     }
 
-                    if should_quit(key.code, key.modifiers, state.prompt_input.is_empty(), state.pending) {
+                    if should_quit(
+                        key.code,
+                        key.modifiers,
+                        state.prompt_input.is_empty(),
+                        state.pending,
+                    ) {
                         return Ok(());
                     }
 
@@ -1251,9 +1279,7 @@ where
                                         run_memory_command(state, &memory_path, terminal, guard)?;
                                     }
                                     Err(err) => {
-                                        state
-                                            .view_lines
-                                            .push(format!("/memory failed: {err}"));
+                                        state.view_lines.push(format!("/memory failed: {err}"));
                                     }
                                 }
                                 dirty = true;
@@ -1304,8 +1330,8 @@ where
                                         // applies is unambiguous by
                                         // construction, so `command` is only
                                         // even called in the `None` branch.
-                                        let submit_fut_if_custom =
-                                            resolve_custom_command(&input).map(|expanded| {
+                                        let submit_fut_if_custom = resolve_custom_command(&input)
+                                            .map(|expanded| {
                                                 let permission = PermissionHandle {
                                                     tx: perm_tx.clone(),
                                                 };
@@ -1411,7 +1437,12 @@ where
 /// from under a user who was mid-typing their next message, silently
 /// discarding it. Ctrl+C always quits as a hard escape hatch regardless of
 /// prompt content or pending state.
-fn should_quit(code: KeyCode, modifiers: KeyModifiers, prompt_is_empty: bool, pending: bool) -> bool {
+fn should_quit(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    prompt_is_empty: bool,
+    pending: bool,
+) -> bool {
     (matches!(code, KeyCode::Char('q')) && prompt_is_empty && !pending)
         || (matches!(code, KeyCode::Char('c')) && modifiers.contains(KeyModifiers::CONTROL))
 }
@@ -1778,8 +1809,9 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let area = buffer.area;
-        let rendered_rows: Vec<String> =
-            (area.y..area.y + area.height).map(|y| row_text(buffer, y)).collect();
+        let rendered_rows: Vec<String> = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect();
         let rendered = rendered_rows.join("\n");
 
         // The hint line must always be visible, in full, somewhere in the
@@ -1840,8 +1872,9 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let area = buffer.area;
-        let rendered_rows: Vec<String> =
-            (area.y..area.y + area.height).map(|y| row_text(buffer, y)).collect();
+        let rendered_rows: Vec<String> = (area.y..area.y + area.height)
+            .map(|y| row_text(buffer, y))
+            .collect();
         let rendered = rendered_rows.join("\n");
 
         assert!(
@@ -2189,7 +2222,12 @@ mod tests {
 
     #[test]
     fn should_quit_on_bare_q_when_prompt_empty_and_not_pending() {
-        assert!(should_quit(KeyCode::Char('q'), KeyModifiers::NONE, true, false));
+        assert!(should_quit(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            true,
+            false
+        ));
     }
 
     /// Regression test for the bug fixed here: a `q` keystroke arriving while a
@@ -2202,17 +2240,32 @@ mod tests {
     /// submitted.
     #[test]
     fn should_quit_does_not_fire_on_bare_q_while_pending() {
-        assert!(!should_quit(KeyCode::Char('q'), KeyModifiers::NONE, true, true));
+        assert!(!should_quit(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            true,
+            true
+        ));
     }
 
     #[test]
     fn should_quit_on_ctrl_c_even_while_pending() {
-        assert!(should_quit(KeyCode::Char('c'), KeyModifiers::CONTROL, true, true));
+        assert!(should_quit(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            true,
+            true
+        ));
     }
 
     #[test]
     fn should_quit_does_not_fire_on_q_when_prompt_not_empty() {
-        assert!(!should_quit(KeyCode::Char('q'), KeyModifiers::NONE, false, false));
+        assert!(!should_quit(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -2225,7 +2278,11 @@ mod tests {
 
     #[test]
     fn history_navigate_up_starts_walk_from_empty_prompt_at_most_recent_entry() {
-        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let history = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
         let result = history_navigate_up(&history, None, true);
         assert_eq!(result, Some((2, "third".to_string())));
     }
@@ -2239,7 +2296,11 @@ mod tests {
 
     #[test]
     fn history_navigate_up_walks_to_older_entry_when_already_navigating() {
-        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let history = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
         let result = history_navigate_up(&history, Some(2), false);
         assert_eq!(result, Some((1, "second".to_string())));
     }
@@ -2259,17 +2320,27 @@ mod tests {
 
     #[test]
     fn history_navigate_down_walks_to_newer_entry() {
-        let history = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let history = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
         assert_eq!(
             history_navigate_down(&history, Some(0)),
-            HistoryDown::Recall { index: 1, text: "second".to_string() }
+            HistoryDown::Recall {
+                index: 1,
+                text: "second".to_string()
+            }
         );
     }
 
     #[test]
     fn history_navigate_down_clears_to_empty_past_newest_entry() {
         let history = vec!["first".to_string(), "second".to_string()];
-        assert_eq!(history_navigate_down(&history, Some(1)), HistoryDown::ClearToEmpty);
+        assert_eq!(
+            history_navigate_down(&history, Some(1)),
+            HistoryDown::ClearToEmpty
+        );
     }
 
     /// Ticket 41 (multiline-input) acceptance-adjacent unit test: Shift+Enter
@@ -2287,7 +2358,10 @@ mod tests {
 
         let inserted = handle_enter_key(&mut state, KeyModifiers::SHIFT);
 
-        assert!(inserted, "expected Shift+Enter to insert a newline, not submit");
+        assert!(
+            inserted,
+            "expected Shift+Enter to insert a newline, not submit"
+        );
         assert_eq!(
             state.prompt_input, "line one\n",
             "expected the newline to be appended and the buffer preserved rather than cleared/submitted"
@@ -2296,14 +2370,23 @@ mod tests {
         // Alt+Enter must behave identically (both are treated as "insert a
         // newline" per the ticket).
         let inserted_alt = handle_enter_key(&mut state, KeyModifiers::ALT);
-        assert!(inserted_alt, "expected Alt+Enter to insert a newline, not submit");
+        assert!(
+            inserted_alt,
+            "expected Alt+Enter to insert a newline, not submit"
+        );
         assert_eq!(state.prompt_input, "line one\n\n");
 
         // A plain Enter (no ALT/SHIFT) must NOT be treated as a newline
         // insert -- that's the event loop's cue to submit instead.
         let inserted_plain = handle_enter_key(&mut state, KeyModifiers::NONE);
-        assert!(!inserted_plain, "expected plain Enter not to insert a newline");
-        assert_eq!(state.prompt_input, "line one\n\n", "plain Enter must not modify the buffer");
+        assert!(
+            !inserted_plain,
+            "expected plain Enter not to insert a newline"
+        );
+        assert_eq!(
+            state.prompt_input, "line one\n\n",
+            "plain Enter must not modify the buffer"
+        );
     }
 
     /// Ticket 42 (editor-integration) unit test: `edit_buffer_with_editor`
@@ -2328,8 +2411,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&script_dir).expect("failed to create script dir");
         let script_path = script_dir.join("fake_editor.sh");
-        std::fs::write(&script_path, "#!/bin/sh\nprintf '\\nedited by script\\n' >> \"$1\"\n")
-            .expect("failed to write fake editor script");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf '\\nedited by script\\n' >> \"$1\"\n",
+        )
+        .expect("failed to write fake editor script");
         let mut perms = std::fs::metadata(&script_path)
             .expect("failed to stat fake editor script")
             .permissions();
@@ -2339,7 +2425,9 @@ mod tests {
 
         let result = edit_buffer_with_editor(
             "original line",
-            script_path.to_str().expect("script path should be valid utf-8"),
+            script_path
+                .to_str()
+                .expect("script path should be valid utf-8"),
         )
         .expect("scripted editor should succeed");
 
@@ -2389,8 +2477,13 @@ mod tests {
         std::fs::set_permissions(&script_path, perms)
             .expect("failed to make permission-check editor script executable");
 
-        edit_buffer_with_editor("content", script_path.to_str().expect("script path should be valid utf-8"))
-            .expect("scripted editor should succeed");
+        edit_buffer_with_editor(
+            "content",
+            script_path
+                .to_str()
+                .expect("script path should be valid utf-8"),
+        )
+        .expect("scripted editor should succeed");
 
         let mode = std::fs::read_to_string(&marker_path)
             .expect("marker file should have been written by the script")
@@ -2440,7 +2533,9 @@ mod tests {
 
         let editor_command = format!(
             "{} \"hello world\"",
-            script_path.to_str().expect("script path should be valid utf-8")
+            script_path
+                .to_str()
+                .expect("script path should be valid utf-8")
         );
         let result = edit_buffer_with_editor("original", &editor_command)
             .expect("scripted editor with a quoted argument should succeed");
@@ -2463,7 +2558,10 @@ mod tests {
         assert_eq!(resolve_editor_command(None), "vi");
         assert_eq!(resolve_editor_command(Some(String::new())), "vi");
         assert_eq!(resolve_editor_command(Some("   ".to_string())), "vi");
-        assert_eq!(resolve_editor_command(Some("code --wait".to_string())), "code --wait");
+        assert_eq!(
+            resolve_editor_command(Some("code --wait".to_string())),
+            "code --wait"
+        );
     }
 
     /// Ticket 43 (mouse-scroll-status-line): mouse-wheel scroll adjusts
@@ -2524,11 +2622,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &state)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        let rendered: String = buffer
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
         assert!(
             rendered.contains("MCP server 'flaky' failed to start: boom"),
             "expected the notice text in the rendered header, got: {rendered}"

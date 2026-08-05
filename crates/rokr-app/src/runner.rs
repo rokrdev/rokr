@@ -338,13 +338,17 @@ impl SessionRunner {
                         rokr_core::PermissionPayload::Command(command) => {
                             (rokr_tui::PermissionDetail::Text(command), None)
                         }
-                        rokr_core::PermissionPayload::Diff { path, old, new } => (
-                            rokr_tui::PermissionDetail::Diff {
-                                old: old.clone(),
-                                new,
-                            },
-                            Some((path, old)),
-                        ),
+                        rokr_core::PermissionPayload::Diff { path, old, new } => {
+                            let note = pre_edit_divergence_note(&path);
+                            (
+                                rokr_tui::PermissionDetail::Diff {
+                                    old: old.clone(),
+                                    new,
+                                    note,
+                                },
+                                Some((path, old)),
+                            )
+                        }
                         rokr_core::PermissionPayload::ToolCall {
                             server,
                             tool,
@@ -470,13 +474,17 @@ impl SessionRunner {
                             rokr_core::PermissionPayload::Command(command) => {
                                 (rokr_tui::PermissionDetail::Text(command), None)
                             }
-                            rokr_core::PermissionPayload::Diff { path, old, new } => (
-                                rokr_tui::PermissionDetail::Diff {
-                                    old: old.clone(),
-                                    new,
-                                },
-                                Some((path, old)),
-                            ),
+                            rokr_core::PermissionPayload::Diff { path, old, new } => {
+                                let note = pre_edit_divergence_note(&path);
+                                (
+                                    rokr_tui::PermissionDetail::Diff {
+                                        old: old.clone(),
+                                        new,
+                                        note,
+                                    },
+                                    Some((path, old)),
+                                )
+                            }
                             rokr_core::PermissionPayload::ToolCall {
                                 server,
                                 tool,
@@ -1062,6 +1070,33 @@ pub fn format_tool_call_permission_text(
         text.push_str(&format!("\norigin: {origin}"));
     }
     text
+}
+
+/// Ticket 81 (pre-edit-divergence-note), PRD "Divergence safety": one-line
+/// note for the diff-review permission prompt when `path`'s CURRENT
+/// on-disk content diverges from its content at `HEAD` -- signals "this
+/// file changed by a path rokr doesn't know about" (e.g. the user
+/// hand-edited it mid-session) without blocking the write either way.
+///
+/// Deliberately re-reads `path` fresh from disk here rather than reusing
+/// the `old` field already captured on the `Diff` payload: for `write`,
+/// `old` IS the file's full pre-image, but for `edit` it's only the
+/// targeted `old_str` snippet (see `EditTool::diff_snippet`'s doc comment)
+/// -- comparing a snippet against `HEAD`'s full file content would be
+/// meaningless. A fresh full-file read is correct for both tools uniformly.
+///
+/// `None` (no note) whenever there's nothing to flag: the read fails (e.g.
+/// a brand-new file that doesn't exist yet), `path`'s cwd isn't a git
+/// repo, or the file's current content matches `HEAD` exactly (clean file
+/// -> no note).
+fn pre_edit_divergence_note(path: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let current_content = std::fs::read_to_string(path).ok()?;
+    if crate::git::pre_image_diverges_from_head(&cwd, path, &current_content) {
+        Some("Note: this file diverges from HEAD (changed outside this session).".to_string())
+    } else {
+        None
+    }
 }
 
 /// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management
