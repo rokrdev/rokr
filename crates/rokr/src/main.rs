@@ -872,7 +872,7 @@ async fn main() -> ExitCode {
             // `AnyProvider::from_name`, so an OAuth-only user (no
             // `ROKR_ANTHROPIC_API_KEY` env var) can still switch to
             // anthropic.
-            let command = move |input: String| {
+            let command = move |input: String, permission: rokr_tui::PermissionHandle| {
                 let provider = command_provider.clone();
                 let config_dir = command_config_dir.clone();
                 let transcript = command_transcript.clone();
@@ -1066,6 +1066,10 @@ async fn main() -> ExitCode {
                                 }
                             }
                         }
+                        "/commit" => {
+                            handle_commit_command(cwd.as_deref(), &data_dir, &session_handle, permission)
+                                .await
+                        }
                         "/mcp" => format_mcp_listing(&mcp_configs, &mcp_server_handles),
                         "/hooks" => format_hooks_listing(&hooks_config),
                         // Ticket 57: `/cost` folds the CURRENT session's own
@@ -1243,6 +1247,102 @@ fn mcp_reconnect_gate(status: &rokr_mcp::McpServerStatus) -> Result<(), &'static
     }
 }
 
+/// Ticket 79 (commit-command): drafts a minimal Conventional Commits
+/// message from `paths` -- deliberately simple (no diff-content-aware
+/// drafting; PRD "Out of Scope": no config key for commit-message style).
+/// `/commit`'s confirmation prompt shows this alongside the file list so the
+/// user reviews both before approving.
+fn draft_commit_message(paths: &[String]) -> String {
+    let commit_type = if !paths.is_empty() && paths.iter().all(|p| p.ends_with(".md")) {
+        "docs"
+    } else {
+        "chore"
+    };
+    let summary = match paths {
+        [] => "update repository".to_string(),
+        [only] => format!("update {only}"),
+        _ => format!("update {} files", paths.len()),
+    };
+    let file_list = paths.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n");
+    format!("{commit_type}: {summary}\n\n{file_list}")
+}
+
+/// Ticket 79 (commit-command): `/commit`'s handler. Bypasses
+/// `PermissionPolicy`/the read-only-git classifier/the sandbox entirely --
+/// same trusted, in-process authority `/compact` already has (both are
+/// user-invoked, not model-invoked). Candidate paths come from
+/// `rokr_app::commit_candidate_set::distinct_touched_paths` (ticket 78);
+/// confirmation reuses the existing permission surface
+/// (`rokr_tui::PermissionDetail::Text`), mirroring `skill_trust.rs`'s
+/// `InteractiveConsentResolver::resolve`.
+async fn handle_commit_command(
+    cwd: Option<&Path>,
+    data_dir: &Path,
+    session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
+    permission: rokr_tui::PermissionHandle,
+) -> String {
+    let Some(cwd) = cwd else {
+        return "/commit requires a git repository, but no working directory is available"
+            .to_string();
+    };
+
+    if rokr_app::git::snapshot(cwd).is_none() {
+        return format!("/commit requires a git repository; {} is not one", cwd.display());
+    }
+
+    let session_id = match session_handle.read().await.as_ref() {
+        Some(handle) => handle.session_id().to_string(),
+        None => return "cannot commit: no active session".to_string(),
+    };
+
+    let candidate_paths =
+        match rokr_app::commit_candidate_set::distinct_touched_paths(data_dir, &session_id) {
+            Ok(paths) => paths,
+            Err(err) => return format!("failed to read this session's touched paths: {err}"),
+        };
+
+    if candidate_paths.is_empty() {
+        return "nothing to commit from this session".to_string();
+    }
+
+    let staged = rokr_app::git::staged_paths(cwd);
+    let candidate_set: std::collections::BTreeSet<&str> =
+        candidate_paths.iter().map(String::as_str).collect();
+    let staged_set: std::collections::BTreeSet<&str> = staged.iter().map(String::as_str).collect();
+
+    let message = draft_commit_message(&candidate_paths);
+    let mut detail = String::new();
+    if !staged.is_empty() && staged_set != candidate_set {
+        detail.push_str(&format!(
+            "warning: already-staged files differ from this session's candidate set \
+             (staged: {}) -- committing the candidate set only\n\n",
+            staged.join(", ")
+        ));
+    }
+    detail.push_str(&format!(
+        "Files:\n{}\n\nMessage:\n{}",
+        candidate_paths.join("\n"),
+        message
+    ));
+
+    let decision = permission
+        .request(rokr_tui::PermissionRequest {
+            tool_name: "commit".to_string(),
+            detail: rokr_tui::PermissionDetail::Text(detail),
+        })
+        .await;
+
+    match decision {
+        rokr_tui::PermissionDecision::Allow | rokr_tui::PermissionDecision::AllowAndRemember => {
+            match rokr_app::git::commit(cwd, &candidate_paths, &message) {
+                Ok(()) => format!("Committed {} file(s).", candidate_paths.len()),
+                Err(err) => format!("commit failed: {err}"),
+            }
+        }
+        rokr_tui::PermissionDecision::Deny => "commit cancelled".to_string(),
+    }
+}
+
 /// F-004 (pre-ship review): the set of command NAMES (the token
 /// immediately after the leading `/`, before any arguments) that the
 /// `command` closure's match arms above claim, kept as a single explicit
@@ -1274,6 +1374,7 @@ fn is_builtin_command(name: &str) -> bool {
             | "sessions"
             | "compact"
             | "memory"
+            | "commit"
     )
 }
 
@@ -1289,7 +1390,7 @@ mod is_builtin_command_tests {
     fn recognizes_every_builtin_command_name() {
         for name in [
             "model", "resume", "rollback", "search", "mcp", "hooks", "cost", "sessions",
-            "compact", "memory",
+            "compact", "memory", "commit",
         ] {
             assert!(
                 is_builtin_command(name),

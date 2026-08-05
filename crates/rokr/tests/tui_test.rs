@@ -15334,3 +15334,507 @@ async fn git_context_segment_appears_in_system_prompt_inside_a_repo() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+/// Ticket 79 (commit-command) acceptance test: a scripted TUI session where
+/// the model writes to a real file this session (mirroring
+/// `write_tool_call_captures_pre_image_snapshot_and_appends_checkpoint_record`'s
+/// exact write/diff/accept sequence, which is what populates the checkpoint
+/// manifest `CommitCandidateSet::distinct_touched_paths` reads from), then
+/// the user runs `/commit` and approves. `git log`/`git show` verify the
+/// resulting commit contains EXACTLY the candidate path (not the
+/// pre-existing tracked file from the initial commit), a Conventional
+/// Commits message, and no Co-Authored-By line ever.
+#[tokio::test]
+async fn commit_command_commits_exactly_the_candidate_paths_with_conventional_commits_message() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let final_reply_text = "FinalReplyAfterCommitWriteForTesting";
+
+    let project_dir = unique_temp_dir("commit-command-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("tracked.txt"), "already committed").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    let target_file = project_dir.join("agent-touched.txt");
+    let old_content = "preimagebeforeagentwrite";
+    let new_content = "postimageafteragentwrite";
+    std::fs::write(&target_file, old_content).unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-commit-command-write",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": new_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-commit-command-write-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": final_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-commit-command");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-commit-command");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-commit-command");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => { if tx.send(buf[..n].to_vec()).is_err() { break; } }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(output.contains("Header"), "expected pty output to contain Header, got: {output:?}");
+
+    writer.write_all(b"writeagenttouchedfile\r").expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("-preimagebeforeagentwrite") && output.contains("+postimageafteragentwrite") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("-preimagebeforeagentwrite"),
+        "expected pty output to contain the write tool's diff, got: {output:?}"
+    );
+
+    writer.write_all(b"y").expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains(final_reply_text) { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the write, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"/commit\r").expect("failed to write /commit to pty");
+
+    let commit_prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < commit_prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("agent-touched.txt") && output.contains("chore:") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("agent-touched.txt"),
+        "expected the /commit confirmation prompt to list the candidate file, got: {output:?}"
+    );
+    assert!(
+        output.contains("chore:"),
+        "expected the /commit confirmation prompt to show a drafted Conventional Commits \
+         message, got: {output:?}"
+    );
+
+    writer.write_all(b"y").expect("failed to write accept keypress for /commit to pty");
+
+    let committed_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < committed_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("Committed") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Committed"),
+        "expected /commit to report success after being approved, got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") { break status; }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let log_output = std::process::Command::new("git")
+        .args(["log", "--pretty=%s"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("git log should spawn");
+    let subjects: Vec<String> =
+        String::from_utf8_lossy(&log_output.stdout).lines().map(|l| l.to_string()).collect();
+    assert_eq!(
+        subjects.len(), 2,
+        "expected exactly one new commit beyond the initial commit, got subjects: {subjects:?}"
+    );
+    assert!(
+        subjects[0].starts_with("chore:"),
+        "expected the new commit's subject to be a Conventional Commits message, got: {:?}",
+        subjects[0]
+    );
+
+    let show_output = std::process::Command::new("git")
+        .args(["show", "--name-only", "--pretty=format:", "HEAD"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("git show should spawn");
+    let committed_files: Vec<String> = String::from_utf8_lossy(&show_output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    assert_eq!(
+        committed_files,
+        vec!["agent-touched.txt".to_string()],
+        "expected the new commit to contain EXACTLY the candidate path, not tracked.txt"
+    );
+
+    let full_message_output = std::process::Command::new("git")
+        .args(["log", "-1", "--pretty=%B"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("git log should spawn");
+    let full_message = String::from_utf8_lossy(&full_message_output.stdout).to_string();
+    assert!(
+        !full_message.to_ascii_lowercase().contains("co-authored-by"),
+        "expected the commit message to never contain a Co-Authored-By line, got: {full_message:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// Ticket 79 (commit-command) acceptance test: a file staged BEFORE this
+/// session (via a plain `git add`, standing in for a stale `git add` from
+/// before rokr started) that is NOT part of this session's candidate set
+/// must produce a warning in `/commit`'s confirmation prompt, but must NOT
+/// block the commit, and must NOT itself end up in the resulting commit.
+#[tokio::test]
+async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let final_reply_text = "MismatchWriteReplyDone";
+
+    let project_dir = unique_temp_dir("commit-command-mismatch-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("tracked.txt"), "already committed").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    // A file staged BEFORE rokr's session starts -- never touched by rokr,
+    // so it will never appear in the candidate set.
+    std::fs::write(project_dir.join("stale-staged.txt"), "staged before session").unwrap();
+    git(&["add", "stale-staged.txt"]);
+
+    let target_file = project_dir.join("agent-touched.txt");
+    let old_content = "preimagebeforeagentwrite";
+    let new_content = "postimageafteragentwrite";
+    std::fs::write(&target_file, old_content).unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-commit-command-mismatch-write",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": new_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-commit-command-mismatch-write-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": final_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-commit-command-mismatch");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-commit-command-mismatch");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-commit-command-mismatch");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => { if tx.send(buf[..n].to_vec()).is_err() { break; } }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(output.contains("Header"), "expected pty output to contain Header, got: {output:?}");
+
+    writer.write_all(b"writeagenttouchedfile\r").expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("-preimagebeforeagentwrite") && output.contains("+postimageafteragentwrite") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("-preimagebeforeagentwrite"),
+        "expected pty output to contain the write tool's diff, got: {output:?}"
+    );
+
+    writer.write_all(b"y").expect("failed to write accept keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains(final_reply_text) { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after accepting the write, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"/commit\r").expect("failed to write /commit to pty");
+
+    let commit_prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < commit_prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("warning:") && output.contains("stale-staged.txt") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("warning:"),
+        "expected /commit's confirmation prompt to warn about the pre-staged mismatch, \
+         got: {output:?}"
+    );
+    assert!(
+        output.contains("stale-staged.txt"),
+        "expected the mismatch warning to name the pre-staged file, got: {output:?}"
+    );
+    assert!(
+        output.contains("agent-touched.txt"),
+        "expected the /commit confirmation prompt to still list the real candidate file \
+         alongside the warning, got: {output:?}"
+    );
+
+    writer.write_all(b"y").expect("failed to write accept keypress for /commit to pty");
+
+    let committed_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < committed_deadline {
+        while let Ok(chunk) = rx.try_recv() { output.push_str(&String::from_utf8_lossy(&chunk)); }
+        if output.contains("Committed") { break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Committed"),
+        "expected /commit to report success (the warning must not block the commit), \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") { break status; }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "expected rokr to exit cleanly after q, got status: {status:?}");
+
+    let show_output = std::process::Command::new("git")
+        .args(["show", "--name-only", "--pretty=format:", "HEAD"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("git show should spawn");
+    let committed_files: Vec<String> = String::from_utf8_lossy(&show_output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    assert_eq!(
+        committed_files,
+        vec!["agent-touched.txt".to_string()],
+        "expected the new commit to contain EXACTLY the candidate path, never the pre-staged \
+         mismatch file"
+    );
+
+    let staged_output = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("git diff --cached should spawn");
+    let still_staged: Vec<String> = String::from_utf8_lossy(&staged_output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    assert_eq!(
+        still_staged,
+        vec!["stale-staged.txt".to_string()],
+        "expected the pre-staged mismatch file to remain staged and uncommitted afterward"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}

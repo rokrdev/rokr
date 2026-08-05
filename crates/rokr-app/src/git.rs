@@ -112,6 +112,76 @@ pub fn snapshot(cwd: &Path) -> Option<GitContext> {
     })
 }
 
+/// Error returned by [`commit`]. `CoAuthorNotAllowed` is a HARD RULE
+/// (ticket 79): enforced here in code, not just in the message-drafting
+/// prompt wording, so a hand-edited message smuggling a Co-Authored-By
+/// trailer past drafting still can't reach a real `git commit` invocation.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CommitError {
+    #[error("commit message must not contain a Co-Authored-By line or other agent attribution")]
+    CoAuthorNotAllowed,
+    #[error("`git add` failed for {0:?}")]
+    Add(Vec<String>),
+    #[error("`git commit` failed")]
+    Commit,
+}
+
+/// True if any line of `message` is a `Co-Authored-By:` git trailer
+/// (case-insensitive, leading whitespace ignored).
+fn contains_co_author_line(message: &str) -> bool {
+    message
+        .lines()
+        .any(|line| line.trim_start().to_ascii_lowercase().starts_with("co-authored-by:"))
+}
+
+/// Stages EXACTLY `paths` (never `-A`/`.`) and commits them with `message`,
+/// via two real `git` subprocess calls: `git add -- <paths>` (so untracked
+/// candidate files get indexed), then `git commit -m <message> -- <paths>`.
+/// The trailing pathspec on `commit` (not just `add`) is what keeps the
+/// result exact even when something else is ALREADY staged (ticket 79's
+/// pre-staged-mismatch case): a pathspec-limited `git commit` only commits
+/// modifications to the listed paths regardless of what else sits in the
+/// index, and leaves that other staged content untouched (still staged,
+/// neither committed nor reverted).
+pub fn commit(cwd: &Path, paths: &[String], message: &str) -> Result<(), CommitError> {
+    if contains_co_author_line(message) {
+        return Err(CommitError::CoAuthorNotAllowed);
+    }
+
+    let add_status = Command::new("git")
+        .arg("add")
+        .arg("--")
+        .args(paths)
+        .current_dir(cwd)
+        .status()
+        .map_err(|_| CommitError::Add(paths.to_vec()))?;
+    if !add_status.success() {
+        return Err(CommitError::Add(paths.to_vec()));
+    }
+
+    let commit_status = Command::new("git")
+        .args(["commit", "-m", message, "--"])
+        .args(paths)
+        .current_dir(cwd)
+        .status()
+        .map_err(|_| CommitError::Commit)?;
+    if !commit_status.success() {
+        return Err(CommitError::Commit);
+    }
+
+    Ok(())
+}
+
+/// Paths currently staged (the git index differs from `HEAD`), via `git
+/// diff --cached --name-only` -- used by `/commit` to detect a pre-staged
+/// mismatch against the session's candidate set. Empty (not an error) both
+/// outside a git repo and when nothing is staged.
+pub fn staged_paths(cwd: &Path) -> Vec<String> {
+    run_git(cwd, &["diff", "--cached", "--name-only"])
+        .map(|s| s.lines().map(|line| line.to_string()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +280,97 @@ mod tests {
                 "commit 5".to_string(),
                 "commit 4".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn commit_stages_exactly_the_given_paths_and_writes_the_given_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello", "first commit");
+
+        // a.txt gets a real, uncommitted modification -- it must NOT end up
+        // in the new commit even though it's dirty, proving "exactly the
+        // given paths" rather than "everything dirty".
+        std::fs::write(dir.path().join("a.txt"), "modified after first commit")
+            .expect("failed to modify a.txt");
+        // b.txt is a brand new, untracked file -- the only path passed to
+        // `commit`.
+        std::fs::write(dir.path().join("b.txt"), "new file content")
+            .expect("failed to write b.txt");
+
+        let result = super::commit(dir.path(), &["b.txt".to_string()], "chore: add b.txt");
+        assert!(result.is_ok(), "expected commit to succeed, got: {result:?}");
+
+        let subject_output = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git log should spawn");
+        assert_eq!(
+            String::from_utf8_lossy(&subject_output.stdout).trim(),
+            "chore: add b.txt",
+            "expected the new commit's subject to be exactly the given message"
+        );
+
+        let files_output = Command::new("git")
+            .args(["show", "--name-only", "--pretty=format:", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git show should spawn");
+        let files_stdout = String::from_utf8_lossy(&files_output.stdout).to_string();
+        let committed_files: Vec<&str> =
+            files_stdout.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            committed_files,
+            vec!["b.txt"],
+            "expected the new commit to contain EXACTLY the given paths, not a.txt's \
+             uncommitted modification"
+        );
+
+        let status_output = Command::new("git")
+            .args(["status", "--porcelain", "a.txt"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git status should spawn");
+        assert!(
+            !String::from_utf8_lossy(&status_output.stdout).trim().is_empty(),
+            "expected a.txt's modification to remain uncommitted, proving it was never staged"
+        );
+    }
+
+    #[test]
+    fn commit_message_never_contains_a_co_author_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        commit(dir.path(), "a.txt", "hello", "first commit");
+        std::fs::write(dir.path().join("b.txt"), "new file content")
+            .expect("failed to write b.txt");
+
+        let result = super::commit(
+            dir.path(),
+            &["b.txt".to_string()],
+            "chore: add b.txt\n\nCo-Authored-By: Some Agent <agent@example.com>",
+        );
+
+        assert_eq!(
+            result,
+            Err(CommitError::CoAuthorNotAllowed),
+            "expected commit to refuse a message containing a Co-Authored-By trailer"
+        );
+
+        let log_output = Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git log should spawn");
+        let commit_count = String::from_utf8_lossy(&log_output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+        assert_eq!(
+            commit_count, 1,
+            "expected no new commit to have been created when the message was refused"
         );
     }
 }

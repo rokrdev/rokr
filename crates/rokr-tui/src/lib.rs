@@ -850,10 +850,14 @@ fn run_memory_command(
 /// user's decision mid-`submit`.
 ///
 /// `command` is called instead of `submit` (see [`route_input`]) whenever
-/// the prompt text starts with `/`; it has no `PermissionHandle` since
-/// rokr-tui doesn't know what any given command means — `main.rs` interprets
-/// literal command strings like `/compact`. Its resolved `String` is
-/// displayed the same way a `submit` reply is.
+/// the prompt text starts with `/`; rokr-tui still doesn't know what any
+/// given command means — `main.rs` interprets literal command strings like
+/// `/compact`. Ticket 79 (commit-command) gave `command` its own
+/// `PermissionHandle` (mirroring `submit`'s), so built-in commands that need
+/// user confirmation before acting (like `/commit`) can use the same
+/// permission surface; commands that don't need it just ignore the
+/// parameter. Its resolved `String` is displayed the same way a `submit`
+/// reply is.
 ///
 /// `history` (ticket 40, prompt-history) seeds [`AppState::history`] for
 /// Up/Down recall, and `on_history_append` is invoked with each submitted
@@ -917,7 +921,7 @@ pub async fn run<F, Fut, C, Fut2, M, M2>(
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
-    C: Fn(String) -> Fut2 + Send + Sync + 'static,
+    C: Fn(String, PermissionHandle) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
     M: Fn() -> io::Result<PathBuf> + Send + 'static,
     M2: Fn(&str) -> Option<String> + Send + 'static,
@@ -963,7 +967,7 @@ fn run_blocking<F, Fut, C, Fut2, M, M2>(
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
-    C: Fn(String) -> Fut2 + Send + Sync + 'static,
+    C: Fn(String, PermissionHandle) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
     M: Fn() -> io::Result<PathBuf> + Send + 'static,
     M2: Fn(&str) -> Option<String> + Send + 'static,
@@ -1073,7 +1077,7 @@ fn event_loop<F, Fut, C, Fut2, M, M2>(
 where
     F: Fn(String, PermissionHandle) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, String>> + Send + 'static,
-    C: Fn(String) -> Fut2 + Send + Sync + 'static,
+    C: Fn(String, PermissionHandle) -> Fut2 + Send + Sync + 'static,
     Fut2: Future<Output = String> + Send + 'static,
     M: Fn() -> io::Result<PathBuf> + Send + 'static,
     M2: Fn(&str) -> Option<String> + Send + 'static,
@@ -1312,7 +1316,10 @@ where
                                                 spawn_and_report(handle, submit_fut, tx.clone());
                                             }
                                             None => {
-                                                let command_fut = command(input);
+                                                let permission = PermissionHandle {
+                                                    tx: perm_tx.clone(),
+                                                };
+                                                let command_fut = command(input, permission);
                                                 spawn_and_report(
                                                     handle,
                                                     async move { Ok(command_fut.await) },
