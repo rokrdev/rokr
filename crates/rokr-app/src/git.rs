@@ -11,7 +11,7 @@
 //! detection and output parsing are shared, not duplicated, between the
 //! read-only snapshot here and that future mutating use.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A point-in-time snapshot of the repo at `cwd`. Computed once at session
@@ -239,24 +239,38 @@ pub fn create_branch(cwd: &Path, name: &str) -> Result<(), String> {
     }
 }
 
+/// Resolves the work-tree root of the repo containing `cwd` (`git
+/// rev-parse --show-toplevel`), canonicalized. `None` when `cwd` isn't
+/// inside a git work tree.
+fn repo_root(cwd: &Path) -> Option<PathBuf> {
+    let root = run_git(cwd, &["rev-parse", "--show-toplevel"])?;
+    std::fs::canonicalize(root).ok()
+}
+
 /// Resolves `path` (as supplied on a `PermissionPayload::Diff`, which may be
 /// absolute or relative -- see `runner.rs`'s `pre_edit_divergence_note`) to a
-/// path relative to `cwd`'s repo root, suitable for a `git show HEAD:<path>`
-/// pathspec. Canonicalizes BOTH sides before stripping the prefix when
-/// `path` is absolute -- mirrors `WriteTool::new`'s doc comment on why
-/// (macOS's `/var` -> `/private/var` symlink resolution means a raw,
-/// non-canonical absolute path and a canonical `cwd` otherwise fail to
-/// share a common prefix even when they name the same file). `None` if
-/// `path` can't be resolved onto `cwd` at all (e.g. it names a file outside
-/// the repo, or neither side exists on disk yet).
+/// path relative to the repo's work-tree ROOT (NOT `cwd` -- rokr is commonly
+/// launched from a subdirectory of a larger repo, and git's `<rev>:<path>`
+/// syntax always resolves `<path>` relative to the work-tree root regardless
+/// of the process's cwd), suitable for a `git show HEAD:<path>` pathspec. A
+/// relative `path` is first joined onto `cwd` to make it absolute. Both
+/// sides are canonicalized before stripping the prefix -- mirrors
+/// `WriteTool::new`'s doc comment on why (macOS's `/var` -> `/private/var`
+/// symlink resolution means a raw, non-canonical absolute path and a
+/// canonical repo root otherwise fail to share a common prefix even when
+/// they name the same file). `None` if `path` can't be resolved onto the
+/// repo root at all (e.g. it names a file outside the repo, `cwd` isn't
+/// inside a git work tree, or the file doesn't exist on disk yet).
 fn to_repo_relative_pathspec(cwd: &Path, path: &str) -> Option<String> {
     let candidate = Path::new(path);
-    if !candidate.is_absolute() {
-        return Some(candidate.to_string_lossy().replace('\\', "/"));
-    }
-    let canonical_cwd = std::fs::canonicalize(cwd).ok()?;
-    let canonical_path = std::fs::canonicalize(candidate).ok()?;
-    let relative = canonical_path.strip_prefix(&canonical_cwd).ok()?;
+    let absolute_candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        cwd.join(candidate)
+    };
+    let root = repo_root(cwd)?;
+    let canonical_candidate = std::fs::canonicalize(&absolute_candidate).ok()?;
+    let relative = canonical_candidate.strip_prefix(&root).ok()?;
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
@@ -591,6 +605,35 @@ mod tests {
         assert!(
             !diverges,
             "expected a pre-image matching HEAD's content to not be flagged as diverging"
+        );
+    }
+
+    /// Regression test: rokr is commonly launched from a subdirectory of a
+    /// larger repo, not the repo's top-level directory -- nothing in the
+    /// codebase enforces "cwd == repo root". `to_repo_relative_pathspec`
+    /// must resolve the pathspec against the repo's work-tree root (`git
+    /// rev-parse --show-toplevel`), not against whatever `cwd` happens to
+    /// be, or `git show HEAD:<path>` is handed a path relative to the wrong
+    /// directory, silently fails, and a genuinely hand-dirtied file is never
+    /// flagged as diverging.
+    #[test]
+    fn pre_image_diverging_from_head_is_detected_when_cwd_is_a_subdirectory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let sub_dir = dir.path().join("sub");
+        std::fs::create_dir(&sub_dir).expect("failed to create subdirectory");
+        commit(dir.path(), "sub/a.txt", "hello from HEAD", "initial commit");
+
+        // `cwd` is the SUBDIRECTORY, not the repo root, and `path` is
+        // relative to that subdirectory -- exactly how a real edit/write
+        // permission prompt resolves paths when rokr itself was launched
+        // from `sub/` rather than the repo root.
+        let diverges = pre_image_diverges_from_head(&sub_dir, "a.txt", "hello from a user edit");
+
+        assert!(
+            diverges,
+            "expected a pre-image differing from HEAD's content to be flagged as diverging \
+             even when cwd is a subdirectory of the repo root"
         );
     }
 }

@@ -17986,3 +17986,237 @@ async fn edit_permission_prompt_shows_no_note_for_clean_file() {
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+/// Regression test: rokr's pre-edit divergence check (ticket 81) must still
+/// fire when rokr is launched from a SUBDIRECTORY of the repo, not the
+/// repo's top-level directory -- nothing in the codebase enforces "rokr's
+/// cwd == repo root", and this is otherwise a silent false negative (`git
+/// show HEAD:<path>` is handed a pathspec computed relative to the wrong
+/// directory, fails, and the divergence note simply never appears). Closely
+/// modeled on `edit_permission_prompt_shows_divergence_note_for_user_dirtied_file`
+/// above, but the git repo is rooted at `project_dir` while rokr itself is
+/// launched with `cmd.cwd(&project_dir.join("sub"))`, and the hand-dirtied
+/// target file lives inside that subdirectory.
+#[tokio::test]
+async fn edit_permission_prompt_shows_divergence_note_when_launched_from_subdirectory() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let final_reply_text = "FinalReplyAfterSubdirDivergenceNoteRejectForTesting";
+
+    let project_dir = unique_temp_dir("subdir-divergence-note-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    let sub_dir = project_dir.join("sub");
+    std::fs::create_dir(&sub_dir).expect("failed to create subdirectory");
+    let target_file = sub_dir.join("tracked.txt");
+    std::fs::write(&target_file, "headcontentvalue\n").unwrap();
+    git(&["add", "sub/tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    // Hand-dirty the tracked file AFTER the commit, uncommitted -- same
+    // "user separately edited by hand mid-session" case as the sibling test
+    // above, just with rokr's own cwd rooted at `sub/` rather than the repo
+    // top level.
+    std::fs::write(&target_file, "userdirtiedvalue\n").unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+    let old_str = "userdirtiedvalue";
+    let new_str = "agentreplacedvalue";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-subdir-divergence-note",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "edit",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "old_str": old_str,
+                                        "new_str": new_str
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-test-subdir-divergence-note-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": final_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-subdir-divergence-note");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-subdir-divergence-note");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    // The key difference from the sibling test above: rokr is launched from
+    // the SUBDIRECTORY, not the repo root.
+    cmd.cwd(&sub_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    writer
+        .write_all(b"editthedirtiedfile\r")
+        .expect("failed to write prompt to pty");
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("-userdirtiedvalue") && output.contains("+agentreplacedvalue") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("-userdirtiedvalue"),
+        "expected pty output to contain the edit tool's diff, got: {output:?}"
+    );
+    assert!(
+        output.contains("diverges"),
+        "expected the permission prompt to carry a one-line divergence note for a \
+         user-dirtied file even when rokr is launched from a subdirectory of the repo, \
+         got: {output:?}"
+    );
+
+    writer
+        .write_all(b"n")
+        .expect("failed to write reject keypress to pty");
+
+    let response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(final_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(final_reply_text),
+        "expected pty output to contain the final assistant reply after rejecting the edit, \
+         got: {output:?}"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
