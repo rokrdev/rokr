@@ -78,6 +78,17 @@ pub enum SessionRecord {
         turn_index: usize,
         snapshot_id: String,
     },
+    /// Ticket 82 (rollback-past-commit-warning): appended once by `/commit`
+    /// (main.rs `handle_commit_command`) immediately after a successful
+    /// `git commit`, recording the `turn_index` that was current at that
+    /// moment. `fold` ignores it entirely (same treatment as
+    /// `Header`/`Checkpoint`); `handle_rollback_command` consults the LAST
+    /// such record via `SessionStore::last_commit_boundary_turn_index` to
+    /// decide whether a requested rollback target would cross mid-session
+    /// committed work -- a warn-then-confirm case, not a hard refusal.
+    CommitBoundary {
+        turn_index: usize,
+    },
 }
 
 /// Read shim (architect ruling, phase-5, schema v2): deserializes a `Turn`
@@ -126,7 +137,9 @@ pub fn fold(records: &[SessionRecord]) -> (Vec<Message>, Option<rokr_core::Usage
 
     for record in records {
         match record {
-            SessionRecord::Header { .. } | SessionRecord::Checkpoint { .. } => {}
+            SessionRecord::Header { .. }
+            | SessionRecord::Checkpoint { .. }
+            | SessionRecord::CommitBoundary { .. } => {}
             SessionRecord::Turn {
                 messages, usage, ..
             } => {
@@ -314,6 +327,17 @@ impl SessionHandle {
     /// makes a later resume/jump replay the truncated transcript correctly.
     pub fn append_rollback(&self, target: usize) {
         self.enqueue(SessionRecord::Rollback { target });
+    }
+
+    /// Enqueues a `CommitBoundary` record (ticket 82,
+    /// rollback-past-commit-warning). Intended to be called once per
+    /// successful `/commit`, with `turn_index` set to the current value of
+    /// `main.rs`'s own `turn_index` mutex at that moment (the count of turns
+    /// completed so far). `handle_rollback_command` reads the last such
+    /// record back via [`SessionStore::last_commit_boundary_turn_index`] to
+    /// decide whether a requested rollback target crosses committed work.
+    pub fn append_commit_boundary(&self, turn_index: usize) {
+        self.enqueue(SessionRecord::CommitBoundary { turn_index });
     }
 
     /// Enqueues a `Compaction` record (RULING 2, architect ruling phase-5).
@@ -567,6 +591,42 @@ impl SessionStore {
                 SessionRecord::Compaction {
                     replaced_through, ..
                 } => Some(replaced_through),
+                _ => None,
+            })
+            .next_back();
+
+        Ok(last)
+    }
+
+    /// Ticket 82 (rollback-past-commit-warning): the `turn_index` of the LAST
+    /// `CommitBoundary` record in `session_id`'s log (in file order), or
+    /// `None` if the session has never had a commit boundary recorded.
+    /// `handle_rollback_command` consults this to WARN (never hard-refuse --
+    /// unlike `last_compaction_replaced_through`) when a `/rollback` target
+    /// would cross committed work. Same read-raw-records,
+    /// skip-unparseable-line, missing-log-is-None policy as
+    /// `last_compaction_replaced_through`.
+    pub fn last_commit_boundary_turn_index(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<usize>> {
+        let session_jsonl_path = self
+            .data_dir
+            .join("sessions")
+            .join(session_id)
+            .join("session.jsonl");
+        let contents = match std::fs::read_to_string(&session_jsonl_path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        let last = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<SessionRecord>(line).ok())
+            .filter_map(|record| match record {
+                SessionRecord::CommitBoundary { turn_index } => Some(turn_index),
                 _ => None,
             })
             .next_back();
@@ -1670,6 +1730,75 @@ mod tests {
         );
         assert_eq!(
             store.last_compaction_replaced_through("nonexistent").unwrap(),
+            None,
+            "a session with no log yet must return None, not an error"
+        );
+    }
+
+    /// Ticket 82 (rollback-past-commit-warning): `SessionHandle::append_commit_boundary`
+    /// enqueues a `CommitBoundary { turn_index }` record; `SessionStore::
+    /// last_commit_boundary_turn_index` returns the LAST such record's
+    /// `turn_index` in file order (or `None` for a session that has never had
+    /// a commit boundary recorded), mirroring
+    /// `last_compaction_replaced_through`'s existing shape exactly. Exercises
+    /// BOTH sides: a hand-built fixture (never-committed -> None) and a real
+    /// `SessionHandle::append_commit_boundary` call through a live writer
+    /// (proving the RECORDING side actually persists the event, not just the
+    /// query logic against a fixture).
+    #[tokio::test]
+    async fn commit_boundary_event_is_recorded_and_queryable_by_turn_index() {
+        let dir = unique_temp_dir("commit-boundary");
+
+        // Never-committed session -> None.
+        let plain_id = "plain-session".to_string();
+        write_session_fixture(
+            &dir,
+            &plain_id,
+            &[SessionRecord::Turn {
+                messages: vec![Message::user_text("hi")],
+                usage: usage(0),
+                timestamp: "t0".to_string(),
+            }],
+        );
+
+        // A session committed via a real SessionHandle -- two commit
+        // boundaries recorded across two turns; the LAST one's turn_index
+        // must win.
+        let store = SessionStore::open(&dir);
+        let handle = store
+            .create_session()
+            .expect("create_session should succeed");
+        let committed_id = handle.session_id().to_string();
+        handle.append_turn(
+            vec![Message::user_text("turn0")],
+            usage(0),
+            "t0".to_string(),
+        );
+        handle.append_commit_boundary(1);
+        handle.append_turn(
+            vec![Message::user_text("turn1")],
+            usage(1),
+            "t1".to_string(),
+        );
+        handle.append_commit_boundary(2);
+        handle.flush().await;
+
+        assert_eq!(
+            store.last_commit_boundary_turn_index(&plain_id).unwrap(),
+            None,
+            "a session with no /commit ever run must report no commit boundary"
+        );
+        assert_eq!(
+            store
+                .last_commit_boundary_turn_index(&committed_id)
+                .unwrap(),
+            Some(2),
+            "expected the LAST commit boundary's turn_index (2), not the first (1)"
+        );
+        assert_eq!(
+            store
+                .last_commit_boundary_turn_index("nonexistent")
+                .unwrap(),
             None,
             "a session with no log yet must return None, not an error"
         );

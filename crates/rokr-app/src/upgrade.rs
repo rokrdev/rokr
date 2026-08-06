@@ -60,9 +60,11 @@ pub async fn run() -> std::process::ExitCode {
     }
 
     let outcome = match std::env::var("ROKR_UPGRADE_MOCK_CHECK_OUTCOME") {
-        Ok(raw) => MockUpdateChecker(parse_mock_check_outcome(&raw))
-            .check_for_update()
-            .await,
+        Ok(raw) => {
+            MockUpdateChecker(parse_mock_check_outcome(&raw))
+                .check_for_update()
+                .await
+        }
         Err(_) => AxoUpdateChecker.check_for_update().await,
     };
 

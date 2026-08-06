@@ -321,8 +321,10 @@ struct ModelEnvOverride {
 
 impl ModelEnvOverride {
     fn apply(model: &str) -> Self {
-        let vars: [&'static str; 2] =
-            [rokr_provider::openai::ENV_MODEL, rokr_provider::anthropic::ENV_MODEL];
+        let vars: [&'static str; 2] = [
+            rokr_provider::openai::ENV_MODEL,
+            rokr_provider::anthropic::ENV_MODEL,
+        ];
         let previous = vars
             .into_iter()
             .map(|var| {
@@ -456,6 +458,17 @@ pub async fn run_result_object(
         system_prompt.push_str(&segment.content);
     }
 
+    // Ticket 76 (git-context-snapshot): computed once here, never
+    // recomputed mid-session, following the same fold-in pattern as the
+    // `load_memory` loop just above. Silently absent (no error, no
+    // placeholder) outside a git repo, exactly matching how an absent
+    // AGENTS.md is handled.
+    if let Some(git_context) = cwd.as_deref().and_then(crate::git::snapshot) {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("# Git Context\n");
+        system_prompt.push_str(&git_context.to_prompt_text());
+    }
+
     let repo_map: Option<String> = cwd.as_deref().map(rokr_tools::repo_map::generate);
 
     let token_store = rokr_provider::auth::default_token_store(&config_dir);
@@ -473,7 +486,9 @@ pub async fn run_result_object(
     // `model_name` below is read straight off `run_override` rather than
     // re-reading the env var, so it's correct even after the guard is gone.
     let built = {
-        let _model_override_guard = run_override.as_ref().map(|o| ModelEnvOverride::apply(&o.model));
+        let _model_override_guard = run_override
+            .as_ref()
+            .map(|o| ModelEnvOverride::apply(&o.model));
         rokr_provider::build_provider(
             requested_provider_name,
             resolved_auth,
@@ -864,7 +879,12 @@ mod tests {
         );
 
         let _ = registry
-            .resolve_skills("@skill:deploy", temp.path().to_path_buf(), trust_store, consent)
+            .resolve_skills(
+                "@skill:deploy",
+                temp.path().to_path_buf(),
+                trust_store,
+                consent,
+            )
             .await
             .expect("an untrusted skill under default mode must not error the whole run");
 

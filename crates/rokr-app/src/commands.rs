@@ -567,8 +567,7 @@ mod tests {
             .expect("expected /deploy to be discovered from .rokr/commands/");
 
         assert_eq!(
-            expanded,
-            "Run: !rm -rf /tmp/should-never-execute && echo pwned",
+            expanded, "Run: !rm -rf /tmp/should-never-execute && echo pwned",
             "expected the '!'-prefixed body to expand to inert literal text, byte-for-byte \
              unchanged -- CommandRegistry has no shell-execution semantics (see ADR 0014)"
         );
@@ -592,8 +591,16 @@ mod tests {
         let project_commands_dir = project_dir.join(".rokr").join("commands");
         fs::create_dir_all(&user_commands_dir).unwrap();
         fs::create_dir_all(&project_commands_dir).unwrap();
-        fs::write(user_commands_dir.join("cost.md"), "user-scope /cost template").unwrap();
-        fs::write(project_commands_dir.join("cost.md"), "project-scope /cost template").unwrap();
+        fs::write(
+            user_commands_dir.join("cost.md"),
+            "user-scope /cost template",
+        )
+        .unwrap();
+        fs::write(
+            project_commands_dir.join("cost.md"),
+            "project-scope /cost template",
+        )
+        .unwrap();
 
         let mut registry = CommandRegistry::discover_user_scope(temp.path());
         registry.merge_overriding(CommandRegistry::discover_project_scope(&project_dir));
@@ -674,8 +681,7 @@ mod tests {
             .expect("expected /review to be discovered from commands/");
 
         assert_eq!(
-            expanded,
-            "Follow # Code Style\nUse 4-space indentation.",
+            expanded, "Follow # Code Style\nUse 4-space indentation.",
             "expected @skill:code-style to be replaced inline with the skill file's full \
              contents, sourced from the user-scope skills/ directory"
         );
@@ -701,7 +707,11 @@ mod tests {
             "---\ndescription: test\n---\nFollow @skill:code-style",
         )
         .unwrap();
-        fs::write(user_skills_dir.join("code-style.md"), "USER-SCOPE-STYLE-GUIDE").unwrap();
+        fs::write(
+            user_skills_dir.join("code-style.md"),
+            "USER-SCOPE-STYLE-GUIDE",
+        )
+        .unwrap();
         fs::write(
             project_skills_dir.join("code-style.md"),
             "PROJECT-SCOPE-STYLE-GUIDE",
@@ -716,8 +726,7 @@ mod tests {
             .expect("expected /review to be discovered from user-scope commands/");
 
         assert_eq!(
-            expanded,
-            "Follow PROJECT-SCOPE-STYLE-GUIDE",
+            expanded, "Follow PROJECT-SCOPE-STYLE-GUIDE",
             "expected the project-scope skill to win over the user-scope skill of the same name"
         );
     }

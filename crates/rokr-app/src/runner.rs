@@ -324,17 +324,31 @@ impl SessionRunner {
                 let mcp_http_origins = request_permission_mcp_http_origins.clone();
                 let session_grants = request_permission_session_grants.clone();
                 async move {
+                    // Ticket 77 (read-only-git-carveout, ADR 0019): cloned
+                    // out BEFORE the consuming match below moves `command`
+                    // into `PermissionDetail::Text` -- this is what lets the
+                    // `PermissionPolicy::resolve` call further down see the
+                    // raw command text on the `bash` path without fighting
+                    // the borrow checker over an already-moved `String`.
+                    let command_text: Option<String> = match &request.payload {
+                        rokr_core::PermissionPayload::Command(command) => Some(command.clone()),
+                        _ => None,
+                    };
                     let (detail, diff_path_and_old) = match request.payload {
                         rokr_core::PermissionPayload::Command(command) => {
                             (rokr_tui::PermissionDetail::Text(command), None)
                         }
-                        rokr_core::PermissionPayload::Diff { path, old, new } => (
-                            rokr_tui::PermissionDetail::Diff {
-                                old: old.clone(),
-                                new,
-                            },
-                            Some((path, old)),
-                        ),
+                        rokr_core::PermissionPayload::Diff { path, old, new } => {
+                            let note = pre_edit_divergence_note(&path);
+                            (
+                                rokr_tui::PermissionDetail::Diff {
+                                    old: old.clone(),
+                                    new,
+                                    note,
+                                },
+                                Some((path, old)),
+                            )
+                        }
                         rokr_core::PermissionPayload::ToolCall {
                             server,
                             tool,
@@ -342,14 +356,12 @@ impl SessionRunner {
                         } => {
                             let origin = mcp_http_origins.get(&server).map(String::as_str);
                             (
-                                rokr_tui::PermissionDetail::Text(
-                                    format_tool_call_permission_text(
-                                        &server,
-                                        &tool,
-                                        &input_pretty,
-                                        origin,
-                                    ),
-                                ),
+                                rokr_tui::PermissionDetail::Text(format_tool_call_permission_text(
+                                    &server,
+                                    &tool,
+                                    &input_pretty,
+                                    origin,
+                                )),
                                 None,
                             )
                         }
@@ -379,6 +391,7 @@ impl SessionRunner {
                             permission_mode,
                             &request.tool_name,
                             None,
+                            command_text.as_deref(),
                             &grants,
                         )
                     };
@@ -455,27 +468,29 @@ impl SessionRunner {
                     let session_handle = subagent_request_permission_session_handle.clone();
                     let turn_index = subagent_request_permission_turn_index.clone();
                     let data_dir = subagent_request_permission_data_dir.clone();
-                    let mcp_http_origins =
-                        subagent_request_permission_mcp_http_origins.clone();
+                    let mcp_http_origins = subagent_request_permission_mcp_http_origins.clone();
                     Box::pin(async move {
                         let (detail, diff_path_and_old) = match request.payload {
                             rokr_core::PermissionPayload::Command(command) => {
                                 (rokr_tui::PermissionDetail::Text(command), None)
                             }
-                            rokr_core::PermissionPayload::Diff { path, old, new } => (
-                                rokr_tui::PermissionDetail::Diff {
-                                    old: old.clone(),
-                                    new,
-                                },
-                                Some((path, old)),
-                            ),
+                            rokr_core::PermissionPayload::Diff { path, old, new } => {
+                                let note = pre_edit_divergence_note(&path);
+                                (
+                                    rokr_tui::PermissionDetail::Diff {
+                                        old: old.clone(),
+                                        new,
+                                        note,
+                                    },
+                                    Some((path, old)),
+                                )
+                            }
                             rokr_core::PermissionPayload::ToolCall {
                                 server,
                                 tool,
                                 input_pretty,
                             } => {
-                                let origin =
-                                    mcp_http_origins.get(&server).map(String::as_str);
+                                let origin = mcp_http_origins.get(&server).map(String::as_str);
                                 (
                                     rokr_tui::PermissionDetail::Text(
                                         format_tool_call_permission_text(
@@ -590,7 +605,14 @@ impl SessionRunner {
                 AgentTier::Plan => vec![&read, &glob, &grep, &ls],
                 AgentTier::Build => {
                     vec![
-                        &read, &glob, &grep, &ls, &bash, &write, &edit, &webfetch,
+                        &read,
+                        &glob,
+                        &grep,
+                        &ls,
+                        &bash,
+                        &write,
+                        &edit,
+                        &webfetch,
                         &subagent_tool,
                     ]
                 }
@@ -621,11 +643,11 @@ impl SessionRunner {
             // read error (missing file, permissions, non-UTF-8,
             // ...) is treated as `NotFound`.
             let mut expanded_input =
-                rokr_core::mentions::expand_mentions(&input, |path| {
-                    match std::fs::read_to_string(path) {
-                        Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
-                        Err(_) => rokr_core::mentions::MentionResolution::NotFound,
-                    }
+                rokr_core::mentions::expand_mentions(&input, |path| match std::fs::read_to_string(
+                    path,
+                ) {
+                    Ok(contents) => rokr_core::mentions::MentionResolution::Found(contents),
+                    Err(_) => rokr_core::mentions::MentionResolution::NotFound,
                 });
 
             // `UserPromptSubmit` (PRD "Hooks"; architect decision:
@@ -675,8 +697,7 @@ impl SessionRunner {
                 }
             }
             if !injected_user_prompt_context.is_empty() {
-                expanded_input =
-                    format!("{expanded_input}\n\n{injected_user_prompt_context}");
+                expanded_input = format!("{expanded_input}\n\n{injected_user_prompt_context}");
             }
 
             let mut transcript = transcript.lock().await;
@@ -729,9 +750,7 @@ impl SessionRunner {
                                 rokr_hooks::HookResult::Success { .. } => {}
                                 rokr_hooks::HookResult::Blocked { stderr } => {
                                     if entry.blocking.unwrap_or(true) {
-                                        return rokr_core::PreToolHookOutcome::Deny(
-                                            stderr,
-                                        );
+                                        return rokr_core::PreToolHookOutcome::Deny(stderr);
                                     }
                                     eprintln!(
                                         "PreToolUse hook exited 2 but its config entry \
@@ -926,12 +945,7 @@ impl SessionRunner {
                         // tail turn is `raw_turn_count - 1` and the
                         // summary replaces through `raw_turn_count - 2`.
                         let raw_turn_count = *turn_index.lock().unwrap();
-                        append_compaction_record(
-                            &session_handle,
-                            &compacted,
-                            raw_turn_count,
-                        )
-                        .await;
+                        append_compaction_record(&session_handle, &compacted, raw_turn_count).await;
                         *transcript = compacted;
                         None
                     }
@@ -1058,6 +1072,33 @@ pub fn format_tool_call_permission_text(
     text
 }
 
+/// Ticket 81 (pre-edit-divergence-note), PRD "Divergence safety": one-line
+/// note for the diff-review permission prompt when `path`'s CURRENT
+/// on-disk content diverges from its content at `HEAD` -- signals "this
+/// file changed by a path rokr doesn't know about" (e.g. the user
+/// hand-edited it mid-session) without blocking the write either way.
+///
+/// Deliberately re-reads `path` fresh from disk here rather than reusing
+/// the `old` field already captured on the `Diff` payload: for `write`,
+/// `old` IS the file's full pre-image, but for `edit` it's only the
+/// targeted `old_str` snippet (see `EditTool::diff_snippet`'s doc comment)
+/// -- comparing a snippet against `HEAD`'s full file content would be
+/// meaningless. A fresh full-file read is correct for both tools uniformly.
+///
+/// `None` (no note) whenever there's nothing to flag: the read fails (e.g.
+/// a brand-new file that doesn't exist yet), `path`'s cwd isn't a git
+/// repo, or the file's current content matches `HEAD` exactly (clean file
+/// -> no note).
+fn pre_edit_divergence_note(path: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let current_content = std::fs::read_to_string(path).ok()?;
+    if crate::git::pre_image_diverges_from_head(&cwd, path, &current_content) {
+        Some("Note: this file diverges from HEAD (changed outside this session).".to_string())
+    } else {
+        None
+    }
+}
+
 /// Ticket 38 (checkpoint-pre-images), PRD phase-5-session-management
 /// decision 4: on a GRANTED write/edit permission decision, captures the
 /// file's pre-image under `sessions/<id>/snapshots/` (reusing the `old`
@@ -1125,8 +1166,13 @@ pub async fn capture_checkpoint_if_granted_diff(
     };
 
     let current_turn_index = *turn_index.lock().unwrap();
-    let checkpoint_store = rokr_session::CheckpointStore::open(data_dir, session_handle.session_id());
-    let old_content: Option<&str> = if old.is_empty() { None } else { Some(old.as_str()) };
+    let checkpoint_store =
+        rokr_session::CheckpointStore::open(data_dir, session_handle.session_id());
+    let old_content: Option<&str> = if old.is_empty() {
+        None
+    } else {
+        Some(old.as_str())
+    };
 
     match checkpoint_store.snapshot(current_turn_index, &path, old_content) {
         Ok((snapshot_id, newly_written)) => {
@@ -1210,8 +1256,7 @@ pub fn default_data_dir() -> std::path::PathBuf {
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(".local/share"))
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".local/share"));
     base.join("rokr")
@@ -1619,7 +1664,10 @@ mod tests {
         };
 
         let first_reply = runner
-            .run_submission("please run the first bash command".to_string(), requester.clone())
+            .run_submission(
+                "please run the first bash command".to_string(),
+                requester.clone(),
+            )
             .await
             .expect("the first submission should drive to a terminal Ok state");
 
@@ -1640,7 +1688,10 @@ mod tests {
         );
 
         let second_reply = runner
-            .run_submission("please run the second bash command".to_string(), requester.clone())
+            .run_submission(
+                "please run the second bash command".to_string(),
+                requester.clone(),
+            )
             .await
             .expect("the second submission should drive to a terminal Ok state");
 

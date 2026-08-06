@@ -997,3 +997,89 @@ async fn print_flag_untrusted_executable_skill_executes_under_bypass_without_per
     let _ = std::fs::remove_dir_all(&xdg_config_home);
     let _ = std::fs::remove_dir_all(&project_dir);
 }
+
+/// Ticket 76 (git-context-snapshot) acceptance test: mirrors
+/// `print_flag_prompt_with_skill_mention_inlines_skill_file_contents_in_outgoing_request`'s
+/// shape, but for the Git Context segment -- a real `git init`-ed
+/// `project_dir` fixture with a commit and a dirty (untracked) file must
+/// produce a "# Git Context" segment in the outgoing system prompt
+/// containing the branch name, a dirty indicator, and the recent commit's
+/// subject.
+#[tokio::test]
+async fn git_context_segment_appears_in_headless_system_prompt_inside_a_repo() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })))
+        .mount(&mock)
+        .await;
+
+    let home = unique_temp_dir("git-context-home");
+    let xdg_config_home = unique_temp_dir("git-context-xdg-config-home");
+    let project_dir = unique_temp_dir("git-context-project");
+    std::fs::create_dir_all(&project_dir).expect("failed to create fixture project directory");
+
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("a.txt"), "hello").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-m", "DistinctiveHeadlessGitContextCommitSubjectForTesting"]);
+    std::fs::write(project_dir.join("untracked.txt"), "dirty").unwrap();
+
+    let mut cmd = Command::cargo_bin("rokr").unwrap();
+    cmd.arg("-p")
+        .arg("say hi")
+        .current_dir(&project_dir)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env("ROKR_OPENAI_BASE_URL", mock.uri())
+        .env("ROKR_OPENAI_MODEL", "gpt-4o-mini")
+        .env("ROKR_OPENAI_API_KEY", "test-key")
+        .assert()
+        .success();
+
+    let received_requests = mock.received_requests().await.expect(
+        "mock server should have recorded received requests \
+         (make sure the request recorder wasn't disabled)",
+    );
+    assert!(
+        !received_requests.is_empty(),
+        "expected at least one outgoing request to /chat/completions"
+    );
+    let first_request_body = String::from_utf8_lossy(&received_requests[0].body).into_owned();
+    assert!(
+        first_request_body.contains("# Git Context"),
+        "expected the outgoing request body to contain a Git Context segment, got: \
+         {first_request_body:?}"
+    );
+    assert!(
+        first_request_body.contains("main"),
+        "expected the outgoing request body to contain the branch name 'main', got: \
+         {first_request_body:?}"
+    );
+    assert!(
+        first_request_body.contains("dirty"),
+        "expected the outgoing request body to contain a dirty indicator, got: \
+         {first_request_body:?}"
+    );
+    assert!(
+        first_request_body.contains("DistinctiveHeadlessGitContextCommitSubjectForTesting"),
+        "expected the outgoing request body to contain the recent commit subject, got: \
+         {first_request_body:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
