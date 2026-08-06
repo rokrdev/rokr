@@ -286,6 +286,13 @@ fn to_repo_relative_pathspec(cwd: &Path, path: &str) -> Option<String> {
 /// (the pre-image side of this comparison, see
 /// `pre_image_diverges_from_head`) does NOT strip, making an untouched,
 /// byte-identical file look like it diverges from `HEAD`.
+///
+/// Accepted limitation: a non-UTF8 (binary) file at `HEAD` also collapses
+/// into this same `None`, since `String::from_utf8` rejects it -- so
+/// `pre_image_diverges_from_head` treats a hand-edited binary file
+/// identically to "doesn't exist at `HEAD`" and never flags it as
+/// diverging. See the PRD's Further Notes for the accepted-limitation
+/// writeup.
 fn head_content_at_path(cwd: &Path, path: &str) -> Option<String> {
     let relative = to_repo_relative_pathspec(cwd, path)?;
     let output = Command::new("git")

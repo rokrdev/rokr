@@ -158,6 +158,20 @@ mitigated in v1:**
   path exists in the repo, without a prompt. This is accepted as
   read-only information disclosure no worse than what the existing
   `read` tool already permits unprompted today.
+- **A configured `textconv`/external-diff driver runs implicitly, with no
+  special flags on the invocation itself** -- git's own `diff.<driver>.textconv`
+  mechanism means `git diff`, `git show`, and `git log -p` will
+  transparently invoke an externally-configured command against file
+  content whenever a `.gitattributes` entry assigns that driver to a
+  path, with a matching driver definition in `.git/config` -- entirely
+  through ordinary, flag-clean invocations of the five allowlisted
+  subcommands, nothing the classifier could catch by inspecting the
+  command string. This is accepted for the same reason the PATH-spoofed
+  `git` binary risk above is accepted: driving it requires a prior local
+  `.git/config` write, which is itself a gated operation the sandbox
+  still contains, so this is the same accepted risk class -- a session
+  that could already plant a spoofed `git` binary could equally already
+  plant a `textconv` driver -- not a new hole this carve-out opens.
 
 **5. Cross-reference.** This ADR amends ADR 0016 in the same spirit ADR
 0016's own "Amendment (ticket 72)" section amended itself, and the way
