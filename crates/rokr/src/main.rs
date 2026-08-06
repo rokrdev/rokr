@@ -1067,8 +1067,14 @@ async fn main() -> ExitCode {
                             }
                         }
                         "/commit" => {
-                            handle_commit_command(cwd.as_deref(), &data_dir, &session_handle, permission)
-                                .await
+                            handle_commit_command(
+                                cwd.as_deref(),
+                                &data_dir,
+                                &session_handle,
+                                &turn_index,
+                                permission,
+                            )
+                            .await
                         }
                         "/pr" => handle_pr_command(cwd.as_deref(), permission).await,
                         "/mcp" => format_mcp_listing(&mcp_configs, &mcp_server_handles),
@@ -1280,10 +1286,16 @@ fn draft_commit_message(paths: &[String]) -> String {
 /// confirmation reuses the existing permission surface
 /// (`rokr_tui::PermissionDetail::Text`), mirroring `skill_trust.rs`'s
 /// `InteractiveConsentResolver::resolve`.
+///
+/// Ticket 82 (rollback-past-commit-warning): on a successful `git commit`,
+/// also records a `CommitBoundary` event at the current `turn_index` (count
+/// of turns completed so far), which `handle_rollback_command` later
+/// consults to warn if a rollback target would rewind past this commit.
 async fn handle_commit_command(
     cwd: Option<&Path>,
     data_dir: &Path,
     session_handle: &tokio::sync::RwLock<Option<Arc<rokr_session::SessionHandle>>>,
+    turn_index: &std::sync::Mutex<usize>,
     permission: rokr_tui::PermissionHandle,
 ) -> String {
     let Some(cwd) = cwd else {
@@ -1298,10 +1310,14 @@ async fn handle_commit_command(
         );
     }
 
-    let session_id = match session_handle.read().await.as_ref() {
-        Some(handle) => handle.session_id().to_string(),
-        None => return "cannot commit: no active session".to_string(),
+    // Ticket 82: the `Arc<SessionHandle>` is cloned out (not just its
+    // `session_id`) so it's still available AFTER the confirmation `match`
+    // below, to record a `CommitBoundary` event on a successful commit
+    // without re-acquiring the lock.
+    let Some(active_handle) = session_handle.read().await.as_ref().cloned() else {
+        return "cannot commit: no active session".to_string();
     };
+    let session_id = active_handle.session_id().to_string();
 
     let candidate_paths =
         match rokr_app::commit_candidate_set::distinct_touched_paths(data_dir, &session_id) {
@@ -1343,7 +1359,16 @@ async fn handle_commit_command(
     match decision {
         rokr_tui::PermissionDecision::Allow | rokr_tui::PermissionDecision::AllowAndRemember => {
             match rokr_app::git::commit(cwd, &candidate_paths, &message) {
-                Ok(()) => format!("Committed {} file(s).", candidate_paths.len()),
+                Ok(()) => {
+                    // Ticket 82: record the commit boundary at the CURRENT
+                    // turn_index (count of turns completed so far), so
+                    // `handle_rollback_command` can later warn if a rollback
+                    // target would rewind past this point.
+                    let boundary_turn_index = *turn_index.lock().unwrap();
+                    active_handle.append_commit_boundary(boundary_turn_index);
+                    active_handle.flush().await;
+                    format!("Committed {} file(s).", candidate_paths.len())
+                }
                 Err(err) => format!("commit failed: {err}"),
             }
         }
@@ -1916,6 +1941,13 @@ async fn handle_resume_command(
 /// `Compaction` record's `replaced_through` -- those earlier turns were
 /// summarized away and cannot be un-folded, so this is a hard refusal, not a
 /// partial rollback.
+///
+/// Ticket 82 (rollback-past-commit-warning): additionally WARNS (never
+/// refuses -- overridable with a trailing `--yes` on `arg`, exactly like
+/// `handle_resume_command`'s own warn-first/`--yes`-confirms pattern) when
+/// the target is strictly before the `turn_index` that was current at the
+/// last successful `/commit` -- crossing a mid-session commit boundary. See
+/// the check itself below for the precise "crosses" definition.
 async fn handle_rollback_command(
     data_dir: &std::path::Path,
     store: &rokr_session::SessionStore,
@@ -1927,7 +1959,15 @@ async fn handle_rollback_command(
 ) -> String {
     let current_turn_index = *turn_index.lock().unwrap();
 
-    let trimmed = arg.trim();
+    // Ticket 82: a trailing `--yes` confirms a rollback that would
+    // otherwise warn for crossing a mid-session commit boundary -- mirrors
+    // `handle_resume_command`'s identical warn-first/`--yes`-confirms
+    // pattern exactly (`arg.trim().strip_suffix("--yes")`).
+    let trimmed_arg = arg.trim();
+    let (trimmed, confirmed) = match trimmed_arg.strip_suffix("--yes") {
+        Some(rest) => (rest.trim(), true),
+        None => (trimmed_arg, false),
+    };
     let target: usize = if trimmed.is_empty() {
         match current_turn_index.checked_sub(1) {
             Some(target) => target,
@@ -1971,6 +2011,30 @@ async fn handle_rollback_command(
         Ok(Some(boundary)) if target <= boundary => {
             return "cannot roll back past the last compaction — earlier turns were summarized"
                 .to_string();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return format!("rollback failed, no changes applied: {err}");
+        }
+    }
+
+    // Ticket 82 (rollback-past-commit-warning): unlike the compaction guard
+    // above (a hard refusal), crossing a mid-session commit is a WARNING the
+    // user can override with `--yes` -- the commit itself is safe in git
+    // history either way, but rolling back changes what the live session
+    // considers current, which is worth a pause. "Crosses" is defined as:
+    // the target is strictly before the turn_index that was current when
+    // the LAST `/commit` succeeded (i.e. some committed-at-the-time turn
+    // would no longer be reflected as the transcript's live tail after this
+    // rollback). A target at or after that boundary does not cross it, so
+    // no warning. Checked BEFORE any mutation, same as the compaction guard.
+    match store.last_commit_boundary_turn_index(&session_id) {
+        Ok(Some(boundary)) if target < boundary && !confirmed => {
+            return format!(
+                "rollback to turn {target} would cross a commit made mid-session -- committed \
+                 work would no longer be reflected in the live transcript. Run '/rollback \
+                 {target} --yes' to confirm."
+            );
         }
         Ok(_) => {}
         Err(err) => {
@@ -2082,7 +2146,8 @@ fn fold_session_usage_and_model(
             }
             rokr_session::SessionRecord::Compaction { .. }
             | rokr_session::SessionRecord::Rollback { .. }
-            | rokr_session::SessionRecord::Checkpoint { .. } => {}
+            | rokr_session::SessionRecord::Checkpoint { .. }
+            | rokr_session::SessionRecord::CommitBoundary { .. } => {}
         }
     }
     (usage, model)

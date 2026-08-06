@@ -16098,6 +16098,833 @@ async fn commit_command_pre_staged_mismatch_warns_without_blocking() {
     let _ = std::fs::remove_dir_all(&project_dir);
 }
 
+/// Ticket 82 (rollback-past-commit-warning) acceptance test: edit -> /commit
+/// -> further edit -> `/rollback` targeting a turn BEFORE the commit shows a
+/// warning and makes NO mutation; re-running with `--yes` then proceeds.
+#[tokio::test]
+async fn rollback_past_a_mid_session_commit_boundary_warns_and_requires_confirmation() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let project_dir = unique_temp_dir("rollback-commit-boundary-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("tracked.txt"), "already committed").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    let target_file = project_dir.join("boundary-target.txt");
+    let initial_content = "boundarypreimagebeforeanywrite";
+    let turn0_content = "boundarycontentafterturnzero";
+    let turn1_content = "boundarycontentafterturnone";
+    std::fs::write(&target_file, initial_content).unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    let turn0_reply_text = "FinalReplyTurnZeroForBoundaryTest";
+    let turn1_reply_text = "FinalReplyTurnOneForBoundaryTest";
+
+    // Turn 0: write turn0_content over the initial content.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-boundary-turn0-toolcall",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_turn0",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": turn0_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-boundary-turn0-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn0_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Turn 1 (after /commit): write turn1_content over turn0_content.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-boundary-turn1-toolcall",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_turn1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": turn1_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-boundary-turn1-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn1_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-rollback-boundary");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-rollback-boundary");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-rollback-boundary");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Turn 0: write, accept.
+    writer
+        .write_all(b"turnzeroboundarywriteprompt\r")
+        .expect("failed to write turn0 prompt to pty");
+    let turn0_diff_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn0_diff_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("+boundarycontentafterturnzero") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("+boundarycontentafterturnzero"),
+        "expected pty output to contain turn 0's diff, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write turn0 accept keypress to pty");
+
+    let turn0_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn0_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn0_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn0_reply_text),
+        "expected pty output to contain turn 0's final reply, got: {output:?}"
+    );
+
+    // /commit: accept, recording a commit boundary at turn_index 1.
+    writer
+        .write_all(b"/commit\r")
+        .expect("failed to write /commit to pty");
+    let commit_prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < commit_prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("boundary-target.txt") && output.contains("chore:") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("boundary-target.txt"),
+        "expected the /commit confirmation prompt to list the candidate file, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for /commit to pty");
+
+    let committed_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < committed_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Committed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Committed"),
+        "expected /commit to report success after being approved, got: {output:?}"
+    );
+
+    // Turn 1 (after /commit): write again, accept -- this is the "further
+    // edit" the acceptance criterion requires after the commit.
+    writer
+        .write_all(b"turnoneboundarywriteprompt\r")
+        .expect("failed to write turn1 prompt to pty");
+    let turn1_diff_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_diff_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("+boundarycontentafterturnone") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("+boundarycontentafterturnone"),
+        "expected pty output to contain turn 1's diff, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write turn1 accept keypress to pty");
+
+    let turn1_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn1_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn1_reply_text),
+        "expected pty output to contain turn 1's final reply, got: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn1_content,
+        "expected the file to hold turn 1's content before any rollback"
+    );
+
+    // /rollback 0 targets a turn BEFORE the commit boundary (recorded at
+    // turn_index 1, since only turn 0 had completed at /commit time) --
+    // this must WARN and make NO mutation.
+    let output_before_warning = output.len();
+    writer
+        .write_all(b"/rollback 0\r")
+        .expect("failed to write /rollback command to pty");
+    let warning_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < warning_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output[output_before_warning..].contains("--yes") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let warning_text = &output[output_before_warning..];
+    assert!(
+        warning_text.contains("commit") && warning_text.contains("--yes"),
+        "expected /rollback 0 to warn about crossing the commit boundary and mention --yes, \
+         got: {warning_text:?}"
+    );
+    assert!(
+        !warning_text.contains("Rolled"),
+        "expected the warned rollback to make NO mutation yet, got: {warning_text:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn1_content,
+        "expected the file to be UNCHANGED after only the warning (no confirmation yet)"
+    );
+
+    // session.jsonl proof: no Rollback record has been appended yet.
+    let sessions_dir = xdg_data_home.join("rokr").join("sessions");
+    let session_dir_entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&sessions_dir)
+        .unwrap_or_else(|err| {
+            panic!("expected sessions directory to exist at {sessions_dir:?}, got error: {err:?}")
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    assert_eq!(
+        session_dir_entries.len(),
+        1,
+        "expected exactly one ULID-named session directory under {sessions_dir:?}"
+    );
+    let session_dir = session_dir_entries[0].path();
+    let session_jsonl_before_confirm = std::fs::read_to_string(session_dir.join("session.jsonl"))
+        .expect("failed to read session.jsonl contents");
+    assert!(
+        !session_jsonl_before_confirm.contains(r#""type":"Rollback""#),
+        "expected NO Rollback record before confirmation, got: {session_jsonl_before_confirm:?}"
+    );
+
+    // Re-run with --yes: must now proceed.
+    writer
+        .write_all(b"/rollback 0 --yes\r")
+        .expect("failed to write confirmed /rollback command to pty");
+    let rolled_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < rolled_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Rolled") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Rolled"),
+        "expected the confirmed /rollback to proceed, got: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn0_content,
+        "expected the file to hold turn 0's content after confirming rollback to target 0"
+    );
+
+    let session_jsonl_after_confirm = std::fs::read_to_string(session_dir.join("session.jsonl"))
+        .expect("failed to read session.jsonl contents");
+    let rollback_records: Vec<rokr_session::SessionRecord> = session_jsonl_after_confirm
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<rokr_session::SessionRecord>(line).ok())
+        .filter(|record| matches!(record, rokr_session::SessionRecord::Rollback { .. }))
+        .collect();
+    assert_eq!(
+        rollback_records.len(),
+        1,
+        "expected exactly one Rollback record after confirmation, got: {rollback_records:?}"
+    );
+    match &rollback_records[0] {
+        rokr_session::SessionRecord::Rollback { target } => {
+            assert_eq!(*target, 0, "expected the Rollback record's target to be 0");
+        }
+        other => panic!("expected a Rollback record, got: {other:?}"),
+    }
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
+/// Ticket 82 (rollback-past-commit-warning) acceptance test: "doesn't cross
+/// any commit boundary" is exercised here as -- a commit boundary EXISTS
+/// (turn 0 was committed via `/commit`), but the rollback target (turn 1,
+/// the commit's own turn) is NOT strictly before that boundary, so it isn't
+/// crossed. This must proceed immediately, with no warning and no `--yes`
+/// needed -- proving the commit-boundary check is precise (only the actual
+/// `target < boundary` case warns), not merely "warn if any commit ever
+/// happened this session".
+#[tokio::test]
+async fn rollback_before_any_commit_boundary_proceeds_without_warning() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let project_dir = unique_temp_dir("rollback-no-boundary-project");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&project_dir)
+            .status()
+            .expect("git command should spawn");
+        assert!(status.success(), "git {args:?} should succeed");
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    std::fs::write(project_dir.join("tracked.txt"), "already committed").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    let target_file = project_dir.join("no-boundary-target.txt");
+    let initial_content = "noboundarypreimagebeforeanywrite";
+    let turn0_content = "noboundarycontentafterturnzero";
+    let turn1_content = "noboundarycontentafterturnone";
+    std::fs::write(&target_file, initial_content).unwrap();
+    let target_path = target_file.to_string_lossy().into_owned();
+
+    let turn0_reply_text = "FinalReplyTurnZeroForNoBoundaryTest";
+    let turn1_reply_text = "FinalReplyTurnOneForNoBoundaryTest";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-no-boundary-turn0-toolcall",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_turn0",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": turn0_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-no-boundary-turn0-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn0_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-no-boundary-turn1-toolcall",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_turn1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write",
+                                    "arguments": serde_json::json!({
+                                        "path": target_path,
+                                        "content": turn1_content
+                                    }).to_string()
+                                }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-no-boundary-turn1-final",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": turn1_reply_text },
+                    "finish_reason": "stop"
+                }
+            ]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let home = unique_temp_dir("home-rollback-no-boundary");
+    let xdg_config_home = unique_temp_dir("xdg-config-home-rollback-no-boundary");
+    let xdg_data_home = unique_temp_dir("xdg-data-home-rollback-no-boundary");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rokr"));
+    cmd.env("HOME", &home);
+    cmd.env("XDG_CONFIG_HOME", &xdg_config_home);
+    cmd.env("XDG_DATA_HOME", &xdg_data_home);
+    cmd.env("ROKR_OPENAI_BASE_URL", mock_server.uri());
+    cmd.env("ROKR_OPENAI_MODEL", "gpt-4o-mini");
+    cmd.env("ROKR_OPENAI_API_KEY", "test-api-key");
+    cmd.cwd(&project_dir);
+    cmd.arg("--agent");
+    cmd.arg("build");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn rokr in pty");
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to clone pty reader");
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("failed to take pty writer");
+
+    let mut output = String::new();
+    let render_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < render_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Header") && output.contains("View") && output.contains("Prompt") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Header"),
+        "expected pty output to contain Header, got: {output:?}"
+    );
+
+    // Turn 0: write, accept.
+    writer
+        .write_all(b"turnzeronoboundarywriteprompt\r")
+        .expect("failed to write turn0 prompt to pty");
+    let turn0_diff_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn0_diff_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("+noboundarycontentafterturnzero") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("+noboundarycontentafterturnzero"),
+        "expected pty output to contain turn 0's diff, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write turn0 accept keypress to pty");
+
+    let turn0_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn0_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn0_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn0_reply_text),
+        "expected pty output to contain turn 0's final reply, got: {output:?}"
+    );
+
+    // /commit: accept, recording a commit boundary at turn_index 1 (only
+    // turn 0 has completed).
+    writer
+        .write_all(b"/commit\r")
+        .expect("failed to write /commit to pty");
+    let commit_prompt_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < commit_prompt_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("no-boundary-target.txt") && output.contains("chore:") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("no-boundary-target.txt"),
+        "expected the /commit confirmation prompt to list the candidate file, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write accept keypress for /commit to pty");
+
+    let committed_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < committed_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Committed") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("Committed"),
+        "expected /commit to report success after being approved, got: {output:?}"
+    );
+
+    // Turn 1: write again, accept.
+    writer
+        .write_all(b"turnonenoboundarywriteprompt\r")
+        .expect("failed to write turn1 prompt to pty");
+    let turn1_diff_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_diff_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("+noboundarycontentafterturnone") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains("+noboundarycontentafterturnone"),
+        "expected pty output to contain turn 1's diff, got: {output:?}"
+    );
+    writer
+        .write_all(b"y")
+        .expect("failed to write turn1 accept keypress to pty");
+
+    let turn1_response_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < turn1_response_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains(turn1_reply_text) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        output.contains(turn1_reply_text),
+        "expected pty output to contain turn 1's final reply, got: {output:?}"
+    );
+
+    // A commit boundary EXISTS (recorded at turn_index 1), but /rollback 1
+    // targets turn 1 itself -- NOT strictly before the boundary -- so it
+    // does not cross it. Must proceed immediately, bare (no --yes), no
+    // warning.
+    let output_before_rollback = output.len();
+    writer
+        .write_all(b"/rollback 1\r")
+        .expect("failed to write /rollback command to pty");
+    let rolled_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < rolled_deadline {
+        while let Ok(chunk) = rx.try_recv() {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        if output.contains("Rolled") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let rollback_text = &output[output_before_rollback..];
+    assert!(
+        rollback_text.contains("Rolled"),
+        "expected /rollback 1 to proceed immediately since it does not cross the commit \
+         boundary (target 1 is not strictly before boundary 1), got: {rollback_text:?}"
+    );
+    assert!(
+        !rollback_text.contains("--yes"),
+        "expected NO warning/--yes mention when the commit boundary was not crossed, got: \
+         {rollback_text:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).unwrap(),
+        turn1_content,
+        "expected the file to STILL hold turn 1's own written content after rolling back to \
+         turn 1 (RULING 3: turn N's own mutation survives a rollback to N)"
+    );
+
+    writer.write_all(b"q").expect("failed to write q to pty");
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll rokr exit status") {
+            break status;
+        }
+        if Instant::now() > exit_deadline {
+            let _ = child.kill();
+            panic!("rokr did not exit within timeout after pressing q; output so far: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "expected rokr to exit cleanly after q, got status: {status:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&xdg_config_home);
+    let _ = std::fs::remove_dir_all(&xdg_data_home);
+    let _ = std::fs::remove_dir_all(&project_dir);
+}
+
 /// Ticket 80 (pr-command): resolves the ABSOLUTE path to the real `git`
 /// binary via the ambient `PATH` at test-run time (`which git`) -- used to
 /// build PATH-shim directories below that stay independent of whatever
